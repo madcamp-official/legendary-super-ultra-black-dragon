@@ -29,7 +29,8 @@ class JoinTests(unittest.TestCase):
             config.write_text("DURE_SERVER=http://control:8081\nDURE_INSECURE=true\n", encoding="utf-8")
             self.assertEqual(resolve_join_settings(client_config=config), ("http://control:8081", True))
 
-    def test_join_registers_config_and_starts_agent(self):
+    @patch("dure.agent.os.geteuid", return_value=0)
+    def test_join_registers_config_and_starts_agent(self, _geteuid):
         runner = FakeRunner(executables={"systemctl"})
         with tempfile.TemporaryDirectory() as temporary:
             client_config = Path(temporary) / "client.env"
@@ -58,7 +59,8 @@ class JoinTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_join_settings(client_config=config)
 
-    def test_join_is_idempotent_and_restarts_agent(self):
+    @patch("dure.agent.os.geteuid", return_value=0)
+    def test_join_is_idempotent_and_restarts_agent(self, _geteuid):
         runner = FakeRunner(executables={"systemctl"})
         with tempfile.TemporaryDirectory() as temporary:
             client_config = Path(temporary) / "client.env"
@@ -75,3 +77,8 @@ class JoinTests(unittest.TestCase):
             )
             self.assertEqual(result, {"node_id": "existing", "status": "already-joined"})
             self.assertIn(("systemctl", "enable", "--now", "dure-agent"), runner.calls)
+
+    @patch("dure.agent.os.geteuid", return_value=1000)
+    def test_join_requires_root(self, _geteuid):
+        with self.assertRaisesRegex(PermissionError, "must run as root"):
+            join_control_plane(start_service=False)

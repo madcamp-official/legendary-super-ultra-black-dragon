@@ -29,7 +29,7 @@ class CorePackageTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "0.3.1")
+        self.assertEqual(result.stdout.strip(), "0.3.2")
 
     def test_server_reports_missing_optional_dependencies(self):
         result = self._run_without_site_packages(

@@ -1,3 +1,9 @@
+dure (0.3.2) stable; urgency=medium
+
+  * Make root-required join tests portable to unprivileged CI runners.
+
+ -- Dure contributors <maintainers@example.invalid>  Sun, 19 Jul 2026 05:35:00 +0000
+
 dure (0.3.1) stable; urgency=medium
 
   * Split the dependency-free node package from optional control-plane dependencies.
