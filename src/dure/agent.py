@@ -12,11 +12,22 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from . import __version__
+from .artifact_prepare import (
+    ArtifactPreparationExecutor,
+    is_artifact_preparation_task,
+    preparation_failure_code,
+    validate_preparation_history,
+    validate_preparation_result,
+)
 from .command import SubprocessRunner
 from .http import APIError, JSONClient
+from .model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_VERIFICATION_VERSION,
+)
 from .models import DeploymentPlan, InstalledModelProfile, NodeProfile
 from .orchestrator import InitOrchestrator
 from .probe import DURE_MODEL_ROOT, NodeProbe
@@ -77,6 +88,8 @@ BENCHMARK_AGENT_FAILURE_CODES = frozenset(
         "BENCHMARK_ARTIFACT_UNAVAILABLE",
     }
 )
+PENDING_REPORT_TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+RETRYABLE_REPORT_HTTP_STATUSES = frozenset({408, 425, 429})
 
 
 class BenchmarkAgentError(ValueError):
@@ -130,7 +143,10 @@ def _exact_cached_model(
             or not model.path
             or model.model_id != payload.model_repository
             or model.revision != payload.artifact_revision
+            or model.manifest_digest != payload.artifact_manifest_digest
             or model.quantization != payload.quantization
+            or model.cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT
+            or model.verification_version != MODEL_CACHE_VERIFICATION_VERSION
         ):
             continue
         candidate = Path(model.path)
@@ -146,7 +162,7 @@ def _exact_cached_model(
     if len(matches) != 1:
         raise BenchmarkAgentError(
             "BENCHMARK requires exactly one complete local cache matching repository, "
-            "revision, and quantization",
+            "revision, manifest, quantization, and FULL_SNAPSHOT cache kind",
             failure_code="BENCHMARK_ARTIFACT_UNAVAILABLE",
         )
     return matches[0]
@@ -429,6 +445,9 @@ class TaskExecutor:
         runner=None,
         state_path: Path | None = None,
         benchmark_executor: SafeBenchmarkExecutor | None = None,
+        preparation_executor: ArtifactPreparationExecutor | None = None,
+        artifact_origin_config: object = None,
+        manifest_loader: Callable[[str], dict] | None = None,
         build_commit: str | None | object = _BUILD_COMMIT_UNSET,
     ) -> None:
         self.node_id = node_id
@@ -449,6 +468,12 @@ class TaskExecutor:
 
             benchmark_executor = SafeBenchmarkRuntime(runner=runner)
         self.benchmark_executor = benchmark_executor
+        self.preparation_executor = preparation_executor or ArtifactPreparationExecutor(
+            node_id,
+            runner=runner,
+            origin_config=artifact_origin_config,
+            manifest_loader=manifest_loader,
+        )
 
     def _profile(self):
         profile = NodeProbe(self.runner).collect()
@@ -517,6 +542,9 @@ class TaskExecutor:
         return payload, plan, assignment
 
     def execute(self, task: dict) -> dict:
+        task_type = task.get("type") if type(task) is dict else None
+        if is_artifact_preparation_task(task_type):
+            return self.preparation_executor.execute(task)
         try:
             kind = TaskType(task["type"])
         except (KeyError, ValueError) as exc:
@@ -636,7 +664,17 @@ class Agent:
             raise ValueError("agent control-plane URL must use HTTPS")
         self.client = JSONClient(config["server"], config["credential"], verify_tls=config.get("verify_tls", True))
         self.history_path = history_path
-        self.history = _read_json(history_path, {"completed": {}})
+        history = _read_json(
+            history_path,
+            {"completed": {}, "pending_reports": {}},
+        )
+        if type(history) is not dict:
+            history = {}
+        if type(history.get("completed")) is not dict:
+            history["completed"] = {}
+        if type(history.get("pending_reports")) is not dict:
+            history["pending_reports"] = {}
+        self.history = history
         self.state_path = Path(config.get("state_file", DEFAULT_STATE))
         self.build_commit = (
             _load_build_commit(DEFAULT_BUILD_COMMIT)
@@ -653,9 +691,133 @@ class Agent:
             runner=runner,
             state_path=self.state_path,
             benchmark_executor=benchmark_executor,
+            artifact_origin_config=config.get("artifact_origin"),
+            manifest_loader=self._load_artifact_manifest,
             build_commit=self.build_commit,
         )
         self.running = True
+
+    def _save_history(self) -> None:
+        completed = self.history["completed"]
+        self.history["completed"] = dict(list(completed.items())[-1000:])
+        _atomic_json(self.history_path, self.history)
+
+    def _record_terminal_report(
+        self,
+        task_id: str,
+        history_record: dict,
+    ) -> None:
+        status_value = history_record.get("status")
+        if status_value == "complete" and type(history_record.get("result")) is dict:
+            pending_report = {
+                "status": "complete",
+                "result": history_record["result"],
+            }
+        elif status_value == "failed" and type(history_record.get("error")) is str:
+            pending_report = {
+                "status": "failed",
+                "error": history_record["error"],
+            }
+        else:
+            raise ValueError("terminal task history record is invalid")
+        self.history["completed"][task_id] = dict(history_record)
+        self.history["pending_reports"][task_id] = pending_report
+        self._save_history()
+
+    @staticmethod
+    def _pending_report_request(
+        task_id,
+        report,
+    ) -> tuple[str, dict] | None:
+        if (
+            type(task_id) is not str
+            or PENDING_REPORT_TASK_ID_PATTERN.fullmatch(task_id) is None
+            or type(report) is not dict
+        ):
+            return None
+        if (
+            set(report) == {"status", "result"}
+            and report.get("status") == "complete"
+            and type(report.get("result")) is dict
+        ):
+            return (
+                f"/v1/agent/tasks/{task_id}/complete",
+                {"result": report["result"]},
+            )
+        if (
+            set(report) == {"status", "error"}
+            and report.get("status") == "failed"
+            and type(report.get("error")) is str
+            and len(report["error"]) <= 8192
+        ):
+            return (
+                f"/v1/agent/tasks/{task_id}/fail",
+                {"error": report["error"]},
+            )
+        return None
+
+    @staticmethod
+    def _report_error_is_retryable(exc: APIError) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        return (
+            type(status_code) is not int
+            or status_code >= 500
+            or status_code in RETRYABLE_REPORT_HTTP_STATUSES
+        )
+
+    def _drop_pending_report(self, task_id) -> None:
+        pending_reports = self.history["pending_reports"]
+        if task_id in pending_reports:
+            del pending_reports[task_id]
+            self._save_history()
+
+    def _send_pending_report(self, task_id) -> None:
+        pending_reports = self.history["pending_reports"]
+        if task_id not in pending_reports:
+            return
+        request = self._pending_report_request(
+            task_id,
+            pending_reports[task_id],
+        )
+        if request is None:
+            LOG.error("discarding malformed pending agent task report")
+            self._drop_pending_report(task_id)
+            return
+        path, payload = request
+        try:
+            self.client.request("POST", path, payload)
+        except APIError as exc:
+            if self._report_error_is_retryable(exc):
+                raise
+            LOG.warning(
+                "discarding pending task %s report after terminal HTTP %s",
+                task_id,
+                exc.status_code,
+            )
+            self._drop_pending_report(task_id)
+            return
+        self._drop_pending_report(task_id)
+
+    def _flush_pending_reports(self) -> bool:
+        task_ids = list(self.history["pending_reports"])
+        if not task_ids:
+            return False
+        for task_id in task_ids:
+            self._send_pending_report(task_id)
+        return True
+
+    def _load_artifact_manifest(self, task_id: str) -> dict:
+        response = self.client.request(
+            "GET",
+            f"/v1/agent/tasks/{task_id}/artifact-manifest",
+        )
+        if (
+            type(response) is not dict
+            or set(response) != {"manifest"}
+            or type(response["manifest"]) is not dict
+        ):
+            raise ValueError("artifact manifest response is invalid")
+        return response["manifest"]
 
     def stop(self, *_args) -> None:
         self.running = False
@@ -667,14 +829,44 @@ class Agent:
             "/v1/agent/heartbeat",
             {"state": state, "agent_version": __version__},
         )
+        if self._flush_pending_reports():
+            return True
         task = self.client.request("POST", "/v1/agent/tasks/claim").get("task")
         if task is None:
             return False
         task_id = task["id"]
         is_benchmark = task.get("type") == TaskType.BENCHMARK.value
+        is_preparation = is_artifact_preparation_task(task.get("type"))
         previous = self.history.get("completed", {}).get(task_id)
         if previous is not None:
-            if is_benchmark:
+            if is_preparation:
+                try:
+                    status_value, replay = validate_preparation_history(
+                        task,
+                        previous,
+                        self.executor.node_id,
+                    )
+                except Exception:
+                    status_value = "failed"
+                    replay = "PREPARATION_HISTORY_INVALID"
+                    self.history.setdefault("completed", {})[task_id] = {
+                        "status": status_value,
+                        "error": replay,
+                    }
+                    _atomic_json(self.history_path, self.history)
+                if status_value == "failed":
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/fail",
+                        {"error": replay},
+                    )
+                else:
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/complete",
+                        {"result": replay},
+                    )
+            elif is_benchmark:
                 try:
                     benchmark = _validated_benchmark_payload(
                         task.get("payload") or {}
@@ -779,6 +971,12 @@ class Agent:
         try:
             try:
                 result = self.executor.execute(task)
+                if is_preparation:
+                    result = validate_preparation_result(
+                        task,
+                        result,
+                        self.executor.node_id,
+                    )
             except Exception as exc:
                 if is_benchmark and getattr(exc, "defer_benchmark", False) is True:
                     LOG.warning(
@@ -789,22 +987,22 @@ class Agent:
                     if is_benchmark:
                         error = _benchmark_failure_code(exc)
                         LOG.error("BENCHMARK task %s failed with %s", task_id, error)
+                    elif is_preparation:
+                        error = preparation_failure_code(exc)
+                        LOG.error(
+                            "artifact preparation task %s failed with %s",
+                            task_id,
+                            error,
+                        )
                     else:
                         LOG.exception("task %s failed", task_id)
                         error = str(exc)[:8192]
-                    self.history.setdefault("completed", {})[task_id] = {
+                    history_record = {
                         "status": "failed",
                         "error": error,
                     }
-                    self.history["completed"] = dict(
-                        list(self.history["completed"].items())[-1000:]
-                    )
-                    _atomic_json(self.history_path, self.history)
-                    self.client.request(
-                        "POST",
-                        f"/v1/agent/tasks/{task_id}/fail",
-                        {"error": error},
-                    )
+                    self._record_terminal_report(task_id, history_record)
+                    self._send_pending_report(task_id)
             else:
                 history_record = {
                     "status": "complete",
@@ -817,18 +1015,8 @@ class Agent:
                     history_record["executed_dure_commit"] = (
                         benchmark.dure_commit
                     )
-                self.history.setdefault("completed", {})[task_id] = {
-                    **history_record,
-                }
-                self.history["completed"] = dict(
-                    list(self.history["completed"].items())[-1000:]
-                )
-                _atomic_json(self.history_path, self.history)
-                self.client.request(
-                    "POST",
-                    f"/v1/agent/tasks/{task_id}/complete",
-                    {"result": result},
-                )
+                self._record_terminal_report(task_id, history_record)
+                self._send_pending_report(task_id)
         finally:
             renewal_stop.set()
             renewal.join(timeout=2)

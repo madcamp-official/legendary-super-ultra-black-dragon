@@ -9,7 +9,9 @@ from . import __version__
 
 
 class APIError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class JSONClient:
@@ -39,6 +41,9 @@ class JSONClient:
                 detail = json.loads(body).get("detail", body)
             except json.JSONDecodeError:
                 detail = body
-            raise APIError(f"HTTP {exc.code}: {detail}") from exc
+            raise APIError(
+                f"HTTP {exc.code}: {detail}",
+                status_code=exc.code,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             raise APIError(str(exc)) from exc

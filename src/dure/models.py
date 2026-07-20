@@ -51,6 +51,9 @@ class InstalledModelProfile:
     quantization: str | None = None
     size_mib: int | None = None
     complete: bool = True
+    manifest_digest: str | None = None
+    cache_kind: str | None = None
+    verification_version: int | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "InstalledModelProfile":

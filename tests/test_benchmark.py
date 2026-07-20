@@ -31,12 +31,14 @@ from dure.control.models import (
     AuditEvent,
     BenchmarkEvidence,
     Deployment,
+    DeploymentOperation,
     Node,
     NodeProfileRecord,
     Task,
     utcnow,
 )
 from dure.control.service import (
+    BenchmarkRunError,
     add_placement_profile,
     apply_benchmark_run,
     claim_task,
@@ -345,6 +347,91 @@ class BenchmarkServiceTests(unittest.TestCase):
             self.assertEqual(replay.id, recovered.id)
             _, evidence_ids, _ = promote_model_release(session, release.id)
             self.assertEqual(evidence_ids, [recovered.id])
+
+    def test_artifact_preparation_blocks_benchmark_task_creation(self):
+        with self.factory() as session:
+            node = _node(session, "preparation-busy")
+            _, _, release, placements = _release(session, "preparation-busy")
+            run, _ = prepare_benchmark_run(
+                session,
+                request_id=str(uuid.uuid4()),
+                release_id=release.id,
+                placement_id=placements[0].id,
+                node_ids=[node.id],
+                workload_id="short-chat-1k-128",
+                dure_commit="d" * 40,
+            )
+            preparation_task = Task(
+                bulk_id=str(uuid.uuid4()),
+                node_id=node.id,
+                type="PREPARE_MODEL",
+                payload={},
+            )
+            session.add(preparation_task)
+            session.commit()
+
+            with self.assertRaises(BenchmarkRunError) as raised:
+                apply_benchmark_run(session, run.request_id)
+
+            self.assertEqual(raised.exception.code, "BENCHMARK_NODE_BUSY")
+            self.assertEqual(
+                raised.exception.details,
+                {
+                    "node_id": node.id,
+                    "task_id": preparation_task.id,
+                    "task_type": "PREPARE_MODEL",
+                },
+            )
+            session.refresh(run)
+            self.assertEqual(run.status, "PREPARED")
+            self.assertIsNone(run.task_id)
+            self.assertEqual(
+                session.scalar(
+                    select(func.count())
+                    .select_from(Task)
+                    .where(Task.type == "BENCHMARK")
+                ),
+                0,
+            )
+
+            preparation_task.status = "CANCELED"
+            deployment_id = f"benchmark-operation-{uuid.uuid4()}"
+            session.add(
+                Deployment(
+                    id=deployment_id,
+                    lineage_id=deployment_id,
+                    generation=1,
+                    plan={},
+                    accept_model_download=False,
+                    pull_image=False,
+                )
+            )
+            session.flush()
+            operation_id = str(uuid.uuid4())
+            session.add(
+                DeploymentOperation(
+                    id=operation_id,
+                    request_digest="sha256:" + "8" * 64,
+                    lineage_id=deployment_id,
+                    deployment_id=deployment_id,
+                    kind="APPLY",
+                    status="PARTIAL_FAILED",
+                    phase="APPLY",
+                    node_ids=[node.id],
+                    serve=False,
+                    api=False,
+                    active_lineage_id=deployment_id,
+                )
+            )
+            session.commit()
+
+            with self.assertRaises(BenchmarkRunError) as operation_busy:
+                apply_benchmark_run(session, run.request_id)
+            self.assertEqual(operation_busy.exception.code, "BENCHMARK_NODE_BUSY")
+            self.assertEqual(
+                operation_busy.exception.details,
+                {"node_id": node.id, "operation_id": operation_id},
+            )
 
     def test_runtime_architecture_matches_the_gpu_selected_for_execution(self):
         with self.factory() as session:

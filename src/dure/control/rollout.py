@@ -44,6 +44,8 @@ DEPLOYMENT_MUTATION_TASK_TYPES = {
     TaskType.START_DEPLOYMENT.value,
     TaskType.STOP_DEPLOYMENT.value,
     TaskType.RESTART_DEPLOYMENT.value,
+    TaskType.PREPARE_MODEL.value,
+    TaskType.PREPARE_IMAGE.value,
 }
 PHASE_ORDER = {
     phase: index
@@ -398,6 +400,7 @@ def _operation_audit(
 
 
 def _phase_payload(
+    session: Session,
     operation: DeploymentOperation,
     phase: str,
     source: Deployment,
@@ -411,8 +414,17 @@ def _phase_payload(
                 "rollback target is missing", code="ROLLBACK_TARGET_NOT_FOUND"
             )
         deployment = target
+    plan = deployment.plan
+    if deployment.source_recommendation_id is not None:
+        from .preparation import effective_deployment_plan
+
+        plan = effective_deployment_plan(
+            session,
+            deployment,
+            require_prepared=phase != "STOP_SOURCE",
+        )
     payload: dict[str, Any] = {
-        "plan": deployment.plan,
+        "plan": plan,
         "generation": deployment.generation,
     }
     if phase == "APPLY":
@@ -421,8 +433,14 @@ def _phase_payload(
         payload["serve"] = False
         payload["accept_model_download"] = bool(
             deployment.accept_model_download
+            if deployment.source_recommendation_id is None
+            else False
         )
-        payload["pull_image"] = bool(deployment.pull_image)
+        payload["pull_image"] = bool(
+            deployment.pull_image
+            if deployment.source_recommendation_id is None
+            else False
+        )
     elif phase == "START_TARGET":
         payload["serve"] = False
     elif phase == "START_API":
@@ -474,7 +492,9 @@ def _queue_phase(
     )
     if source is None:
         raise DeploymentRolloutNotFoundError()
-    deployment, payload = _phase_payload(operation, phase, source, target)
+    deployment, payload = _phase_payload(
+        session, operation, phase, source, target
+    )
     records = _phase_nodes(session, operation, phase, lock=True)
     if retry_failed_only:
         records = [item for item in records if item.status in {"FAILED", "CANCELED"}]
@@ -750,6 +770,13 @@ def prepare_or_apply_rollback(
     source, target, lineage_id = _validate_rollback(
         session, source_id, normalized_node_ids
     )
+    if target.source_recommendation_id is not None:
+        from .preparation import effective_deployment_plan
+
+        # Rollback is deliberately network-free. A recommended target must
+        # already have a fully successful exact preparation record; this call
+        # only validates that immutable evidence and never queues preparation.
+        effective_deployment_plan(session, target, require_prepared=True)
     digest = _rollback_request_digest(
         source, target, normalized_node_ids, serve=serve
     )
@@ -1001,7 +1028,9 @@ def attach_deployment_bulk_operation(
     )
     session.add(operation)
     task_by_node = {task.node_id: task for task in tasks}
-    _, payload = _phase_payload(operation, phase, deployment, None)
+    _, payload = _phase_payload(
+        session, operation, phase, deployment, None
+    )
     for node_id in node_ids:
         record = DeploymentOperationNode(
             id=str(uuid.uuid4()),

@@ -1,3 +1,35 @@
+dure (0.3.16) UNRELEASED; urgency=medium
+
+  * 추천 배포 세대의 모델과 이미지를 명시적으로 준비하는 중앙 작업을 추가합니다.
+  * 노드별 준비 증적, 실패 단계 재시도와 늦은 결과 펜싱을 추가합니다.
+  * 검증된 정확한 캐시와 다이제스트 이미지가 없는 추천 배포 적용을 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 03:42:05 +0900
+
+dure (0.3.15) UNRELEASED; urgency=medium
+
+  * 신뢰 HTTPS 원본과 SHA-256 콘텐츠 주소 청크 저장소를 추가합니다.
+  * 중단 뒤 재개 가능한 파일 조립과 검증된 FULL_SNAPSHOT 캐시 활성화를 추가합니다.
+  * 캐시 소유권, 디스크, 경로 충돌과 실패 안전 복구 경계를 강화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 03:17:05 +0900
+
+dure (0.3.14) UNRELEASED; urgency=medium
+
+  * 불변 정규 모델 아티팩트 매니페스트와 파일·청크 레지스트리를 추가합니다.
+  * 관리자 전용의 멱등 매니페스트 등록·조회와 엄격한 경로·범위 검증을 추가합니다.
+  * SHA-256 무결성과 게시자 서명·공급망 provenance의 신뢰 경계를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 01:10:11 +0900
+
+dure (0.3.13) UNRELEASED; urgency=medium
+
+  * 정확한 다중 노드 조합의 최신 네트워크·NCCL 증적을 중앙 추천에 연결합니다.
+  * 증적의 24시간 신선도와 릴리스·런타임·인벤토리 결합을 다시 검증합니다.
+  * 실패·진행 중인 최신 실행과 불일치 증적을 실패 안전 방식으로 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 00:52:56 +0900
+
 dure (0.3.12) UNRELEASED; urgency=medium
 
   * 배포 세대별 적용·검증 상태와 실패 노드 재시도 추적을 추가합니다.

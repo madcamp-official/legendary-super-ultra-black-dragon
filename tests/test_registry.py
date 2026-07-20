@@ -143,6 +143,35 @@ class RegistryTests(unittest.TestCase):
                     cuda_version="12.8",
                     gpu_architectures=["ampere"],
                 )
+            with self.assertRaisesRegex(ValueError, "digest-pinned"):
+                create_runtime_release(
+                    session,
+                    version="uppercase",
+                    image="Registry.example/vllm@sha256:" + "f" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+            with self.assertRaisesRegex(ValueError, "digest-pinned"):
+                create_runtime_release(
+                    session,
+                    version="tagged-digest",
+                    image=(
+                        "registry.example/vllm:stable@sha256:" + "f" * 64
+                    ),
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+            single_character = create_runtime_release(
+                session,
+                version="single-character",
+                image="a@sha256:" + "e" * 64,
+                vllm_version="0.9.0",
+                cuda_version="12.8",
+                gpu_architectures=["ampere"],
+            )
+            self.assertEqual(single_character.image, "a@sha256:" + "e" * 64)
             with self.assertRaisesRegex(ValueError, "architecture"):
                 create_runtime_release(
                     session,

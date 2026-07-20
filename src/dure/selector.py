@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 
-from .catalog import CatalogEntry, ModelCatalog, STATIC_CATALOG
+from .catalog import CatalogEntry, ModelCatalog, NetworkEvidenceBinding, STATIC_CATALOG
 from .models import GPUProfile, NodeProfile
 
 
@@ -49,9 +49,12 @@ class CandidateEvaluation:
     feasible: bool
     node_ids: tuple[str, ...]
     rejections: tuple[Rejection, ...]
+    network_evidence_id: str | None = None
+    network_evidence_digest: str | None = None
+    network_evidence_registered_at: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "candidate_id": self.candidate_id,
             "model_id": self.model_id,
             "placement_profile_id": self.placement_profile_id,
@@ -60,6 +63,17 @@ class CandidateEvaluation:
             "node_ids": list(self.node_ids),
             "rejections": [item.to_dict() for item in self.rejections],
         }
+        if self.network_evidence_id is not None:
+            result.update(
+                {
+                    "network_evidence_id": self.network_evidence_id,
+                    "network_evidence_digest": self.network_evidence_digest,
+                    "network_evidence_registered_at": (
+                        self.network_evidence_registered_at
+                    ),
+                }
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -164,6 +178,42 @@ def _compute_capability_at_least(actual: str | None, minimum: str | None) -> boo
         return False
 
 
+def _select_exact_network_evidence(
+    entry: CatalogEntry,
+    available: list[tuple[InventoryNode, GPUProfile]],
+) -> tuple[NetworkEvidenceBinding | None, tuple[str, ...]]:
+    """Choose one complete evidence-bound node set without combining sets."""
+    placement = entry.placement
+    ranking = {item[0].node_id: index for index, item in enumerate(available)}
+    choices: list[
+        tuple[tuple[object, ...], NetworkEvidenceBinding, tuple[str, ...]]
+    ] = []
+    for binding in entry.network_evidence:
+        node_ids = tuple(sorted(binding.node_ids))
+        if len(node_ids) != placement.node_count or len(set(node_ids)) != len(node_ids):
+            continue
+        if any(node_id not in ranking for node_id in node_ids):
+            continue
+        choices.append(
+            (
+                (
+                    tuple(sorted(ranking[node_id] for node_id in node_ids)),
+                    node_ids,
+                    binding.evidence_id,
+                    binding.evidence_digest,
+                    binding.registered_at,
+                ),
+                binding,
+                node_ids,
+            )
+        )
+    if not choices:
+        return None, ()
+    _, binding, node_ids = min(choices, key=lambda item: item[0])
+    selected = tuple(sorted(node_ids, key=ranking.__getitem__))
+    return binding, selected
+
+
 def _evaluate(
     entry: CatalogEntry,
     nodes: list[InventoryNode],
@@ -233,13 +283,6 @@ def _evaluate(
         ):
             missing_runtime.append(node_id)
             continue
-        if (
-            placement.requires_network_evidence
-            and not allow_unverified_network
-            and not node.network_verified
-        ):
-            missing_network.append(node_id)
-            continue
         available.append((node, gpu))
 
     available.sort(
@@ -249,7 +292,25 @@ def _evaluate(
             item[0].node_id,
         )
     )
-    selected = tuple(item[0].node_id for item in available[: placement.node_count])
+    selected_evidence = None
+    if not placement.requires_network_evidence or allow_unverified_network:
+        network_eligible = available
+        selected = tuple(
+            item[0].node_id for item in network_eligible[: placement.node_count]
+        )
+    elif entry.network_evidence:
+        selected_evidence, selected = _select_exact_network_evidence(entry, available)
+        network_eligible = available if selected_evidence is not None else []
+        if selected_evidence is None:
+            missing_network.extend(item[0].node_id for item in available)
+    else:
+        network_eligible = [item for item in available if item[0].network_verified]
+        missing_network.extend(
+            item[0].node_id for item in available if not item[0].network_verified
+        )
+        selected = tuple(
+            item[0].node_id for item in network_eligible[: placement.node_count]
+        )
     rejections: list[Rejection] = []
     if missing_profile:
         rejections.append(
@@ -327,7 +388,7 @@ def _evaluate(
         rejections.append(
             Rejection(
                 "NODE_COUNT",
-                f"적격 노드 {len(available)}개, 필요 노드 {placement.node_count}개",
+                f"적격 노드 {len(network_eligible)}개, 필요 노드 {placement.node_count}개",
             )
         )
     else:
@@ -341,6 +402,15 @@ def _evaluate(
         feasible=feasible,
         node_ids=selected,
         rejections=tuple(rejections),
+        network_evidence_id=(
+            selected_evidence.evidence_id if selected_evidence is not None else None
+        ),
+        network_evidence_digest=(
+            selected_evidence.evidence_digest if selected_evidence is not None else None
+        ),
+        network_evidence_registered_at=(
+            selected_evidence.registered_at if selected_evidence is not None else None
+        ),
     )
 
 

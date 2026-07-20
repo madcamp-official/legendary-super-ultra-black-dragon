@@ -1,7 +1,7 @@
 import unittest
 from dataclasses import replace
 
-from dure.catalog import ModelCatalog, STATIC_CATALOG
+from dure.catalog import ModelCatalog, NetworkEvidenceBinding, STATIC_CATALOG
 from dure.models import GPUProfile, InstalledModelProfile
 from dure.selector import InventoryNode, recommend_model
 
@@ -23,6 +23,15 @@ def inventory(node_profile, *, node_id=None, approved=True, online=True, fresh=T
     )
 
 
+def network_evidence(evidence_id, *node_ids):
+    return NetworkEvidenceBinding(
+        evidence_id=evidence_id,
+        evidence_digest="sha256:" + (evidence_id[-1] * 64),
+        node_ids=tuple(node_ids),
+        registered_at="2026-07-21T00:00:00Z",
+    )
+
+
 class SelectorTests(unittest.TestCase):
     def test_inventory_order_does_not_change_recommendation(self):
         nodes = [
@@ -37,6 +46,10 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(forward.to_dict(), reverse.to_dict())
         self.assertEqual(forward.selected_model_id, "qwen2.5-72b-awq")
         self.assertEqual(forward.selected_node_ids, ("node-a", "node-b", "node-c"))
+        self.assertNotIn(
+            "network_evidence_id",
+            evaluation(forward, "qwen2.5-72b-awq").to_dict(),
+        )
 
     def test_three_22g_nodes_do_not_qualify_for_72b(self):
         nodes = [
@@ -74,6 +87,86 @@ class SelectorTests(unittest.TestCase):
 
         self.assertIsNone(result.selected_model_id)
         self.assertIn("NETWORK_EVIDENCE", {item.code for item in result.evaluations[0].rejections})
+
+    def test_exact_network_evidence_selects_its_complete_node_set(self):
+        entry = replace(
+            STATIC_CATALOG.entry("qwen2.5-72b-awq"),
+            network_evidence=(
+                network_evidence("evidence-a", "node-d", "node-b", "node-c"),
+            ),
+        )
+        result = recommend_model(
+            [
+                inventory(profile("node-a")),
+                inventory(profile("node-b")),
+                inventory(profile("node-c")),
+                inventory(profile("node-d")),
+            ],
+            catalog=ModelCatalog("test", "test", (entry,)),
+        )
+
+        candidate = result.evaluations[0]
+        self.assertTrue(candidate.feasible)
+        self.assertEqual(result.selected_node_ids, ("node-b", "node-c", "node-d"))
+        self.assertEqual(candidate.network_evidence_id, "evidence-a")
+        self.assertEqual(candidate.network_evidence_digest, "sha256:" + ("a" * 64))
+        self.assertEqual(
+            candidate.to_dict()["network_evidence_registered_at"],
+            "2026-07-21T00:00:00Z",
+        )
+
+    def test_exact_network_evidence_groups_are_not_combined(self):
+        first = network_evidence("evidence-a", "node-a", "node-b", "node-c")
+        second = network_evidence("evidence-b", "node-b", "node-c", "node-d")
+        entry = replace(
+            STATIC_CATALOG.entry("qwen2.5-72b-awq"),
+            network_evidence=(first, second),
+        )
+        undersized = profile("node-c", gpu_memory_mib=22528)
+
+        result = recommend_model(
+            [
+                inventory(profile("node-a"), network=True),
+                inventory(profile("node-b"), network=True),
+                inventory(undersized, network=True),
+                inventory(profile("node-d"), network=True),
+            ],
+            catalog=ModelCatalog("test", "test", (entry,)),
+        )
+
+        candidate = result.evaluations[0]
+        self.assertFalse(candidate.feasible)
+        self.assertEqual(candidate.node_ids, ())
+        self.assertIsNone(candidate.network_evidence_id)
+        self.assertIn("NETWORK_EVIDENCE", {item.code for item in candidate.rejections})
+
+    def test_exact_network_evidence_choice_is_order_independent(self):
+        first = network_evidence("evidence-a", "node-a", "node-c", "node-d")
+        second = network_evidence("evidence-b", "node-b", "node-c", "node-d")
+        entry = STATIC_CATALOG.entry("qwen2.5-72b-awq")
+        nodes = [
+            inventory(profile("node-a")),
+            inventory(profile("node-b")),
+            inventory(profile("node-c")),
+            inventory(profile("node-d")),
+        ]
+
+        forward = recommend_model(
+            nodes,
+            catalog=ModelCatalog(
+                "test", "test", (replace(entry, network_evidence=(second, first)),)
+            ),
+        )
+        reverse = recommend_model(
+            list(reversed(nodes)),
+            catalog=ModelCatalog(
+                "test", "test", (replace(entry, network_evidence=(first, second)),)
+            ),
+        )
+
+        self.assertEqual(forward.to_dict(), reverse.to_dict())
+        self.assertEqual(forward.selected_node_ids, ("node-a", "node-c", "node-d"))
+        self.assertEqual(forward.evaluations[0].network_evidence_id, "evidence-a")
 
     def test_disk_and_runtime_failures_are_explained(self):
         disk_node = profile("disk")

@@ -6,7 +6,9 @@ from datetime import timedelta
 from functools import partial
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -46,12 +48,19 @@ from .models import (
     utcnow,
 )
 from .service import (
+    MAX_ARTIFACT_FILE_BYTES,
+    MAX_ARTIFACT_MANIFEST_CHUNKS,
+    MAX_ARTIFACT_MANIFEST_FILES,
+    MAX_ARTIFACT_PATH_LENGTH,
+    ArtifactManifestConflictError,
+    ArtifactManifestNotFoundError,
     BENCHMARK_TASK_FAILURE_CODES,
     BenchmarkRunError,
     BenchmarkRunNotFoundError,
     authenticate_node,
     apply_benchmark_run,
     approve_node,
+    artifact_manifest_dict,
     benchmark_run_dict,
     cancel_task,
     claim_enrollment,
@@ -65,6 +74,7 @@ from .service import (
     fail_benchmark_task,
     finish_task,
     get_benchmark_run,
+    get_artifact_manifest,
     join_node,
     node_status,
     revoke_node,
@@ -74,6 +84,7 @@ from .service import (
     add_placement_profile,
     RegistryConflictError,
     prepare_benchmark_run,
+    register_artifact_manifest,
     complete_benchmark_task,
     transition_model_release,
 )
@@ -84,6 +95,14 @@ from .recommendation import (
     accept_deployment_recommendation,
     recommend_deployment,
     show_deployment_recommendation,
+)
+from .preparation import (
+    ArtifactPreparationError,
+    ArtifactPreparationNotFoundError,
+    artifact_preparation_detail,
+    get_artifact_preparation,
+    manifest_for_preparation_task,
+    prepare_deployment_artifacts,
 )
 from .rollout import (
     DeploymentRolloutError,
@@ -162,6 +181,31 @@ class ModelArtifactCreate(StrictBody):
     license_id: str
 
 
+class ArtifactManifestChunkCreate(StrictBody):
+    ordinal: int = Field(ge=0, lt=MAX_ARTIFACT_MANIFEST_CHUNKS)
+    offset_bytes: int = Field(ge=0, le=MAX_ARTIFACT_FILE_BYTES)
+    length_bytes: int = Field(gt=0, le=MAX_ARTIFACT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class ArtifactManifestFileCreate(StrictBody):
+    path: str = Field(min_length=1, max_length=MAX_ARTIFACT_PATH_LENGTH)
+    kind: Literal["REGULAR"]
+    size_bytes: int = Field(ge=0, le=MAX_ARTIFACT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    chunks: list[ArtifactManifestChunkCreate] = Field(
+        max_length=MAX_ARTIFACT_MANIFEST_CHUNKS
+    )
+
+
+class ArtifactManifestCreate(StrictBody):
+    schema_version: Literal[1]
+    files: list[ArtifactManifestFileCreate] = Field(
+        min_length=1,
+        max_length=MAX_ARTIFACT_MANIFEST_FILES,
+    )
+
+
 class RuntimeReleaseCreate(StrictBody):
     version: str
     image: str
@@ -229,6 +273,20 @@ class DeploymentRollback(StrictBody):
     node_ids: list[str] = Field(min_length=1, max_length=64)
     apply: StrictBool = False
     serve: StrictBool = False
+
+
+class DeploymentPreparationRequest(StrictBody):
+    request_id: str
+    apply: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_request_id(self):
+        try:
+            if str(uuid.UUID(self.request_id)) != self.request_id:
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("request_id must be a canonical UUID") from exc
+        return self
 
 
 class BenchmarkContextRequest(StrictBody):
@@ -396,6 +454,10 @@ def _rollout_error_detail(exc: DeploymentRolloutError) -> dict:
     }
 
 
+def _preparation_error_detail(exc: ArtifactPreparationError) -> dict:
+    return exc.to_detail()
+
+
 def _task_dict(task: Task) -> dict:
     return {
         "id": task.id,
@@ -554,6 +616,24 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     expected_admin = admin_token or os.environ.get("DURE_ADMIN_TOKEN")
     get_session = partial(session_dependency, factory)
 
+    @app.exception_handler(RequestValidationError)
+    async def closed_request_validation_error(
+        _request: Request,
+        _error: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "detail": [
+                    {
+                        "type": "request_validation",
+                        "loc": ["request"],
+                        "msg": "Request does not match the closed schema",
+                    }
+                ]
+            },
+        )
+
     def admin_auth(authorization: str | None = Header(default=None)) -> str:
         supplied = _bearer(authorization)
         if not expected_admin or not __import__("hmac").compare_digest(supplied, expected_admin):
@@ -624,6 +704,31 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be extended")
         return {"ok": True, "lease_until": task.lease_until}
 
+    @app.get("/v1/agent/tasks/{task_id}/artifact-manifest")
+    def agent_task_artifact_manifest(
+        task_id: str,
+        node: Node = Depends(node_auth),
+        session: Session = Depends(get_session),
+    ):
+        if not node.approved:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "PREPARATION_MANIFEST_UNAVAILABLE",
+                    "message": "preparation manifest is unavailable",
+                    "details": {},
+                },
+            )
+        try:
+            manifest = manifest_for_preparation_task(
+                session, task_id, node.id
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        return {"manifest": manifest}
+
     @app.post("/v1/agent/tasks/{task_id}/complete")
     def agent_task_complete(task_id: str, body: TaskComplete, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         task = session.get(Task, task_id)
@@ -656,7 +761,16 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 "ok": True,
                 "benchmark_run": benchmark_run_dict(run) if run else None,
             }
-        if not finish_task(session, task, node.id, result=body.result, error=None):
+        try:
+            accepted = finish_task(
+                session, task, node.id, result=body.result, error=None
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                _preparation_error_detail(exc),
+            ) from exc
+        if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be completed")
         return {"ok": True}
 
@@ -688,7 +802,16 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 "ok": True,
                 "benchmark_run": benchmark_run_dict(run) if run else None,
             }
-        if not finish_task(session, task, node.id, result=None, error=body.error):
+        try:
+            accepted = finish_task(
+                session, task, node.id, result=None, error=body.error
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _preparation_error_detail(exc),
+            ) from exc
+        if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be failed")
         return {"ok": True}
 
@@ -748,7 +871,13 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
 
     @app.post("/v1/admin/nodes/{node_id}/revoke", dependencies=[Depends(admin_auth)])
     def node_revoke(node_id: str, session: Session = Depends(get_session)):
-        if not revoke_node(session, node_id):
+        try:
+            revoked = revoke_node(session, node_id)
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        if not revoked:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
         return {"ok": True}
 
@@ -776,6 +905,56 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"artifact": _artifact_dict(record)}
+
+    @app.post(
+        "/v1/admin/model-artifacts/{artifact_id}/manifest",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_manifest_register(
+        artifact_id: str,
+        body: ArtifactManifestCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record, created = register_artifact_manifest(
+                session,
+                artifact_id=artifact_id,
+                manifest=body.model_dump(),
+                commit=False,
+            )
+            value = artifact_manifest_dict(session, record)
+            session.commit()
+        except ArtifactManifestNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except ArtifactManifestConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                str(exc),
+            ) from exc
+        return {"manifest": value, "created": created}
+
+    @app.get(
+        "/v1/admin/model-artifacts/{artifact_id}/manifest",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_manifest_show(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record = get_artifact_manifest(session, artifact_id)
+            if record is None:
+                raise ArtifactManifestNotFoundError(
+                    "artifact manifest is not registered"
+                )
+            value = artifact_manifest_dict(session, record)
+        except ArtifactManifestNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except ArtifactManifestConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        return {"manifest": value}
 
     @app.post("/v1/admin/runtime-releases", dependencies=[Depends(admin_auth)])
     def runtime_release_create(
@@ -1066,6 +1245,60 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"deployment": {"id": deployment.id, "generation": deployment.generation, "plan": deployment.plan}}
 
+    @app.post(
+        "/v1/admin/deployments/{deployment_id}/prepare",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_prepare(
+        deployment_id: str,
+        body: DeploymentPreparationRequest,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            preparation, tasks, changed = prepare_deployment_artifacts(
+                session,
+                deployment_id,
+                request_id=body.request_id,
+                apply=body.apply,
+            )
+        except ArtifactPreparationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _preparation_error_detail(exc)
+            ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        return {
+            "preparation": artifact_preparation_detail(
+                session, preparation
+            ),
+            "tasks": [_task_dict(task) for task in tasks],
+            "changed": changed,
+        }
+
+    @app.get(
+        "/v1/admin/deployment-preparations/{preparation_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_preparation_detail(
+        preparation_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            preparation = get_artifact_preparation(
+                session, preparation_id
+            )
+        except ArtifactPreparationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _preparation_error_detail(exc)
+            ) from exc
+        return {
+            "preparation": artifact_preparation_detail(
+                session, preparation
+            )
+        }
+
     @app.get("/v1/admin/deployments/{deployment_id}", dependencies=[Depends(admin_auth)])
     def deployment_detail(deployment_id: str, session: Session = Depends(get_session)):
         try:
@@ -1113,6 +1346,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, _rollout_error_detail(exc)
             ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
         except DeploymentRolloutError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
@@ -1136,6 +1373,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except DeploymentRolloutError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
+            ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
             ) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc

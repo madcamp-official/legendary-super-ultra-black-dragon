@@ -4,7 +4,16 @@ set -e
 if ! getent passwd dure >/dev/null; then
     adduser --system --group --home /var/lib/dure --no-create-home dure
 fi
-install -d -m 0750 -o dure -g dure /var/lib/dure
+if [ -L /var/lib/dure ]; then
+    echo "refusing unsafe Dure state directory symlink" >&2
+    exit 1
+fi
+install -d -m 0750 -o root -g dure /var/lib/dure
+if [ -L /var/lib/dure/server ]; then
+    echo "refusing unsafe Dure server state directory symlink" >&2
+    exit 1
+fi
+install -d -m 0750 -o dure -g dure /var/lib/dure/server
 install -d -m 0750 -o root -g root /etc/dure
 
 #DEBHELPER#

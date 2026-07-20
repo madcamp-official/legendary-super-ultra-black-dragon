@@ -19,6 +19,12 @@ from dure.benchmark_runtime import (
     SafeBenchmarkRuntime,
 )
 from dure.command import CommandResult, SubprocessRunner
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_VERIFICATION_VERSION,
+    build_model_cache_marker,
+)
 from dure.models import GPUProfile, InstalledModelProfile, WorkloadProfile
 from dure.task import BenchmarkTaskPayload
 
@@ -152,6 +158,9 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             quantization="awq",
             size_mib=8192,
             complete=True,
+            manifest_digest="sha256:" + "b" * 64,
+            cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            verification_version=MODEL_CACHE_VERIFICATION_VERSION,
         )
         self.profile = profile(NODE_ID)
 
@@ -362,11 +371,58 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             replace(self.cached_model, complete=False),
             replace(self.cached_model, source="huggingface-cache"),
             replace(self.cached_model, source="ollama"),
+            replace(
+                self.cached_model, manifest_digest="sha256:" + "f" * 64
+            ),
+            replace(self.cached_model, cache_kind=MODEL_CACHE_KIND_STAGE),
+            replace(self.cached_model, verification_version=2),
         ):
             with self.subTest(cache=invalid_cache), self.assertRaisesRegex(
                 BenchmarkRuntimeError, "artifact"
             ) as raised:
                 runtime.execute(payload(), self.profile, invalid_cache)
+        self.assertEqual(raised.exception.code, "BENCHMARK_ARTIFACT_UNAVAILABLE")
+
+    def test_v2_full_snapshot_marker_is_accepted(self):
+        (self.model_path / ".dure-model.json").write_text(
+            json.dumps(
+                build_model_cache_marker(
+                    repository="Qwen/Test-AWQ",
+                    revision="a" * 40,
+                    manifest_digest="sha256:" + "b" * 64,
+                    quantization="awq",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        result = SafeBenchmarkRuntime(FakeRunner()).execute(
+            payload(), self.profile, self.cached_model
+        )
+
+        self.assertEqual(result["metrics"], {})
+
+    def test_stage_marker_is_rejected_even_if_profile_claims_full_snapshot(self):
+        (self.model_path / ".dure-model.json").write_text(
+            json.dumps(
+                build_model_cache_marker(
+                    repository="Qwen/Test-AWQ",
+                    revision="a" * 40,
+                    manifest_digest="sha256:" + "b" * 64,
+                    quantization="awq",
+                    cache_kind=MODEL_CACHE_KIND_STAGE,
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            BenchmarkRuntimeError, "metadata does not match"
+        ) as raised:
+            SafeBenchmarkRuntime(FakeRunner()).execute(
+                payload(), self.profile, self.cached_model
+            )
+
         self.assertEqual(raised.exception.code, "BENCHMARK_ARTIFACT_UNAVAILABLE")
 
     def test_materialized_cache_metadata_must_match_the_prepared_artifact(self):

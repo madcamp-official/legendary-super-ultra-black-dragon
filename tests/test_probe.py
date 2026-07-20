@@ -4,6 +4,12 @@ import unittest
 from pathlib import Path
 
 from dure.command import CommandResult
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_VERIFICATION_VERSION,
+    build_model_cache_marker,
+)
 from dure.models import NodeProfile
 from dure.probe import NodeProbe
 
@@ -11,6 +17,59 @@ from .helpers import FakeRunner
 
 
 class ProbeTests(unittest.TestCase):
+    def test_huggingface_config_links_are_limited_to_repository_blobs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hub = root / "hub"
+            hub.mkdir()
+            revision = "a" * 40
+            config = json.dumps(
+                {
+                    "model_type": "dure-test",
+                    "quantization_config": {"quant_method": "awq"},
+                }
+            )
+
+            allowed = hub / "models--Example--Allowed"
+            allowed_blob = allowed / "blobs" / ("b" * 64)
+            allowed_blob.parent.mkdir(parents=True)
+            allowed_blob.write_text(config, encoding="utf-8")
+            allowed_snapshot = allowed / "snapshots" / revision
+            allowed_snapshot.mkdir(parents=True)
+            (allowed_snapshot / "config.json").symlink_to(
+                Path("../../blobs") / allowed_blob.name
+            )
+
+            outside_blob = root / "outside-config.json"
+            outside_blob.write_text(config, encoding="utf-8")
+            outside = hub / "models--Example--Outside"
+            outside_snapshot = outside / "snapshots" / revision
+            outside_snapshot.mkdir(parents=True)
+            (outside_snapshot / "config.json").symlink_to(outside_blob)
+
+            non_blob = hub / "models--Example--NonBlob"
+            non_blob_config = non_blob / "metadata" / "config.json"
+            non_blob_config.parent.mkdir(parents=True)
+            non_blob_config.write_text(config, encoding="utf-8")
+            non_blob_snapshot = non_blob / "snapshots" / revision
+            non_blob_snapshot.mkdir(parents=True)
+            (non_blob_snapshot / "config.json").symlink_to(
+                Path("../../metadata/config.json")
+            )
+
+            result = NodeProbe(
+                FakeRunner(),
+                model_roots=[hub],
+            ).collect()
+
+        by_id = {item.model_id: item for item in result.installed_models}
+        self.assertTrue(by_id["Example/Allowed"].complete)
+        self.assertEqual(by_id["Example/Allowed"].quantization, "awq")
+        self.assertFalse(by_id["Example/Outside"].complete)
+        self.assertIsNone(by_id["Example/Outside"].quantization)
+        self.assertFalse(by_id["Example/NonBlob"].complete)
+        self.assertIsNone(by_id["Example/NonBlob"].quantization)
+
     def test_parses_nvidia_smi_and_runtime(self):
         gpu_query = (
             "nvidia-smi",
@@ -131,6 +190,18 @@ class ProbeTests(unittest.TestCase):
             by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].revision, "a" * 40
         )
         self.assertEqual(by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].size_mib, 10240)
+        self.assertEqual(
+            by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].manifest_digest,
+            "sha256:" + "b" * 64,
+        )
+        self.assertEqual(
+            by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].cache_kind,
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        )
+        self.assertEqual(
+            by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].verification_version,
+            MODEL_CACHE_VERIFICATION_VERSION,
+        )
         self.assertFalse(by_id["partial-model"].complete)
         self.assertEqual(len(result.workloads), 1)
         self.assertEqual(result.workloads[0].deployment_id, "deploy-1")
@@ -145,6 +216,75 @@ class ProbeTests(unittest.TestCase):
 
         self.assertEqual(restored.installed_models, [])
         self.assertEqual(restored.workloads, [])
+
+    def test_v2_full_snapshot_and_stage_markers_are_distinct(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            for name, repository, cache_kind in (
+                ("full", "Example/Full-AWQ", MODEL_CACHE_KIND_FULL_SNAPSHOT),
+                ("stage", "Example/Stage-AWQ", MODEL_CACHE_KIND_STAGE),
+            ):
+                model_path = model_root / name
+                model_path.mkdir(parents=True)
+                (model_path / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "_name_or_path": repository,
+                            "quantization_config": {"quant_method": "awq"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (model_path / ".dure-model.json").write_text(
+                    json.dumps(
+                        build_model_cache_marker(
+                            repository=repository,
+                            revision="a" * 40,
+                            manifest_digest="sha256:" + "b" * 64,
+                            quantization="awq",
+                            cache_kind=cache_kind,
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+
+            result = NodeProbe(FakeRunner(), model_roots=[model_root]).collect()
+
+        by_id = {item.model_id: item for item in result.installed_models}
+        self.assertEqual(
+            by_id["Example/Full-AWQ"].cache_kind,
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        )
+        self.assertEqual(
+            by_id["Example/Stage-AWQ"].cache_kind,
+            MODEL_CACHE_KIND_STAGE,
+        )
+        for item in by_id.values():
+            self.assertEqual(item.manifest_digest, "sha256:" + "b" * 64)
+            self.assertEqual(
+                item.verification_version, MODEL_CACHE_VERIFICATION_VERSION
+            )
+
+    def test_old_installed_model_json_defaults_cache_identity_fields(self):
+        value = NodeProbe(FakeRunner()).collect().to_dict()
+        value["installed_models"] = [
+            {
+                "source": "dure",
+                "model_id": "Example/Legacy-AWQ",
+                "path": "/var/lib/dure/models/legacy",
+                "revision": "a" * 40,
+                "quantization": "awq",
+                "size_mib": 1024,
+                "complete": True,
+            }
+        ]
+
+        restored = NodeProfile.from_dict(value)
+
+        model = restored.installed_models[0]
+        self.assertIsNone(model.manifest_digest)
+        self.assertIsNone(model.cache_kind)
+        self.assertIsNone(model.verification_version)
 
 
 if __name__ == "__main__":

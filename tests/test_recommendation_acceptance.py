@@ -216,7 +216,7 @@ class RecommendationAcceptanceTests(unittest.TestCase):
                 0,
             )
 
-    def test_postgresql_accept_locks_registry_and_inventory_tables(self):
+    def test_postgresql_accept_locks_evidence_registry_and_inventory_tables(self):
         session = Mock()
         session.get_bind.return_value.dialect.name = "postgresql"
         session.scalars.return_value = []
@@ -227,8 +227,9 @@ class RecommendationAcceptanceTests(unittest.TestCase):
         statement = str(session.execute.call_args.args[0])
         self.assertEqual(
             statement,
-            "LOCK TABLE model_artifacts, model_releases, nodes, node_profiles, "
-            "placement_profiles, runtime_releases IN SHARE MODE",
+            "LOCK TABLE benchmark_evidence, benchmark_runs, model_artifacts, "
+            "model_releases, nodes, node_profiles, placement_profiles, "
+            "runtime_releases IN SHARE MODE",
         )
         session.scalars.assert_not_called()
 
