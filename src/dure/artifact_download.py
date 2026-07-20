@@ -435,6 +435,7 @@ class ArtifactChunkDownloader:
         except Exception:
             raise ModelStoreError("MODEL_STORE_DOWNLOAD_REJECTED") from None
         deadline = time.monotonic() + self.timeout_seconds
+        body_completed = False
         try:
             try:
                 remaining = _validate_response(
@@ -484,6 +485,7 @@ class ArtifactChunkDownloader:
             if received != remaining:
                 raise ModelStoreError("MODEL_STORE_DOWNLOAD_INTERRUPTED")
             os.fsync(descriptor)
+            body_completed = True
             return offset + received
         except ModelStoreError:
             raise
@@ -495,7 +497,10 @@ class ArtifactChunkDownloader:
             try:
                 response.close()
             except Exception:
-                raise ModelStoreError("MODEL_STORE_DOWNLOAD_INTERRUPTED") from None
+                if body_completed:
+                    raise ModelStoreError(
+                        "MODEL_STORE_DOWNLOAD_INTERRUPTED"
+                    ) from None
 
     def download_chunk(
         self,
@@ -505,6 +510,28 @@ class ArtifactChunkDownloader:
         chunk_digest: str,
         expected_size: int,
     ) -> str:
+        try:
+            require_sha256_digest(manifest_digest, field="manifest_digest")
+        except ValueError:
+            raise ModelStoreError("MODEL_STORE_INVALID") from None
+        with self.store.artifact_lock(manifest_digest):
+            return self.download_chunk_locked(
+                origin=origin,
+                manifest_digest=manifest_digest,
+                chunk_digest=chunk_digest,
+                expected_size=expected_size,
+            )
+
+    def download_chunk_locked(
+        self,
+        *,
+        origin: TrustedHTTPSOrigin,
+        manifest_digest: str,
+        chunk_digest: str,
+        expected_size: int,
+    ) -> str:
+        """Prepare one chunk while the caller holds the artifact lock."""
+
         if type(origin) is not TrustedHTTPSOrigin:
             raise ModelStoreError("MODEL_STORE_INVALID")
         try:
@@ -520,9 +547,7 @@ class ArtifactChunkDownloader:
         ):
             raise ModelStoreError("MODEL_STORE_INVALID")
 
-        with self.store.artifact_lock(manifest_digest), self.store.chunk_lock(
-            chunk_digest
-        ):
+        with self.store.chunk_lock(chunk_digest):
             try:
                 existing = self.store._verified_chunk_without_lock(
                     chunk_digest, expected_size
@@ -549,9 +574,24 @@ class ArtifactChunkDownloader:
                 )
                 return str(existing)
 
-            _, descriptor, offset = self.store.open_chunk_partial(
-                chunk_digest, expected_size
-            )
+            try:
+                _, descriptor, offset = self.store.open_chunk_partial(
+                    chunk_digest, expected_size
+                )
+            except ModelStoreError as exc:
+                try:
+                    self.store.write_attempt(
+                        self._journal(
+                            manifest_digest,
+                            chunk_digest,
+                            0,
+                            status="FAILED",
+                            failure_code=exc.code,
+                        )
+                    )
+                except ModelStoreError:
+                    pass
+                raise
             try:
                 last_error: ModelStoreError | None = None
                 for attempt in range(self.attempts):

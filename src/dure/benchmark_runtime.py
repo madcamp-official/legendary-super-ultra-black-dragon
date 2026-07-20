@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import stat
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,10 +15,9 @@ from .command import Runner, SubprocessRunner
 from .model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_MARKER_FILE,
-    MODEL_CACHE_MARKER_MAX_BYTES,
     MODEL_CACHE_VERIFICATION_VERSION,
     ModelCacheMarkerError,
-    decode_model_cache_marker,
+    read_model_cache_marker,
 )
 from .models import InstalledModelProfile, NodeProfile
 from .probe import DEFAULT_MODEL_ROOTS
@@ -199,13 +200,13 @@ def _validated_model_path(
             "benchmark cache path is unavailable",
             code="BENCHMARK_ARTIFACT_UNAVAILABLE",
         ) from exc
-    if not resolved.is_dir() or not (resolved / "config.json").is_file():
+    if not _safe_owned_directory(resolved) or not (resolved / "config.json").is_file():
         raise BenchmarkRuntimeError(
             "benchmark cache is incomplete",
             code="BENCHMARK_ARTIFACT_UNAVAILABLE",
         )
     trusted_root = DEFAULT_MODEL_ROOTS[0].resolve()
-    if not resolved.is_relative_to(trusted_root):
+    if not _safe_owned_directory(trusted_root) or not resolved.is_relative_to(trusted_root):
         raise BenchmarkRuntimeError(
             "benchmark cache is outside the trusted model roots",
             code="BENCHMARK_ARTIFACT_UNAVAILABLE",
@@ -214,20 +215,27 @@ def _validated_model_path(
     return resolved
 
 
+def _safe_owned_directory(path: Path) -> bool:
+    try:
+        observed = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return (
+        stat.S_ISDIR(observed.st_mode)
+        and observed.st_uid == os.geteuid()
+        and not observed.st_mode & 0o022
+        and resolved == Path(os.path.abspath(path))
+    )
+
+
 def _validated_cache_metadata(
     model_path: Path, payload: BenchmarkTaskPayload
 ) -> None:
     metadata_path = model_path / MODEL_CACHE_MARKER_FILE
     try:
-        if metadata_path.stat().st_size > MODEL_CACHE_MARKER_MAX_BYTES:
-            raise BenchmarkRuntimeError(
-                "benchmark cache metadata is too large",
-                code="BENCHMARK_ARTIFACT_UNAVAILABLE",
-            )
-        metadata = decode_model_cache_marker(
-            metadata_path.read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeError, ModelCacheMarkerError) as exc:
+        metadata = read_model_cache_marker(metadata_path)
+    except ModelCacheMarkerError as exc:
         raise BenchmarkRuntimeError(
             "benchmark cache metadata is invalid",
             code="BENCHMARK_ARTIFACT_UNAVAILABLE",

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -25,6 +28,9 @@ _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _REVISION = re.compile(r"[0-9a-f]{40,64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _QUANTIZATION = re.compile(r"[a-z0-9][a-z0-9._-]{1,39}")
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 class ModelCacheMarkerError(ValueError):
@@ -103,6 +109,9 @@ def parse_model_cache_marker(value: Any) -> ModelCacheMarker:
 
 
 def decode_model_cache_marker(value: str) -> ModelCacheMarker:
+    if type(value) is not str:
+        raise ModelCacheMarkerError("model cache marker must be JSON text")
+
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, item in pairs:
@@ -113,9 +122,81 @@ def decode_model_cache_marker(value: str) -> ModelCacheMarker:
 
     try:
         decoded = json.loads(value, object_pairs_hook=unique_object)
-    except json.JSONDecodeError as exc:
+    except ModelCacheMarkerError:
+        raise
+    except (RecursionError, ValueError) as exc:
         raise ModelCacheMarkerError("model cache marker is not valid JSON") from exc
     return parse_model_cache_marker(decoded)
+
+
+def read_model_cache_marker(path: Path) -> ModelCacheMarker:
+    """Read one bounded regular marker without following filesystem links."""
+
+    candidate = Path(path)
+    descriptor = -1
+    try:
+        observed = candidate.lstat()
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.geteuid()
+            or observed.st_nlink != 1
+            or observed.st_mode & 0o022
+            or observed.st_size > MODEL_CACHE_MARKER_MAX_BYTES
+        ):
+            raise ModelCacheMarkerError("model cache marker is not a bounded regular file")
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY | _CLOEXEC | _NOFOLLOW | _NONBLOCK,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o022
+            or before.st_dev != observed.st_dev
+            or before.st_ino != observed.st_ino
+            or before.st_size > MODEL_CACHE_MARKER_MAX_BYTES
+        ):
+            raise ModelCacheMarkerError("model cache marker identity changed")
+
+        payload = bytearray()
+        while len(payload) <= MODEL_CACHE_MARKER_MAX_BYTES:
+            block = os.read(
+                descriptor,
+                min(8192, MODEL_CACHE_MARKER_MAX_BYTES + 1 - len(payload)),
+            )
+            if not block:
+                break
+            payload.extend(block)
+        if len(payload) > MODEL_CACHE_MARKER_MAX_BYTES:
+            raise ModelCacheMarkerError("model cache marker is too large")
+
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after or len(payload) != before.st_size:
+            raise ModelCacheMarkerError("model cache marker changed while being read")
+        return decode_model_cache_marker(payload.decode("utf-8"))
+    except ModelCacheMarkerError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ModelCacheMarkerError("model cache marker cannot be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def build_model_cache_marker(

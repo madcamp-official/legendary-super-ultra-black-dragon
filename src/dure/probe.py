@@ -6,17 +6,18 @@ import platform
 import re
 import shutil
 import socket
+import stat
 from pathlib import Path
 
 from .command import Runner, SubprocessRunner
 from .model_cache import (
     MODEL_CACHE_MARKER_FILE,
-    MODEL_CACHE_MARKER_MAX_BYTES,
     MODEL_CACHE_SCHEMA_V1,
     ModelCacheMarker,
     ModelCacheMarkerError,
-    decode_model_cache_marker,
+    read_model_cache_marker,
 )
+from .model_store import DURE_MODEL_STAGING_DIRECTORY
 from .models import (
     GPUProfile,
     InstalledModelProfile,
@@ -33,6 +34,7 @@ DEFAULT_MODEL_ROOTS = (
     Path.home() / ".cache" / "huggingface" / "hub",
 )
 MAX_DISCOVERED_MODELS = 100
+MAX_MODEL_CONFIG_BYTES = 1024 * 1024
 DURE_MODEL_METADATA_FILE = MODEL_CACHE_MARKER_FILE
 DURE_MODEL_METADATA_SCHEMA = MODEL_CACHE_SCHEMA_V1
 LLM_RUNTIME_MARKERS = {
@@ -142,14 +144,111 @@ class NodeProbe:
         )
 
     @staticmethod
-    def _model_config(path: Path) -> dict:
+    def _model_config(path: Path) -> dict | None:
+        descriptor = -1
         try:
-            if path.stat().st_size > 1024 * 1024:
-                return {}
-            value = json.loads(path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+            observed = path.lstat()
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or observed.st_mode & 0o022
+                or observed.st_size > MAX_MODEL_CONFIG_BYTES
+            ):
+                return None
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_dev != observed.st_dev
+                or before.st_ino != observed.st_ino
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or before.st_mode & 0o022
+                or before.st_size != observed.st_size
+            ):
+                return None
+            payload = bytearray()
+            while len(payload) <= MAX_MODEL_CONFIG_BYTES:
+                block = os.read(
+                    descriptor,
+                    min(8192, MAX_MODEL_CONFIG_BYTES + 1 - len(payload)),
+                )
+                if not block:
+                    break
+                payload.extend(block)
+            after = os.fstat(descriptor)
+            if (
+                len(payload) != before.st_size
+                or (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+            ):
+                return None
+
+            def unique_object(pairs: list[tuple[str, object]]) -> dict:
+                value: dict = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("duplicate model config key")
+                    value[key] = item
+                return value
+
+            value = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=unique_object,
+            )
+            return value if type(value) is dict else None
+        except (OSError, RecursionError, UnicodeError, ValueError):
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    @staticmethod
+    def _safe_model_directory(path: Path) -> bool:
+        try:
+            observed = path.lstat()
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (
+            stat.S_ISDIR(observed.st_mode)
+            and observed.st_uid == os.geteuid()
+            and not observed.st_mode & 0o022
+            and resolved == Path(os.path.abspath(path))
+        )
+
+    @classmethod
+    def _huggingface_model_config(
+        cls, path: Path, repository: Path
+    ) -> dict | None:
+        try:
+            resolved_repository = repository.resolve(strict=True)
+            resolved_blobs = (resolved_repository / "blobs").resolve(strict=True)
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if not resolved.is_relative_to(resolved_blobs):
+            return None
+        return cls._model_config(resolved)
 
     def _model_size_mib(self, path: Path) -> int | None:
         if not self.runner.exists("du"):
@@ -174,22 +273,37 @@ class NodeProbe:
     def _dure_model_metadata(candidate: Path) -> ModelCacheMarker | None:
         path = candidate / DURE_MODEL_METADATA_FILE
         try:
-            if path.stat().st_size > MODEL_CACHE_MARKER_MAX_BYTES:
-                return None
-            return decode_model_cache_marker(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ModelCacheMarkerError):
+            return read_model_cache_marker(path)
+        except ModelCacheMarkerError:
             return None
 
     def _probe_dure_models(self, root: Path) -> list[InstalledModelProfile]:
+        if not self._safe_model_directory(root):
+            return []
         try:
-            candidates = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name)
+            candidates = []
+            for item in root.iterdir():
+                if item.name == DURE_MODEL_STAGING_DIRECTORY:
+                    continue
+                try:
+                    state = item.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISDIR(state.st_mode) and self._safe_model_directory(item):
+                    candidates.append(item)
+            candidates.sort(key=lambda item: item.name)
         except OSError:
             return []
         models: list[InstalledModelProfile] = []
         for candidate in candidates[:MAX_DISCOVERED_MODELS]:
             config_path = candidate / "config.json"
-            config = self._model_config(config_path) if config_path.is_file() else {}
-            metadata = self._dure_model_metadata(candidate)
+            parsed_config = self._model_config(config_path)
+            config = parsed_config or {}
+            metadata = (
+                self._dure_model_metadata(candidate)
+                if parsed_config is not None
+                else None
+            )
             configured_quantization = self._quantization(config)
             if (
                 metadata
@@ -219,7 +333,7 @@ class NodeProbe:
                         else configured_quantization
                     ),
                     size_mib=self._model_size_mib(candidate),
-                    complete=config_path.is_file(),
+                    complete=parsed_config is not None,
                     manifest_digest=metadata.manifest_digest if metadata else None,
                     cache_kind=metadata.cache_kind if metadata else None,
                     verification_version=(
@@ -251,7 +365,12 @@ class NodeProbe:
                 snapshots = []
             snapshot = snapshots[0] if snapshots else None
             config_path = snapshot / "config.json" if snapshot else None
-            config = self._model_config(config_path) if config_path and config_path.is_file() else {}
+            parsed_config = (
+                self._huggingface_model_config(config_path, repository)
+                if config_path
+                else None
+            )
+            config = parsed_config or {}
             models.append(
                 InstalledModelProfile(
                     source="huggingface-cache",
@@ -260,7 +379,7 @@ class NodeProbe:
                     revision=snapshot.name if snapshot else None,
                     quantization=self._quantization(config),
                     size_mib=self._model_size_mib(repository),
-                    complete=bool(snapshot and config_path and config_path.is_file()),
+                    complete=bool(snapshot and parsed_config is not None),
                 )
             )
         return models
