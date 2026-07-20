@@ -1,85 +1,91 @@
-# Dure Architecture
+# Dure 아키텍처
 
-## System overview
+## 시스템 개요
 
-Dure has three cooperating surfaces:
+Dure는 세 개의 협력 계층으로 구성됩니다.
 
 ```text
-Operator CLI ──HTTPS──> Control Plane ──PostgreSQL
-                         ▲
-                         │ outbound heartbeat/task polling
-                         │
-                    dure-agent
-                         │
-                 Docker / Ray / vLLM
+운영자 CLI ── HTTPS ──> 중앙 제어면 ── PostgreSQL
+                              ↑
+                    외부 방향 하트비트·작업 폴링
+                              │
+                         dure-agent
+                              │
+                    Docker / Ray / vLLM
 ```
 
-- The local CLI probes hardware and can plan or apply deployments without central management.
-- The control plane stores node profiles, observed and desired state, deployments, tasks,
-  credentials, and audit events.
-- The root-owned Agent joins a controller, sends heartbeat state, claims approved tasks, and invokes
-  only predefined Python operations.
-- Ray is an internal implementation detail of a trusted pod, not an enrollment or security layer.
+- 로컬 CLI는 중앙 관리 없이도 하드웨어를 조사하고 배포 계획을 만들고 적용·검증할 수 있습니다.
+- 중앙 제어면은 노드 프로필, 관측·희망 상태, 배포 구성, 작업, 자격 증명, 감사 이벤트를 저장합니다.
+- root 권한 에이전트는 중앙 제어면에 외부 방향 폴링으로 연결하고, 미리 정의된 Python 작업만 실행합니다.
+- Ray는 신뢰된 포드 내부의 분산 실행 수단이며, 등록·인증·보안 경계가 아닙니다.
 
-## Node lifecycle
+## 노드 수명 주기
 
-Package installation provides `/etc/dure/dure-client.env`, containing the deployment's controller
-address. `sudo dure join` sends an installation ID and `NodeProfile` to `POST /v1/nodes/join`.
-The server creates a node-specific credential and records the node as pending.
+패키지 설치 시 `/etc/dure/dure-client.env`에 중앙 제어면 주소가 제공됩니다. `sudo dure join`은 설치 ID와 `NodeProfile`을 `POST /v1/nodes/join`으로 보내며, 서버는 노드별 자격 증명을 발급하고 노드를 대기 상태로 기록합니다.
 
-Pending nodes can authenticate and heartbeat, but task claim returns no work. An operator promotes
-the node with `dure admin node approve <node-id>`. Revocation disables the node and revokes its
-active credentials.
+대기 상태 노드는 인증과 하트비트는 가능하지만 작업 요청 결과는 비어 있습니다. 운영자가 `dure admin node approve <node-id>`로 승인해야 작업을 받을 수 있습니다. 폐기는 노드를 비활성화하고 활성 자격 증명을 폐기합니다.
 
-Local deployment state remains:
+로컬 deployment 상태는 다음과 같습니다.
 
 ```text
 DISCOVERED → PROBING → ELIGIBLE → PLANNED → DOWNLOADING
-           → STARTING → VERIFYING → READY
-                                └→ WAITING_FOR_PEERS
-Any blocking failure ────────────→ FAILED
+                                      ↓
+                              STARTING → VERIFYING → READY
+                                             └────→ WAITING_FOR_PEERS
+차단 오류 발생 → FAILED
 ```
 
-The server stores desired task state separately from the Agent's observed lifecycle state.
+서버의 desired task 상태와 Agent가 보고하는 observed lifecycle 상태는 별도로 저장합니다.
 
-## Capacity diagnosis
+## 현재 용량 진단
 
-`dure admin diagnose` queues only the existing closed-enum `PROBE` task on approved online nodes.
-The resulting profiles include hardware, Dure and Hugging Face model caches, Ollama model names,
-and a metadata-only view of Dure or common LLM containers. Container commands, environment values,
-mount contents, prompts, and credentials are not collected.
+`dure admin diagnose`는 승인되고 온라인인 노드에 기존의 `PROBE` 작업만 요청합니다. 결과 프로필에는 하드웨어, Dure/Hugging Face 모델 캐시, Ollama 모델 이름, Dure 또는 일반 LLM 컨테이너의 메타데이터만 포함됩니다.
 
-The admin CLI reads `GET /v1/admin/inventory` and invokes `codex exec` locally on the operator's
-computer. Codex runs in an empty temporary directory with an ephemeral session, read-only sandbox,
-no project rules or user tool configuration, a non-inheriting shell environment, and a strict JSON
-output schema. This is an advisory control-plane operation: it cannot create a deployment or send a
-new task type to an Agent.
+컨테이너 명령, 환경 변수, 마운트 내용, 자격 증명, 프롬프트는 수집하지 않습니다. 운영자 CLI는 `GET /v1/admin/inventory` 결과를 읽고, 운영자 컴퓨터의 `codex exec`를 빈 임시 디렉터리와 읽기 전용 샌드박스에서 실행합니다. 이 진단은 참고용이며 배포 구성 생성이나 새 에이전트 작업 유형 전송 권한이 없습니다.
 
-CPU-only nodes are currently diagnosed for utility work such as the controller, gateway, artifact
-cache, observability, request queue, and preprocessing. The current runtime still requires a GPU
-node to be the Ray head for a Dure deployment.
+CPU 전용 노드는 중앙 제어면, 게이트웨이, 아티팩트 캐시, 관측성, 대기열, 전처리 같은 보조 역할의 후보가 될 수 있습니다. 현재 Dure 런타임은 GPU 노드가 Ray head여야 하며 CPU 노드에는 모델 레이어를 배정하지 않습니다.
 
-## Task protocol
+## 계획된 모델 추천 흐름
 
-Supported task types are `PROBE`, `VERIFY`, `APPLY_DEPLOYMENT`, `START_DEPLOYMENT`,
-`STOP_DEPLOYMENT`, and `RESTART_DEPLOYMENT`.
+GPU 추가에 따른 정책 기반 모델 추천은 아직 구현되지 않았습니다. 구현 시 다음 경계를 유지합니다.
 
-The Agent polls over HTTPS, leases one task for five minutes, and renews the lease while executing.
-Completed task IDs and outcomes are retained locally so a retried delivery reports the prior result
-instead of repeating a mutation. PostgreSQL row locks serialize claims for a node.
+```text
+승인 또는 PROBE 완료
+        ↓
+신선한 인벤토리 스냅샷
+        ↓
+결정론적 계획기와 ACTIVE 모델 릴리스 평가
+        ↓
+추천 생성 (호스트 변경 없음)
+        ↓
+운영자 승인 → 배포 세대 생성 → 명시적 적용
+```
 
-Plans use server-issued node UUIDs. The controller can normalize a legacy hostname assignment only
-when it resolves to exactly one approved node. Central images must be pinned by OCI digest.
+추천기는 모델의 이름·크기만 비교하지 않고 GPU VRAM, 드라이버·연산 능력, 디스크, 모델 아티팩트, 런타임 이미지, 컨텍스트·동시성, 네트워크/NCCL 조건을 평가합니다. 모델 레지스트리, 아티팩트 검증, 세대별 단계적 전환의 상세 정책은 [모델 선택 정책](model-selection.md)과 [벤치마크 문서](benchmarking.md)를 따릅니다.
 
-## Trust boundaries
+Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해석할 수 있는 참고 보고서로 유지합니다.
 
-- The public management boundary is HTTPS; database and Ray ports remain private.
-- Admin bearer credentials and node credentials have different authority.
-- Tokenless join grants only pending heartbeat access, never execution authority.
-- The Agent runs as root because it manages Docker and `/var/lib/dure`; its task language is closed
-  to prevent the controller from becoming a general remote shell.
-- The operator of a GPU host can observe local workloads. Community nodes are not suitable for
-  secrets or sensitive prompts without a stronger confidential-computing boundary.
+## 작업 프로토콜
 
-See [operations.md](operations.md) for deployment procedures and [security.md](security.md) for the
-threat model and hardening backlog.
+현재 지원하는 작업 유형은 다음으로 고정됩니다.
+
+- `PROBE`
+- `VERIFY`
+- `APPLY_DEPLOYMENT`
+- `START_DEPLOYMENT`
+- `STOP_DEPLOYMENT`
+- `RESTART_DEPLOYMENT`
+
+에이전트는 HTTPS 폴링으로 한 번에 하나의 작업을 5분 임대로 요청하고 실행 중 임대를 갱신합니다. 완료한 작업 ID와 결과는 로컬에 보관하므로 재전달된 작업은 가능한 한 변경을 반복하지 않고 이전 결과를 보고합니다. PostgreSQL 노드 행 잠금은 같은 노드의 요청을 직렬화합니다.
+
+계획은 서버가 발급한 노드 UUID를 사용합니다. 레거시 호스트명 배정은 승인된 노드 하나로만 해석될 때 정규화할 수 있습니다. 중앙 배포 이미지는 OCI 다이제스트로 고정돼야 합니다.
+
+## 신뢰 경계
+
+- 공개 관리 경계는 HTTPS이며 데이터베이스와 Ray 포트는 사설망에 남아야 합니다.
+- 관리자 전달자 자격 증명과 노드 자격 증명은 다른 권한을 가집니다.
+- 토큰 없는 등록은 대기 상태 하트비트 권한만 주며 실행 권한을 주지 않습니다.
+- 에이전트는 Docker와 `/var/lib/dure`를 관리하므로 root로 실행됩니다. 중앙 제어면이 일반 원격 셸이 되지 않도록 작업 언어는 폐쇄형입니다.
+- GPU 호스트 운영자는 로컬 작업 부하를 관찰할 수 있습니다. 더 강한 기밀 컴퓨팅 경계가 생기기 전에는 민감 프롬프트나 비밀값을 커뮤니티 노드에서 처리하면 안 됩니다.
+
+운영 절차는 [operations.md](operations.md), 위협 모델과 보안 강화 작업 목록은 [security.md](security.md)를 참고합니다.

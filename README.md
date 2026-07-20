@@ -1,68 +1,74 @@
 # Dure
 
-**Dure — Pool compute. Share intelligence.**
+**유휴 GPU를 모아 신뢰 가능한 커뮤니티 LLM 인프라를 구축합니다.**
 
-Dure is an early Linux CLI and node agent for building resource-aware community LLM infrastructure. It inventories a node, classifies useful roles, creates a model deployment plan, prepares model artifacts and containers, joins a Ray cluster, and verifies GPU/Ray/vLLM readiness.
+Dure는 Linux CLI, 노드 에이전트, 선택형 중앙 제어면으로 구성된 커뮤니티 LLM 인프라 MVP입니다. 노드 하드웨어를 조사하고, 자원에 맞는 배포 계획을 만들며, Docker·Ray·vLLM으로 모델을 준비하고, GPU·클러스터·API 준비 상태를 확인합니다.
 
-This repository is an executable MVP. It is not yet a hardened public volunteer-computing platform.
+이 저장소는 신뢰된 운영자와 사설 네트워크를 위한 실행 가능한 MVP입니다. 누구나 참여하는 공개 GPU 네트워크나 완성된 공개 추론 서비스는 아직 제공하지 않습니다.
 
-## What works
+## 현재 제공 기능
 
-- Ubuntu/Linux host, memory, disk, virtualization and network inventory
-- NVIDIA GPU, VRAM, driver and compute-capability detection
-- Docker/NVIDIA runtime and Ray detection
-- CPU-only utility-node classification
-- Local Qwen2.5 AWQ model recommendations
-- Three-node 24GB GPU planning for Qwen2.5-72B-AWQ
-- Automatic 80-layer partitioning into `27/27/26`
-- Persisted node lifecycle state
-- Resumable Hugging Face CLI download staging
-- Docker command execution for Ray head/workers and a vLLM API
-- Host GPU, container CUDA, Ray resource, HTTP health and served-model checks
-- Dure/Hugging Face/Ollama model inventory and Dure or common LLM container discovery
-- Codex-assisted central capacity diagnosis for GPU/Ray placement and CPU utility roles
-- Dry-run by default; mutation requires explicit flags
+- Linux 호스트의 CPU, 메모리, 디스크, 가상화, 네트워크 정보 수집
+- NVIDIA GPU, VRAM, 드라이버, compute capability 조사
+- Docker/NVIDIA runtime/Ray 탐지 및 CPU 전용 utility 노드 분류
+- Qwen2.5 AWQ 7B·14B·32B·72B의 로컬 계획 생성
+- 3대의 24GB GPU 노드를 이용한 Qwen2.5-72B-AWQ pipeline 계획과 `27/27/26` 레이어 분할
+- 노드 수명 주기 상태의 원자적 저장
+- 재개 가능한 Hugging Face 다운로드 준비 영역 및 Docker 기반 Ray/vLLM 실행
+- 호스트 GPU, 컨테이너 CUDA, Ray 리소스, HTTP 상태 확인, 제공 모델 검증
+- Dure·Hugging Face·Ollama 모델 캐시와 일반 LLM 컨테이너의 메타데이터 수집
+- 대기 상태 승인, 외부 방향 폴링, 임대 기반 중앙 작업 관리
+- Codex를 이용한 읽기 전용 용량 진단
+- 기본 모의 실행과 명시적 변경 플래그
 
-## Install for development
+## 문서
+
+- [문서 색인](docs/README.md)
+- [아키텍처](docs/architecture.md)
+- [운영 절차](docs/operations.md)
+- [보안 모델](docs/security.md)
+- [모델 선택 정책](docs/model-selection.md) — 계획됨
+- [벤치마크 및 모델 자격 검증](docs/benchmarking.md) — 계획됨
+- [개발·릴리스 절차](docs/development.md)
+- [APT 배포](docs/apt-distribution.md)
+- [개발 로드맵](docs/roadmap.md)
+- [제품 제안서](docs/dure-proposal.md)
+
+## 개발 환경 설치
 
 ```bash
 cd /root/workspace/dure
 python3 -m pip install -e '.[test]'
 ```
 
-The signed APT package contains the dependency-free node CLI and Agent. Install the central
-Control Plane from source with `python3 -m pip install -e '.[server]'`; its modern FastAPI and
-SQLAlchemy requirements are intentionally not resolved from Ubuntu 22.04 system packages.
+서명된 APT 패키지에는 의존성이 없는 노드 CLI와 Agent만 포함됩니다. 중앙 제어면은 별도로 설치합니다.
 
-## Install from APT
+```bash
+python3 -m pip install -e '.[server]'
+```
 
-Once the signed repository has been published, users register it once and install Dure:
+## APT 설치
+
+서명된 저장소가 게시된 뒤에는 다음 한 번의 등록으로 설치할 수 있습니다.
 
 ```bash
 curl -fsSL https://chek737.github.io/dure/install.sh | sudo sh
 ```
 
-APT signing-key fingerprint:
-`E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01`.
+APT 서명 키 fingerprint는 다음과 같습니다.
 
-Subsequent installs and upgrades use normal APT commands:
+```text
+E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01
+```
+
+이후 설치와 업그레이드는 일반 APT 명령을 사용합니다.
 
 ```bash
 sudo apt install dure
 sudo apt upgrade
 ```
 
-See [docs/apt-distribution.md](docs/apt-distribution.md) for signing, GitHub Pages publishing, manual repository registration, and release instructions.
-
-Additional documentation:
-
-- [Architecture](docs/architecture.md)
-- [Control-plane operations](docs/operations.md)
-- [Security model](docs/security.md)
-- [Development and release workflow](docs/development.md)
-- [Development roadmap](docs/roadmap.md)
-
-Then inspect the local node:
+## 노드 조사
 
 ```bash
 dure doctor
@@ -70,9 +76,9 @@ dure doctor --json
 dure doctor --output camp-9.json
 ```
 
-## Create a plan
+## 배포 계획 만들기
 
-Export a profile on each node:
+각 노드에서 프로필을 내보냅니다.
 
 ```bash
 dure doctor --output camp-7.json
@@ -80,7 +86,7 @@ dure doctor --output camp-8.json
 dure doctor --output camp-9.json
 ```
 
-Create a shared deployment plan:
+공유할 계획을 만듭니다.
 
 ```bash
 dure plan \
@@ -93,18 +99,18 @@ dure plan \
   --output qwen72b-plan.json
 ```
 
-The generated plan assigns one Ray rank and one pipeline stage to each node. Every node must receive the exact same plan file.
+생성된 계획은 Ray 순위와 파이프라인 단계를 각 노드에 하나씩 할당합니다. 모든 노드는 동일한 계획 파일을 받아야 합니다.
 
-## Initialize a node
+## 노드 초기화와 검증
 
-Safe dry run:
+안전한 모의 실행:
 
 ```bash
 dure init --plan qwen72b-plan.json
 dure status
 ```
 
-Apply the plan after reviewing it:
+검토 후 실제 적용:
 
 ```bash
 sudo dure init \
@@ -114,7 +120,7 @@ sudo dure init \
   --pull
 ```
 
-Run `--serve` only on the assigned Ray head after all workers have joined:
+API는 할당된 Ray head에서만 시작합니다. 모든 worker가 join한 뒤 Ray head에서 실행합니다.
 
 ```bash
 sudo dure init \
@@ -123,74 +129,62 @@ sudo dure init \
   --serve
 ```
 
-Verify the deployment:
+배포를 검증합니다.
 
 ```bash
 dure verify --plan qwen72b-plan.json --api
 ```
 
-## Safety model
+## 안전 모델
 
-Dure does not install or change an NVIDIA host driver. A mismatched or unavailable driver blocks provisioning and requires administrator action.
+Dure는 NVIDIA host driver를 설치하거나 변경하지 않습니다. driver가 없거나 호환되지 않으면 provisioning을 중단하며, 운영자가 직접 조치해야 합니다.
 
-The CLI refuses to apply any image not pinned by OCI digest unless `--allow-unpinned-image` is supplied. Production plans should use an immutable OCI digest.
+CLI는 OCI 다이제스트로 고정되지 않은 이미지를 기본적으로 거부합니다. 중앙 배포는 항상 다이제스트로 고정한 이미지를 요구합니다. 모델 다운로드는 `--accept-model-download`, 이미지 내려받기는 `--pull`, 중지된 컨테이너 교체는 `--replace`가 필요합니다.
 
-Model downloads require `--accept-model-download`; image pulls require `--pull`; replacement of an existing stopped container requires `--replace`.
+Ray GCS, 대시보드, 워커 포트는 신뢰된 LAN 또는 WireGuard 같은 사설 오버레이에만 노출해야 합니다. 공개 인터넷에 노출해서는 안 됩니다.
 
-Ray ports must be restricted to a trusted LAN or private overlay such as WireGuard. Do not expose the Ray GCS, dashboard, or worker ports to the public Internet.
-
-## Lifecycle
+## 노드 수명 주기
 
 ```text
 DISCOVERED → PROBING → ELIGIBLE → PLANNED
-           → DOWNLOADING → STARTING → VERIFYING → READY
-                                      └────────→ WAITING_FOR_PEERS
-Any blocking error ────────────────────────────→ FAILED
+                        ↓
+                  DOWNLOADING → STARTING → VERIFYING → READY
+                                                └────→ WAITING_FOR_PEERS
+차단 오류 발생 → FAILED
 ```
 
-State is stored under `$XDG_STATE_HOME/dure/state.json`, or `~/.local/state/dure/state.json` by default.
+상태는 `$XDG_STATE_HOME/dure/state.json` 또는 기본 경로인 `~/.local/state/dure/state.json`에 저장됩니다.
 
-## Current limitations
+## 현재 제한 사항
 
-- Central deployment planning still requires exported profile files; direct planning from registered
-  node profiles is not yet implemented.
-- Docker is the only apply-mode container backend.
-- The MVP assigns at most one GPU per physical node.
-- Network benchmark and NCCL collective probe are not yet implemented.
-- vLLM startup is implemented but needs broader image/version compatibility testing.
-- Artifact hashes rely on a pinned Hugging Face revision; a signed model manifest is planned.
-- No credit ledger, authentication, WireGuard automation or public-node sandbox yet.
+- 현재 `--model auto`는 고정된 Qwen2.5 AWQ 카탈로그를 사용합니다. GPU 추가에 따른 정책 기반 추천·모델 레지스트리·자동 후보 재계산은 [모델 선택 정책](docs/model-selection.md)에서 계획 중인 기능입니다.
+- 중앙에서 등록 노드 프로필만으로 계획을 생성하는 기능은 아직 구현되지 않았고, 프로필 JSON 파일이 필요합니다.
+- 적용 모드는 Docker만 지원하며, 물리 노드당 GPU 한 장만 배정합니다.
+- 네트워크 벤치마크와 NCCL 집합 연산 조사는 아직 구현되지 않았습니다.
+- 모델 아티팩트의 서명된 매니페스트와 이미지 서명 검증은 계획 단계입니다.
+- 게이트웨이, 최종 사용자 인증, 크레딧 원장, WireGuard 자동화, 공개 노드 샌드박스는 아직 제공하지 않습니다.
 
-These boundaries are intentional: the current milestones focus on deterministic node discovery, safe provisioning, readiness, and trusted-node control before adding a public inference gateway.
+## 중앙 노드 관리
 
-## Central node management
+Dure에는 선택형 FastAPI/PostgreSQL 제어면과 외부 방향 폴링 노드 에이전트가 있습니다. `dure-server --migrate`를 실행하고 `DURE_DATABASE_URL`, `DURE_ADMIN_TOKEN`을 설정한 뒤 TLS 역방향 프록시 뒤에서 `dure-server`를 시작합니다.
 
-Dure includes an optional FastAPI/PostgreSQL control plane and an outbound-polling node agent.
-Run `dure-server --migrate`, set `DURE_DATABASE_URL` and `DURE_ADMIN_TOKEN`, then start
-`dure-server` behind a TLS reverse proxy.
-
-The package carries the deployment's control-plane address in
-`/etc/dure/dure-client.env`. A new machine joins without a per-node token or server argument:
+패키지의 `/etc/dure/dure-client.env`에는 제어면 주소가 들어 있습니다. 새 머신은 별도 노드 토큰이나 서버 인자 없이 등록합니다.
 
 ```bash
 sudo apt install dure
 sudo dure join
 ```
 
-Joining records the machine as pending, stores its credential, and starts `dure-agent`.
-The agent may send heartbeats while pending but cannot receive work. Approve it centrally:
+등록한 노드는 대기 상태입니다. 하트비트는 보낼 수 있지만 승인 전에는 작업을 요청할 수 없습니다.
 
 ```bash
 dure admin nodes --pending
 dure admin node approve <node-id>
 ```
 
-Central tasks are restricted to probe, verify, apply, start, stop, and restart operations;
-arbitrary remote shell commands are not accepted. Central deployments require an OCI
-digest-pinned image. The one-time enrollment-token endpoint remains for compatibility.
+중앙 작업은 `PROBE`, `VERIFY`, `APPLY_DEPLOYMENT`, `START_DEPLOYMENT`, `STOP_DEPLOYMENT`, `RESTART_DEPLOYMENT`로 고정됩니다. 임의 remote shell 명령은 받지 않습니다.
 
-On the admin computer, refresh approved online nodes and ask the locally authenticated Codex CLI
-for an advisory capacity report:
+관리자는 승인된 온라인 노드의 metadata를 이용해 Codex 기반 용량 진단을 요청할 수 있습니다.
 
 ```bash
 codex login status
@@ -198,11 +192,9 @@ dure admin diagnose
 dure admin diagnose --nodes <node-id> <node-id> --json --output diagnosis.json
 ```
 
-The command sends hardware, network, installed-model, and LLM-container metadata to the configured
-Codex provider. It never sends Dure credentials and does not apply the recommendation. Upgrade the
-Agents before diagnosis so their `PROBE` results include the new model and workload inventory.
+진단은 하드웨어, 네트워크, 설치 모델, 컨테이너 metadata를 configured Codex provider로 보냅니다. Dure credential, container 환경 변수·명령, mount 내용, prompt는 보내지 않으며 진단 자체가 배포를 만들거나 적용하지도 않습니다.
 
-## Tests
+## 테스트
 
 ```bash
 python3 -m unittest discover -v

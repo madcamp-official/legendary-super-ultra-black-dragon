@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
-기준일: 2026-07-19
-현재 개발 브랜치: `version/0.3.3`
+기준일: 2026-07-20
+현재 개발 브랜치: `version/0.3.5` (v0.3.4 기준 문서·추천기 작업)
 
 ## 방향과 원칙
 
@@ -10,13 +10,13 @@ Dure의 다음 목표는 기능 수를 빠르게 늘리는 것이 아니라, 현
 
 1. 수동 파일 교환과 환경별 하드코딩을 먼저 제거한다.
 2. 공개 API보다 노드·모델 배포의 재현성, 보안, 장애 복구를 먼저 검증한다.
-3. Ray는 신뢰된 pod 내부에만 두고 등록·인증·스케줄링은 Control Plane이 담당한다.
-4. 각 버전은 exit criteria를 모두 통과한 후 사용자의 명시적 요청으로만 `main`에 병합한다.
-5. 공개 참여는 보안 gate와 trusted alpha 운영 데이터가 확보된 후에만 시작한다.
+3. Ray는 신뢰된 포드 내부에만 두고 등록·인증·스케줄링은 중앙 제어면이 담당한다.
+4. 각 버전은 완료 기준을 모두 통과한 후 사용자의 명시적 요청으로만 `main`에 병합한다.
+5. 공개 참여는 보안 통과 기준과 신뢰된 알파 운영 데이터가 확보된 후에만 시작한다.
 
 ## 단계별 계획
 
-### v0.3 — Trusted control plane 안정화
+### v0.3 — 신뢰된 중앙 제어면 안정화
 
 예상 기간: 1~2주
 목표: 설치한 노드가 `dure join`으로 등록되고 중앙에서 계획·배포·검증되는 전체 경로를 완성한다.
@@ -35,7 +35,7 @@ Dure의 다음 목표는 기능 수를 빠르게 늘리는 것이 아니라, 현
 - 서버 DB 백업·복구, Agent 재시작, credential revoke/rotate 운영 절차를 실제로 리허설한다.
 - README의 오래된 수동 controller 제한 설명과 모든 CLI 예제를 현재 동작에 맞춘다.
 
-Exit criteria:
+완료 기준:
 
 - 새 노드가 패키지 설치 후 `sudo dure join`만으로 pending 목록에 나타난다.
 - 승인되지 않은 노드는 task를 한 건도 받을 수 없다.
@@ -43,6 +43,28 @@ Exit criteria:
 - 72B pod가 24시간 연속 동작하고 중앙 stop/restart 후 동일 generation으로 복구된다.
 - PostgreSQL 백업에서 노드·deployment·task 이력을 복원할 수 있다.
 - main 병합 전에 CI와 실제 3노드 acceptance checklist가 모두 통과한다.
+
+### v0.3.5 — 결정론적 모델 추천 기반
+
+목표: GPU가 추가되었을 때 현재 고정 Qwen2.5 카탈로그와 프로필 입력 순서에 의존하지 않고, 검증된 후보 중 SLO를 만족하는 최고 품질 모델을 **추천만** 한다.
+
+우선순위 작업:
+
+- `quality-within-SLO` 정책과 카탈로그·배치 프로필을 도입한다.
+- 승인됨·온라인·최신 노드 인벤토리를 UUID 기준으로 정렬해 결정론적으로 평가한다.
+- VRAM, 디스크, Docker/NVIDIA 런타임, 드라이버·연산 능력, 모델 캐시, 네트워크/NCCL 사전 조건을 후보별로 설명한다.
+- `dure admin deployment recommend`와 인벤토리 기반 미리보기를 추가하되 배포 구성·작업·Docker 변경을 만들지 않는다.
+- 기존 프로필 JSON 방식과 명시적 `--model`, 기존 계획 JSON 호환성을 유지한다.
+- Qwen3.5 등 신규 후보는 변경 불가능한 리비전, 런타임 이미지 다이제스트, 라이선스, 벤치마크 결과를 갖춘 뒤에만 활성 카탈로그에 넣는다.
+- 일반 push/PR CI에서 의존성 없는 핵심, 서버 추가 의존성, 선택기 순열, 마이그레이션, 휠, Debian 간이 검사를 검증한다.
+
+완료 기준:
+
+- 같은 인벤토리는 입력 순서와 무관하게 동일한 추천과 탈락 사유를 만든다.
+- 대기 중·오프라인·오래된 노드, 3×22GB, 네트워크/NCCL 미검증 포드는 72B 후보를 통과하지 못한다.
+- GPU 추가가 자동 다운로드·이미지 내려받기·적용·기존 배포 중지를 유발하지 않는다.
+- 3×24GB의 정상 사설망에서는 기존 72B 기준선과 호환되는 추천을 만들 수 있다.
+- 새 문서, 단위·통합 테스트, GPU 수용 검사 아티팩트가 정책과 일치한다.
 
 ### v0.4 — 노드 보안과 사설 네트워크
 
@@ -60,30 +82,30 @@ Exit criteria:
 - join flood, credential 오용, 반복 task 실패, heartbeat 손실에 대한 구조화 감사 로그와 경보를
   추가한다.
 
-Exit criteria:
+완료 기준:
 
 - 네트워크에서 controller와 Ray 포트 노출 검사를 자동화해 위반 시 배포를 차단한다.
 - 인증서/credential 폐기 후 30초 이내 해당 노드의 heartbeat와 task claim이 모두 거부된다.
 - 변조된 image digest, 서명 또는 model manifest가 실제 실행 전에 차단된다.
 - 보안 위협 모델의 pre-public-alpha gate를 재검토하고 독립적인 Agent 권한 리뷰를 완료한다.
 
-### v0.5 — OpenAI 호환 Gateway와 스케줄러
+### v0.5 — OpenAI 호환 게이트웨이와 스케줄러
 
 예상 기간: 3주
 목표: 준비된 단일 GPU pool과 72B pod에 실제 추론 요청을 안전하게 라우팅한다.
 
 우선순위 작업:
 
-- Model Registry에 repository, revision, quantization, image digest, 라이선스와 readiness를 저장한다.
+- 모델 레지스트리에 저장소, 리비전, 양자화, 이미지 다이제스트, 라이선스와 준비 상태를 저장한다.
 - OpenAI 호환 `GET /v1/models`, `POST /v1/chat/completions`와 streaming을 구현한다.
 - 사용자/API key 인증, 모델별 입력·출력 제한, 동시성 제한과 기본 quota를 구현한다.
-- Scheduler가 model readiness, GPU 여유, pod 상태, RTT/대역폭, 최근 오류율을 기준으로 실행 위치를
+- 스케줄러가 모델 준비 상태, GPU 여유, 포드 상태, RTT/대역폭, 최근 오류율을 기준으로 실행 위치를
   선택하도록 한다.
 - 작은 모델은 single-GPU/data-parallel pool, 72B는 안정적인 regional pipeline pod로 분리한다.
 - 대화 세션을 같은 pod에 고정하고 streaming 전 실패만 안전하게 재시도한다.
 - 프롬프트 본문을 기본 로그에서 제외하고 request ID, 토큰 수, latency와 오류만 기록한다.
 
-Exit criteria:
+완료 기준:
 
 - 최소 두 모델이 `/v1/models`에 readiness와 함께 노출된다.
 - 정상 노드 기준 요청 성공률 98% 이상을 유지한다.
@@ -106,14 +128,14 @@ Exit criteria:
 - 내부 credit ledger의 append-only 원장, 중복 방지 key와 운영자 조정 audit를 구현한다.
 - controller 백업, 복원, 프로세스 장애와 네트워크 단절 game day를 정기화한다.
 
-Exit criteria:
+완료 기준:
 
 - 노드·pod·controller 장애 시나리오별 탐지 및 복구 시간이 dashboard와 audit에 남는다.
 - 실패 요청이 중복 과금 또는 중복 credit으로 기록되지 않는다.
 - 동일 deployment의 단계적 rollout과 이전 generation rollback을 운영 절차로 재현한다.
 - 7일 연속 운영에서 데이터 유실 없이 node/task/usage 상태가 복구된다.
 
-### v0.7 — Trusted alpha
+### v0.7 — 신뢰된 알파
 
 예상 기간: 2주 이상
 목표: 5~10명의 승인된 기여자와 제한된 API 사용자를 대상으로 운영 가설을 검증한다.
@@ -126,7 +148,7 @@ Exit criteria:
 - 7B/14B 또는 32B single-GPU pool과 72B pipeline pod를 동시에 운영한다.
 - 성능, 비용, 장애, 재참여율과 사용자 만족 데이터를 수집해 다음 투자 여부를 판단한다.
 
-Exit criteria:
+완료 기준:
 
 - 승인된 GPU 10개 이상, 최소 두 모델, 정상 요청 성공률 98% 이상을 달성한다.
 - 7일/30일 node 재참여율과 유효 GPU 시간 비율을 측정한다.
@@ -140,18 +162,18 @@ Exit criteria:
 - 네트워크 RTT/대역폭 변화에 따른 TTFT와 tokens/s 측정
 - 생성 중 worker 종료와 pod 전체 재시작
 - 이질적인 GPU/driver 조합의 병목 및 실패 분석
-- 동시 요청과 continuous batching 처리량 비교
-- 7B/14B/32B single-GPU와 72B pipeline의 비용·지연 비교
-- 로그·metric·trace의 prompt/credential 유출 검사
-- task 재전달, controller 재시작과 DB 복구 시 멱등성 검사
+- 동시 요청과 연속 배치 처리량 비교
+- 7B/14B/32B 단일 GPU와 72B 파이프라인의 비용·지연 비교
+- 로그·메트릭·추적 정보의 프롬프트·자격 증명 유출 검사
+- 작업 재전달, 중앙 제어면 재시작과 DB 복구 시 멱등성 검사
 
-모든 기능 변경은 unit/integration test, wheel, Alembic, Debian smoke test를 통과해야 한다. GPU와
-네트워크 관련 acceptance는 별도의 실제 환경 결과를 릴리스 기록에 첨부한다.
+모든 기능 변경은 단위·통합 테스트, 휠, Alembic, Debian 간이 검사를 통과해야 한다. GPU와
+네트워크 관련 수용 검사는 별도의 실제 환경 결과를 릴리스 기록에 첨부한다.
 
-## Go/No-Go 기준
+## 진행·중단 기준
 
-Trusted alpha 종료 시 다음 질문 중 세 개 이상이 부정적이면 public federation을 진행하지 않고
-single-GPU data-parallel 또는 비동기 batch 서비스에 집중한다.
+신뢰된 알파 종료 시 다음 질문 중 세 개 이상이 부정적이면 공개 연합을 진행하지 않고
+단일 GPU 데이터 병렬 또는 비동기 배치 서비스에 집중한다.
 
 1. 기여자가 반복적으로 안정적인 GPU 시간을 제공하는가?
 2. 72B pipeline pod가 단일 호스팅보다 의미 있는 비용 또는 접근성 이점이 있는가?
@@ -161,11 +183,11 @@ single-GPU data-parallel 또는 비동기 batch 서비스에 집중한다.
 
 ## 명시적 제외 범위
 
-다음 항목은 trusted alpha 이전에는 추진하지 않는다.
+다음 항목은 신뢰된 알파 이전에는 추진하지 않는다.
 
 - 익명·무허가 노드의 자동 승인
 - 임의 인터넷 GPU를 실시간 tensor parallel로 결합
-- 민감정보에 대한 confidential-computing 보장
-- 모델 학습과 fine-tuning 자원 공유
+- 민감정보에 대한 기밀 컴퓨팅 보장
+- 모델 학습과 미세 조정 자원 공유
 - 암호화폐 또는 외부 거래 가능한 토큰 발행
 - 다중 지역 active-active controller와 상용 SLA
