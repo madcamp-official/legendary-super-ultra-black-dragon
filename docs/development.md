@@ -51,3 +51,5 @@ schema 변경마다 `src/dure/control/migrations/versions/` 아래에 새 Alembi
 - 승인됨·온라인·최신 노드, VRAM 경계, 디스크·런타임·네트워크 거부, 프로필 순서 치환, 오래된 인벤토리, 추천 멱등성을 모두 테스트합니다.
 
 GPU 수용 검사는 보호된 환경에서만 실행하며 공개 CI나 신뢰할 수 없는 PR에 GPU 실행기·모델 자격 증명·서명 비밀값을 노출하지 않습니다. 자세한 기준은 [benchmarking.md](benchmarking.md)를 참고합니다.
+
+소스 checkout이나 editable 설치에서 폐쇄형 `BENCHMARK` 작업을 직접 시험할 때는 실행 중인 코드의 40~64자리 커밋 해시를 `DURE_BUILD_COMMIT`으로 명시합니다. 공식 Debian 빌드는 이 값을 `/usr/share/dure/build-commit`에 설치합니다. 값이 없거나 작업의 `dure_commit`과 다르면 Agent는 GPU 조사나 컨테이너 실행 전에 작업을 거부합니다.

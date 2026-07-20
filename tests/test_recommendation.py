@@ -77,6 +77,7 @@ def _add_node(
     last_seen_age: int = 0,
     profile_age: int = 0,
     stored_profile: dict | None | str = "valid",
+    compute_capability: str = "8.6",
 ):
     node = Node(
         install_id=f"install-{name}",
@@ -89,7 +90,10 @@ def _add_node(
     session.add(node)
     session.flush()
     if stored_profile is not None:
-        value = profile("agent-reported-id").to_dict()
+        value = profile(
+            "agent-reported-id",
+            compute_capability=compute_capability,
+        ).to_dict()
         if stored_profile != "valid":
             value = stored_profile
         session.add(
@@ -126,13 +130,14 @@ def _add_release(
         layer_count=32,
         license_id="apache-2.0",
     )
+    architectures = gpu_architectures or ["ampere"]
     runtime = create_runtime_release(
         session,
         version=f"runtime-{key}",
         image=f"registry.example/{key}@sha256:{_hex(f'image-{key}', 64)}",
         vllm_version="0.9.0",
         cuda_version="12.8",
-        gpu_architectures=gpu_architectures or ["ampere"],
+        gpu_architectures=architectures,
     )
     release = create_model_release(
         session,
@@ -167,8 +172,20 @@ def _add_release(
         transition_model_release(session, release.id, "VALIDATED")
     if status in {"ACTIVE", "DEPRECATED"}:
         if benchmark_nodes is None:
+            capability_by_architecture = {
+                "ampere": "8.6",
+                "ada": "8.9",
+                "hopper": "9.0",
+                "blackwell": "10.0",
+            }
+            benchmark_capability = capability_by_architecture[architectures[0]]
             benchmark_nodes = [
-                _add_node(session, f"benchmark-{key}-{index}", now=utcnow())
+                _add_node(
+                    session,
+                    f"benchmark-{key}-{index}",
+                    now=utcnow(),
+                    compute_capability=benchmark_capability,
+                )
                 for index in range(placement.node_count)
             ]
         node_ids = [node.id for node in benchmark_nodes]

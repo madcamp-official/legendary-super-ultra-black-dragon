@@ -4,17 +4,23 @@ import hashlib
 import json
 import math
 import re
+import uuid
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from dure.models import NodeProfile
+from dure.task import (
+    MAX_BENCHMARK_INTEGER,
+    benchmark_inventory_fingerprint as contract_inventory_fingerprint,
+)
 
 from .models import (
     AuditEvent,
     BenchmarkEvidence,
+    BenchmarkRun,
     ModelArtifact,
     ModelRelease,
     Node,
@@ -31,6 +37,18 @@ MIN_WARMUP_REQUESTS = 20
 MIN_MEASURED_REQUESTS = 200
 MIN_MEASURED_SECONDS = 900
 MIN_QUALITY_SCORE = 0.80
+GPU_COMPUTE_CAPABILITY_ARCHITECTURES = {
+    "8.0": "ampere",
+    "8.6": "ampere",
+    "8.7": "ampere",
+    "8.9": "ada",
+    "9.0": "hopper",
+    "10.0": "blackwell",
+    "10.3": "blackwell",
+    "11.0": "blackwell",
+    "12.0": "blackwell",
+    "12.1": "blackwell",
+}
 
 
 class BenchmarkNotFoundError(ValueError):
@@ -54,6 +72,16 @@ class BenchmarkPromotionError(ValueError):
         self.details = details or {}
 
 
+def _bounded_integer(value: Any, *, field: str, minimum: int) -> int:
+    if (
+        type(value) is not int
+        or value < minimum
+        or value > MAX_BENCHMARK_INTEGER
+    ):
+        raise ValueError(f"{field} must be an integer in range")
+    return value
+
+
 def _canonical(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _canonical(value[key]) for key in sorted(value)}
@@ -73,7 +101,9 @@ def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def benchmark_inventory_fingerprint(session: Session, node_ids: list[str]) -> str:
+def _benchmark_node_profiles(
+    session: Session, node_ids: list[str]
+) -> list[tuple[str, NodeProfile]]:
     normalized_ids = sorted(node_ids)
     nodes = list(
         session.scalars(
@@ -96,7 +126,7 @@ def benchmark_inventory_fingerprint(session: Session, node_ids: list[str]) -> st
     missing = sorted(set(normalized_ids) - found)
     if missing:
         raise BenchmarkNotFoundError(f"unknown benchmark node(s): {', '.join(missing)}")
-    payload: list[dict[str, Any]] = []
+    fingerprint_profiles: list[tuple[str, NodeProfile]] = []
     for node in nodes:
         record = profiles.get(node.id)
         if not node.approved:
@@ -110,8 +140,77 @@ def benchmark_inventory_fingerprint(session: Session, node_ids: list[str]) -> st
                 f"benchmark node has an invalid stored profile: {node.id}"
             ) from exc
         profile.node_id = node.id
-        payload.append({"node_id": node.id, "profile": _canonical(profile.to_dict())})
-    return _digest(payload)
+        fingerprint_profiles.append((node.id, profile))
+    return fingerprint_profiles
+
+
+def _fingerprints_for_profiles(
+    profiles: list[tuple[str, NodeProfile]],
+) -> tuple[str, str]:
+    legacy_payload: list[dict[str, Any]] = []
+    for node_id, profile in profiles:
+        legacy_payload.append(
+            {"node_id": node_id, "profile": _canonical(profile.to_dict())}
+        )
+    return contract_inventory_fingerprint(profiles), _digest(legacy_payload)
+
+
+def _benchmark_inventory_fingerprints(
+    session: Session, node_ids: list[str]
+) -> tuple[str, str]:
+    return _fingerprints_for_profiles(_benchmark_node_profiles(session, node_ids))
+
+
+def _validate_placement_nodes(
+    placement: PlacementProfileRecord,
+    runtime: RuntimeRelease,
+    profiles: list[tuple[str, NodeProfile]],
+) -> None:
+    if len(profiles) != placement.node_count:
+        raise ValueError("benchmark node count does not match placement profile")
+    ineligible: list[dict[str, Any]] = []
+    for node_id, profile in profiles:
+        reasons: list[str] = []
+        healthy_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
+        if not healthy_gpus:
+            reasons.append("HEALTHY_GPU_REQUIRED")
+        else:
+            selected_gpu = max(
+                healthy_gpus, key=lambda gpu: (gpu.memory_mib, -gpu.index)
+            )
+            if selected_gpu.memory_mib < placement.min_gpu_memory_mib:
+                reasons.append("GPU_MEMORY_INSUFFICIENT")
+            architecture = GPU_COMPUTE_CAPABILITY_ARCHITECTURES.get(
+                selected_gpu.compute_capability or ""
+            )
+            if architecture is None:
+                reasons.append("GPU_ARCHITECTURE_UNKNOWN")
+            elif architecture not in runtime.gpu_architectures:
+                reasons.append("GPU_ARCHITECTURE_UNSUPPORTED")
+        if profile.disk_free_mib < placement.min_disk_free_mib:
+            reasons.append("DISK_FREE_INSUFFICIENT")
+        if (
+            profile.runtime.engine != "docker"
+            or not profile.runtime.engine_ready
+            or not profile.runtime.nvidia_runtime
+        ):
+            reasons.append("NVIDIA_DOCKER_UNAVAILABLE")
+        if placement.node_count > 1 and (
+            not profile.network.default_interface or not profile.network.addresses
+        ):
+            reasons.append("NETWORK_IDENTITY_UNAVAILABLE")
+        if reasons:
+            ineligible.append({"node_id": node_id, "reasons": reasons})
+    if ineligible:
+        raise BenchmarkPromotionError(
+            "benchmark node profile does not satisfy the placement requirements",
+            code="PLACEMENT_NODE_INELIGIBLE",
+            details={"nodes": ineligible},
+        )
+
+
+def benchmark_inventory_fingerprint(session: Session, node_ids: list[str]) -> str:
+    return _benchmark_inventory_fingerprints(session, node_ids)[0]
 
 
 def benchmark_context(
@@ -142,15 +241,16 @@ def benchmark_context(
     runtime = session.get(RuntimeRelease, release.runtime_id)
     if artifact is None or runtime is None:
         raise BenchmarkIdentityMismatchError("model release registry binding is incomplete")
+    profiles = _benchmark_node_profiles(session, normalized_node_ids)
+    _validate_placement_nodes(placement, runtime, profiles)
+    inventory_fingerprint, _ = _fingerprints_for_profiles(profiles)
     return {
         "release_id": release.id,
         "placement_id": placement.id,
         "suite_id": BENCHMARK_SUITE_ID,
         "policy_version": BENCHMARK_POLICY_VERSION,
         "node_ids": normalized_node_ids,
-        "inventory_fingerprint": benchmark_inventory_fingerprint(
-            session, normalized_node_ids
-        ),
+        "inventory_fingerprint": inventory_fingerprint,
         "artifact_revision": artifact.revision,
         "artifact_manifest_digest": artifact.manifest_digest,
         "runtime_image": runtime.image,
@@ -309,7 +409,21 @@ def register_benchmark_evidence(
     network_rtt_ms: float | None,
     packet_loss_pct: float | None,
     nccl_all_reduce_ok: bool | None,
+    benchmark_run_id: str | None = None,
+    actor: str = "admin",
+    commit: bool = True,
 ) -> BenchmarkEvidence:
+    for field, value, minimum in (
+        ("input_tokens", input_tokens, 1),
+        ("output_tokens", output_tokens, 1),
+        ("concurrency", concurrency, 1),
+        ("warmup_requests", warmup_requests, 0),
+        ("request_count", request_count, 1),
+        ("oom_count", oom_count, 0),
+        ("crash_count", crash_count, 0),
+        ("restart_count", restart_count, 0),
+    ):
+        _bounded_integer(value, field=field, minimum=minimum)
     if suite_id != BENCHMARK_SUITE_ID:
         raise ValueError("unsupported benchmark suite")
     if policy_version != BENCHMARK_POLICY_VERSION:
@@ -321,6 +435,37 @@ def register_benchmark_evidence(
     if len(node_ids) != len(set(node_ids)):
         raise ValueError("benchmark node_ids must not contain duplicates")
     normalized_node_ids = sorted(node_ids)
+    benchmark_run = None
+    if benchmark_run_id is not None:
+        try:
+            if str(uuid.UUID(benchmark_run_id)) != benchmark_run_id:
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("benchmark_run_id must be a canonical UUID") from exc
+        benchmark_run = session.get(BenchmarkRun, benchmark_run_id)
+        if benchmark_run is None:
+            raise BenchmarkNotFoundError("benchmark run not found")
+        if (
+            benchmark_run.release_id != release_id
+            or benchmark_run.placement_id != placement_id
+            or list(benchmark_run.node_ids) != normalized_node_ids
+            or benchmark_run.suite_id != suite_id
+            or benchmark_run.inventory_fingerprint != inventory_fingerprint
+            or benchmark_run.artifact_revision != artifact_revision
+            or benchmark_run.artifact_manifest_digest
+            != artifact_manifest_digest
+            or benchmark_run.runtime_image != runtime_image
+            or benchmark_run.dure_commit != dure_commit
+            or benchmark_run.policy_version != policy_version
+            or benchmark_run.input_tokens != input_tokens
+            or benchmark_run.output_tokens != output_tokens
+            or benchmark_run.concurrency != concurrency
+            or benchmark_run.warmup_requests != warmup_requests
+            or benchmark_run.request_count != request_count
+        ):
+            raise BenchmarkIdentityMismatchError(
+                "benchmark evidence does not match its benchmark run"
+            )
     context = benchmark_context(
         session,
         release_id=release_id,
@@ -406,23 +551,53 @@ def register_benchmark_evidence(
         "status": status,
         "failure_codes": failure_codes,
     }
-    evidence_digest = _digest(canonical)
+    if benchmark_run_id is not None:
+        canonical["benchmark_run_id"] = benchmark_run_id
+    content_digest = _digest(canonical)
+    evidence_digest = content_digest
     existing = session.scalar(
         select(BenchmarkEvidence).where(
             BenchmarkEvidence.evidence_digest == evidence_digest
         )
     )
-    if existing is not None:
-        return existing
-
-    registration_sequence = (
-        session.scalar(
-            select(func.max(BenchmarkEvidence.registration_sequence)).where(
-                BenchmarkEvidence.placement_id == placement.id
+    latest = session.scalar(
+        select(BenchmarkEvidence)
+        .where(BenchmarkEvidence.placement_id == placement.id)
+        .order_by(BenchmarkEvidence.registration_sequence.desc())
+        .limit(1)
+    )
+    later_failed_run_id = None
+    if benchmark_run_id is None and latest is not None:
+        later_failed_run_id = session.scalar(
+            select(BenchmarkRun.id)
+            .where(
+                BenchmarkRun.release_id == release.id,
+                BenchmarkRun.placement_id == placement.id,
+                BenchmarkRun.status == "FAILED",
+                BenchmarkRun.updated_at > latest.created_at,
             )
+            .order_by(BenchmarkRun.updated_at.desc(), BenchmarkRun.id.desc())
+            .limit(1)
         )
-        or 0
-    ) + 1
+    if benchmark_run_id is not None:
+        if existing is not None:
+            return existing
+    elif latest is not None:
+        latest_matches = latest.benchmark_run_id is None and all(
+            getattr(latest, key) == value for key, value in canonical.items()
+        )
+        if latest_matches and later_failed_run_id is None:
+            return latest
+        if existing is not None:
+            evidence_digest = _digest(
+                {
+                    "content_digest": content_digest,
+                    "after_registration_sequence": latest.registration_sequence,
+                    "after_failed_run_id": later_failed_run_id,
+                }
+            )
+
+    registration_sequence = (latest.registration_sequence if latest else 0) + 1
     record = BenchmarkEvidence(
         **canonical,
         registration_sequence=registration_sequence,
@@ -443,18 +618,22 @@ def register_benchmark_evidence(
         raise BenchmarkIdentityMismatchError("benchmark evidence already exists") from exc
     session.add(
         AuditEvent(
-            actor="admin",
+            actor=actor,
             action="benchmark_evidence.register",
             target=record.id,
             outcome=status.lower(),
             detail={
                 "release_id": release.id,
                 "placement_id": placement.id,
+                "benchmark_run_id": benchmark_run_id,
                 "failure_codes": failure_codes,
             },
         )
     )
-    session.commit()
+    if commit:
+        session.commit()
+    else:
+        session.flush()
     return record
 
 
@@ -463,6 +642,7 @@ def benchmark_evidence_dict(record: BenchmarkEvidence) -> dict[str, Any]:
         key: getattr(record, key)
         for key in (
             "id",
+            "benchmark_run_id",
             "release_id",
             "placement_id",
             "registration_sequence",
@@ -538,6 +718,43 @@ def _qualifying_evidence_ids(session: Session, release: ModelRelease) -> list[st
             detail["code"] = "EVIDENCE_MISSING"
             blocked.append(detail)
             continue
+        pending_run = session.scalar(
+            select(BenchmarkRun)
+            .where(
+                BenchmarkRun.release_id == release.id,
+                BenchmarkRun.placement_id == placement.id,
+                BenchmarkRun.status == "QUEUED",
+            )
+            .order_by(BenchmarkRun.updated_at.desc(), BenchmarkRun.id.desc())
+            .limit(1)
+        )
+        later_failed_run = None
+        if pending_run is None:
+            later_failed_run = session.scalar(
+                select(BenchmarkRun)
+                .where(
+                    BenchmarkRun.release_id == release.id,
+                    BenchmarkRun.placement_id == placement.id,
+                    BenchmarkRun.status == "FAILED",
+                    BenchmarkRun.updated_at > evidence.created_at,
+                )
+                .order_by(BenchmarkRun.updated_at.desc(), BenchmarkRun.id.desc())
+                .limit(1)
+            )
+        later_unresolved_run = pending_run or later_failed_run
+        if later_unresolved_run is not None:
+            detail.update(
+                code=(
+                    "BENCHMARK_RUN_FAILED"
+                    if later_unresolved_run.status == "FAILED"
+                    else "BENCHMARK_RUN_PENDING"
+                ),
+                benchmark_run_id=later_unresolved_run.id,
+                benchmark_run_status=later_unresolved_run.status,
+                failure_code=later_unresolved_run.failure_code,
+            )
+            blocked.append(detail)
+            continue
         if (
             evidence.artifact_revision != artifact.revision
             or evidence.artifact_manifest_digest != artifact.manifest_digest
@@ -555,14 +772,22 @@ def _qualifying_evidence_ids(session: Session, release: ModelRelease) -> list[st
             blocked.append(detail)
             continue
         try:
-            current = benchmark_inventory_fingerprint(
-                session, list(evidence.node_ids)
-            )
+            profiles = _benchmark_node_profiles(session, list(evidence.node_ids))
+            _validate_placement_nodes(placement, runtime, profiles)
+            current, legacy_current = _fingerprints_for_profiles(profiles)
         except (BenchmarkNotFoundError, BenchmarkPromotionError) as exc:
-            detail.update(code="PROFILE_UNAVAILABLE", reason=str(exc))
+            detail.update(
+                code=(
+                    "PROFILE_INELIGIBLE"
+                    if isinstance(exc, BenchmarkPromotionError)
+                    and exc.code == "PLACEMENT_NODE_INELIGIBLE"
+                    else "PROFILE_UNAVAILABLE"
+                ),
+                reason=str(exc),
+            )
             blocked.append(detail)
             continue
-        if current != evidence.inventory_fingerprint:
+        if evidence.inventory_fingerprint not in {current, legacy_current}:
             detail.update(code="PROFILE_CHANGED", current_fingerprint=current)
             blocked.append(detail)
             continue

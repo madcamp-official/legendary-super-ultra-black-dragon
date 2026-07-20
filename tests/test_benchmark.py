@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -19,6 +20,8 @@ from dure.control.benchmark import (
     BENCHMARK_SUITE_ID,
     BenchmarkIdentityMismatchError,
     BenchmarkPromotionError,
+    _benchmark_inventory_fingerprints,
+    benchmark_context,
     benchmark_inventory_fingerprint,
     promote_model_release,
     register_benchmark_evidence,
@@ -35,9 +38,13 @@ from dure.control.models import (
 )
 from dure.control.service import (
     add_placement_profile,
+    apply_benchmark_run,
+    claim_task,
     create_model_artifact,
     create_model_release,
     create_runtime_release,
+    fail_benchmark_task,
+    prepare_benchmark_run,
     transition_model_release,
 )
 
@@ -266,6 +273,143 @@ class BenchmarkServiceTests(unittest.TestCase):
             self.assertEqual(active.status, "ACTIVE")
             self.assertEqual(ids, [latest.id])
 
+    def test_repeated_manual_failure_after_pass_gets_a_new_latest_sequence(self):
+        with self.factory() as session:
+            node = _node(session, "manual-occurrence")
+            artifact, runtime, release, placements = _release(
+                session, "manual-occurrence"
+            )
+            body = _evidence_body(
+                session, artifact, runtime, release, placements[0], [node]
+            )
+            failure_body = dict(body, oom_count=1)
+
+            first_failure = register_benchmark_evidence(session, **failure_body)
+            passed = register_benchmark_evidence(session, **body)
+            repeated_failure = register_benchmark_evidence(
+                session, **failure_body
+            )
+            replay = register_benchmark_evidence(session, **failure_body)
+
+            self.assertNotEqual(repeated_failure.id, first_failure.id)
+            self.assertEqual(
+                repeated_failure.registration_sequence,
+                passed.registration_sequence + 1,
+            )
+            self.assertEqual(replay.id, repeated_failure.id)
+            with self.assertRaises(BenchmarkPromotionError) as raised:
+                promote_model_release(session, release.id)
+            self.assertEqual(
+                raised.exception.details["placements"][0]["evidence_id"],
+                repeated_failure.id,
+            )
+
+    def test_identical_manual_pass_after_execution_failure_is_a_new_occurrence(self):
+        with self.factory() as session:
+            node = _node(session, "manual-recovery")
+            artifact, runtime, release, placements = _release(
+                session, "manual-recovery"
+            )
+            body = _evidence_body(
+                session, artifact, runtime, release, placements[0], [node]
+            )
+            first = register_benchmark_evidence(session, **body)
+            run, _ = prepare_benchmark_run(
+                session,
+                request_id=str(uuid.uuid4()),
+                release_id=release.id,
+                placement_id=placements[0].id,
+                node_ids=[node.id],
+                workload_id="short-chat-1k-128",
+                dure_commit="d" * 40,
+            )
+            _, task, _ = apply_benchmark_run(session, run.request_id)
+            claimed = claim_task(session, node.id)
+            self.assertEqual(claimed.id, task.id)
+            handled, failed_run = fail_benchmark_task(
+                session,
+                claimed,
+                node.id,
+                "BENCHMARK_RUNTIME_UNAVAILABLE",
+            )
+            self.assertTrue(handled)
+            self.assertEqual(failed_run.status, "FAILED")
+
+            recovered = register_benchmark_evidence(session, **body)
+            replay = register_benchmark_evidence(session, **body)
+
+            self.assertNotEqual(recovered.id, first.id)
+            self.assertEqual(
+                recovered.registration_sequence, first.registration_sequence + 1
+            )
+            self.assertEqual(replay.id, recovered.id)
+            _, evidence_ids, _ = promote_model_release(session, release.id)
+            self.assertEqual(evidence_ids, [recovered.id])
+
+    def test_runtime_architecture_matches_the_gpu_selected_for_execution(self):
+        with self.factory() as session:
+            node = _node(session, "runtime-architecture")
+            artifact, runtime, release, placements = _release(
+                session, "runtime-architecture"
+            )
+            stored = session.get(NodeProfileRecord, node.id)
+            changed = json.loads(json.dumps(stored.profile))
+            changed["gpus"].append(
+                {
+                    **changed["gpus"][0],
+                    "index": 1,
+                    "uuid": "GPU-11111111-2222-3333-4444-555555555555",
+                    "memory_mib": changed["gpus"][0]["memory_mib"] * 2,
+                    "compute_capability": "10.0",
+                }
+            )
+            stored.profile = changed
+            session.commit()
+
+            with self.assertRaises(BenchmarkPromotionError) as mismatch:
+                benchmark_context(
+                    session,
+                    release_id=release.id,
+                    placement_id=placements[0].id,
+                    node_ids=[node.id],
+                )
+            self.assertEqual(mismatch.exception.code, "PLACEMENT_NODE_INELIGIBLE")
+            self.assertIn(
+                "GPU_ARCHITECTURE_UNSUPPORTED",
+                mismatch.exception.details["nodes"][0]["reasons"],
+            )
+
+            runtime.gpu_architectures = ["blackwell"]
+            session.commit()
+            body = _evidence_body(
+                session, artifact, runtime, release, placements[0], [node]
+            )
+            evidence = register_benchmark_evidence(session, **body)
+            runtime.gpu_architectures = ["ampere"]
+            session.commit()
+            with self.assertRaises(BenchmarkPromotionError) as promotion:
+                promote_model_release(session, release.id)
+            detail = promotion.exception.details["placements"][0]
+            self.assertEqual(detail["code"], "PROFILE_INELIGIBLE")
+            self.assertEqual(detail["evidence_id"], evidence.id)
+
+            runtime.gpu_architectures = ["blackwell"]
+            unknown_profile = json.loads(json.dumps(changed))
+            unknown_profile["gpus"][1]["compute_capability"] = "7.5"
+            stored.profile = unknown_profile
+            session.commit()
+            with self.assertRaises(BenchmarkPromotionError) as unknown:
+                benchmark_context(
+                    session,
+                    release_id=release.id,
+                    placement_id=placements[0].id,
+                    node_ids=[node.id],
+                )
+            self.assertIn(
+                "GPU_ARCHITECTURE_UNKNOWN",
+                unknown.exception.details["nodes"][0]["reasons"],
+            )
+
     def test_latency_performance_quality_and_stability_failures_are_recorded(self):
         with self.factory() as session:
             node = _node(session, "slo")
@@ -311,6 +455,26 @@ class BenchmarkServiceTests(unittest.TestCase):
                 <= set(evidence.failure_codes)
             )
 
+    def test_legacy_full_profile_fingerprint_remains_eligible(self):
+        with self.factory() as session:
+            node = _node(session, "legacy-fingerprint")
+            artifact, runtime, release, placements = _release(
+                session, "legacy-fingerprint"
+            )
+            body = _evidence_body(
+                session, artifact, runtime, release, placements[0], [node]
+            )
+            evidence = register_benchmark_evidence(session, **body)
+            stable, legacy = _benchmark_inventory_fingerprints(session, [node.id])
+            self.assertEqual(stable, body["inventory_fingerprint"])
+            self.assertNotEqual(stable, legacy)
+            evidence.inventory_fingerprint = legacy
+            session.commit()
+
+            _, evidence_ids, _ = promote_model_release(session, release.id)
+
+            self.assertEqual(evidence_ids, [evidence.id])
+
     def test_identity_state_and_profile_changes_fail_closed_without_writes(self):
         with self.factory() as session:
             node = _node(session, "binding")
@@ -337,6 +501,19 @@ class BenchmarkServiceTests(unittest.TestCase):
             stored = session.get(NodeProfileRecord, node.id)
             changed = dict(stored.profile)
             changed["disk_free_mib"] -= 1
+            stored.profile = changed
+            session.commit()
+            refreshed = _evidence_body(
+                session, artifact, runtime, release, placements[0], [node]
+            )
+            self.assertEqual(
+                refreshed["inventory_fingerprint"], body["inventory_fingerprint"]
+            )
+            self.assertEqual(register_benchmark_evidence(session, **refreshed).id, evidence.id)
+
+            stored = session.get(NodeProfileRecord, node.id)
+            changed = json.loads(json.dumps(stored.profile))
+            changed["gpus"][0]["driver_version"] = "999.0"
             stored.profile = changed
             session.commit()
             with self.assertRaises(BenchmarkPromotionError) as raised:
@@ -369,6 +546,85 @@ class BenchmarkServiceTests(unittest.TestCase):
             )
             with self.assertRaises(BenchmarkPromotionError):
                 register_benchmark_evidence(session, **draft_body)
+
+    def test_benchmark_nodes_must_satisfy_placement_resources(self):
+        cases = {
+            "gpu": lambda value: value.update(gpus=[]),
+            "vram": lambda value: value["gpus"][0].update(memory_mib=4096),
+            "disk": lambda value: value.update(disk_free_mib=4096),
+            "runtime": lambda value: value["runtime"].update(engine_ready=False),
+        }
+        for key, mutate in cases.items():
+            with self.subTest(key=key), self.factory() as session:
+                node = _node(session, f"ineligible-{key}")
+                _, _, release, placements = _release(session, f"ineligible-{key}")
+                stored = session.get(NodeProfileRecord, node.id)
+                changed = json.loads(json.dumps(stored.profile))
+                mutate(changed)
+                stored.profile = changed
+                session.commit()
+
+                with self.assertRaises(BenchmarkPromotionError) as raised:
+                    benchmark_context(
+                        session,
+                        release_id=release.id,
+                        placement_id=placements[0].id,
+                        node_ids=[node.id],
+                    )
+                self.assertEqual(raised.exception.code, "PLACEMENT_NODE_INELIGIBLE")
+
+    def test_promotion_rechecks_volatile_placement_capacity(self):
+        with self.factory() as session:
+            node = _node(session, "capacity-change")
+            artifact, runtime, release, placements = _release(
+                session, "capacity-change"
+            )
+            body = _evidence_body(
+                session, artifact, runtime, release, placements[0], [node]
+            )
+            register_benchmark_evidence(session, **body)
+            stored = session.get(NodeProfileRecord, node.id)
+            changed = json.loads(json.dumps(stored.profile))
+            changed["disk_free_mib"] = placements[0].min_disk_free_mib - 1
+            stored.profile = changed
+            session.commit()
+
+            with self.assertRaises(BenchmarkPromotionError) as raised:
+                promote_model_release(session, release.id)
+            self.assertEqual(
+                raised.exception.details["placements"][0]["code"],
+                "PROFILE_INELIGIBLE",
+            )
+
+    def test_queued_automatic_run_blocks_even_newer_manual_evidence(self):
+        with self.factory() as session:
+            node = _node(session, "queued-before-manual")
+            artifact, runtime, release, placements = _release(
+                session, "queued-before-manual"
+            )
+            run, _ = prepare_benchmark_run(
+                session,
+                request_id=str(uuid.uuid4()),
+                release_id=release.id,
+                placement_id=placements[0].id,
+                node_ids=[node.id],
+                workload_id="short-chat-1k-128",
+                dure_commit="d" * 40,
+            )
+            apply_benchmark_run(session, run.request_id)
+            evidence = register_benchmark_evidence(
+                session,
+                **_evidence_body(
+                    session, artifact, runtime, release, placements[0], [node]
+                ),
+            )
+
+            with self.assertRaises(BenchmarkPromotionError) as raised:
+                promote_model_release(session, release.id)
+            detail = raised.exception.details["placements"][0]
+            self.assertEqual(detail["evidence_id"], evidence.id)
+            self.assertEqual(detail["code"], "BENCHMARK_RUN_PENDING")
+            self.assertEqual(detail["benchmark_run_id"], run.id)
 
     def test_multinode_network_and_nccl_evidence_gate(self):
         with self.factory() as session:
@@ -551,11 +807,18 @@ class BenchmarkAPITests(unittest.TestCase):
             ),
         )
         self.assertEqual(infinite.status_code, 422)
+        oversized_integer = self.client.post(
+            endpoint,
+            headers=self.admin,
+            json={**body, "oom_count": 2**63},
+        )
+        self.assertEqual(oversized_integer.status_code, 422)
 
         first = self.client.post(endpoint, headers=self.admin, json=body)
         second = self.client.post(endpoint, headers=self.admin, json=body)
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()["evidence"]["id"], second.json()["evidence"]["id"])
+        self.assertIsNone(first.json()["evidence"]["benchmark_run_id"])
         listed = self.client.get(
             f"{endpoint}?release_id={release.id}", headers=self.admin
         ).json()["evidence"]

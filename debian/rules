@@ -3,6 +3,13 @@
 %:
 	dh $@ --with python3 --buildsystem=pybuild
 
+override_dh_auto_install:
+	dh_auto_install
+	printf '%s\n' '$(DURE_BUILD_COMMIT)' | grep -Eq '^[0-9a-f]{40,64}$$'
+	install -d -m 0755 debian/dure/usr/share/dure
+	printf '%s\n' '$(DURE_BUILD_COMMIT)' > debian/dure/usr/share/dure/build-commit
+	chmod 0644 debian/dure/usr/share/dure/build-commit
+
 override_dh_auto_test:
 	PYTHONPATH=src python3 -m unittest -v \
 		tests.test_agent \

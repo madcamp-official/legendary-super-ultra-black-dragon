@@ -7,11 +7,12 @@ from functools import partial
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dure import __version__
+from dure.task import MAX_BENCHMARK_INTEGER
 
 from .db import Base, make_engine, make_session_factory, session_dependency
 from .benchmark import (
@@ -39,8 +40,13 @@ from .models import (
     utcnow,
 )
 from .service import (
+    BENCHMARK_TASK_FAILURE_CODES,
+    BenchmarkRunError,
+    BenchmarkRunNotFoundError,
     authenticate_node,
+    apply_benchmark_run,
     approve_node,
+    benchmark_run_dict,
     cancel_task,
     claim_enrollment,
     claim_task,
@@ -50,7 +56,9 @@ from .service import (
     create_enrollment,
     create_tasks,
     extend_task,
+    fail_benchmark_task,
     finish_task,
+    get_benchmark_run,
     join_node,
     node_status,
     revoke_node,
@@ -59,6 +67,8 @@ from .service import (
     save_heartbeat,
     add_placement_profile,
     RegistryConflictError,
+    prepare_benchmark_run,
+    complete_benchmark_task,
     transition_model_release,
 )
 from .recommendation import RecommendationNodeNotFoundError, recommend_deployment
@@ -104,11 +114,11 @@ class TasksCreate(BaseModel):
     options: dict = Field(default_factory=dict)
 
 
-class TaskComplete(BaseModel):
+class TaskComplete(StrictBody):
     result: dict = Field(default_factory=dict)
 
 
-class TaskFail(BaseModel):
+class TaskFail(StrictBody):
     error: str = Field(min_length=1, max_length=8192)
 
 
@@ -192,15 +202,15 @@ class BenchmarkEvidenceCreate(StrictBody):
     runtime_image: str = Field(min_length=1, max_length=512)
     dure_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
     policy_version: Literal["benchmark-gate-v1"] = BENCHMARK_POLICY_VERSION
-    input_tokens: int = Field(gt=0)
-    output_tokens: int = Field(gt=0)
-    concurrency: int = Field(gt=0)
-    warmup_requests: int = Field(ge=0)
-    request_count: int = Field(gt=0)
+    input_tokens: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    output_tokens: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    concurrency: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    warmup_requests: int = Field(ge=0, le=MAX_BENCHMARK_INTEGER)
+    request_count: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
     duration_seconds: float = Field(gt=0, allow_inf_nan=False)
-    oom_count: int = Field(default=0, ge=0)
-    crash_count: int = Field(default=0, ge=0)
-    restart_count: int = Field(default=0, ge=0)
+    oom_count: int = Field(default=0, ge=0, le=MAX_BENCHMARK_INTEGER)
+    crash_count: int = Field(default=0, ge=0, le=MAX_BENCHMARK_INTEGER)
+    restart_count: int = Field(default=0, ge=0, le=MAX_BENCHMARK_INTEGER)
     ttft_p95_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     tpot_p95_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     e2e_p95_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
@@ -230,6 +240,74 @@ class BenchmarkEvidenceCreate(StrictBody):
         return self
 
 
+class BenchmarkRunPrepare(StrictBody):
+    request_id: str
+    release_id: str
+    placement_id: str
+    node_ids: list[str] = Field(min_length=1, max_length=64)
+    workload_id: Literal[
+        "short-chat-1k-128",
+        "long-chat-4k-256",
+        "max-context",
+        "quality-eval",
+    ]
+    dure_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+
+    @model_validator(mode="after")
+    def validate_identities(self):
+        if len(self.node_ids) != len(set(self.node_ids)):
+            raise ValueError("node_ids must not contain duplicates")
+        for value in (
+            self.request_id,
+            self.release_id,
+            self.placement_id,
+            *self.node_ids,
+        ):
+            try:
+                if str(uuid.UUID(value)) != value:
+                    raise ValueError
+            except (AttributeError, ValueError) as exc:
+                raise ValueError(
+                    "benchmark run identities must be canonical UUIDs"
+                ) from exc
+        return self
+
+
+class BenchmarkRunApply(StrictBody):
+    apply: Literal[True]
+
+
+class BenchmarkTaskMetrics(StrictBody):
+    duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    request_count: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    warmup_requests: int = Field(ge=0, le=MAX_BENCHMARK_INTEGER)
+    oom_count: int = Field(ge=0, le=MAX_BENCHMARK_INTEGER)
+    crash_count: int = Field(ge=0, le=MAX_BENCHMARK_INTEGER)
+    restart_count: int = Field(ge=0, le=MAX_BENCHMARK_INTEGER)
+    ttft_p95_ms: float | None = Field(gt=0, allow_inf_nan=False)
+    tpot_p95_ms: float | None = Field(gt=0, allow_inf_nan=False)
+    e2e_p95_ms: float | None = Field(gt=0, allow_inf_nan=False)
+    throughput_tps: float | None = Field(gt=0, allow_inf_nan=False)
+    success_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
+    vram_headroom_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    quality_score: float = Field(ge=0, le=1, allow_inf_nan=False)
+    network_bandwidth_mbps: None
+    network_rtt_ms: None
+    packet_loss_pct: None
+    nccl_all_reduce_ok: None
+
+
+class BenchmarkTaskResult(StrictBody):
+    benchmark_id: str
+    workload_id: Literal[
+        "short-chat-1k-128",
+        "long-chat-4k-256",
+        "max-context",
+        "quality-eval",
+    ]
+    metrics: BenchmarkTaskMetrics
+
+
 class DeploymentRecommendationCreate(StrictBody):
     node_ids: list[str] = Field(default_factory=list, max_length=256)
     all_online: bool = False
@@ -257,6 +335,14 @@ def _bearer(authorization: str | None) -> str:
 
 
 def _promotion_error_detail(exc: BenchmarkPromotionError) -> dict:
+    return {
+        "code": exc.code,
+        "message": str(exc),
+        "details": exc.details,
+    }
+
+
+def _benchmark_run_error_detail(exc: BenchmarkRunError) -> dict:
     return {
         "code": exc.code,
         "message": str(exc),
@@ -448,14 +534,68 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     @app.post("/v1/agent/tasks/{task_id}/complete")
     def agent_task_complete(task_id: str, body: TaskComplete, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         task = session.get(Task, task_id)
-        if task is None or not finish_task(session, task, node.id, result=body.result, error=None):
+        if task is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be completed")
+        if task.type == TaskType.BENCHMARK.value:
+            try:
+                result = BenchmarkTaskResult.model_validate(body.result).model_dump()
+                accepted, run = complete_benchmark_task(
+                    session, task, node.id, result
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "BENCHMARK result does not match the closed evidence schema",
+                ) from exc
+            except BenchmarkRunError as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, _benchmark_run_error_detail(exc)
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+                ) from exc
+            if not accepted:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "task cannot be completed"
+                )
+            return {
+                "ok": True,
+                "benchmark_run": benchmark_run_dict(run) if run else None,
+            }
+        if not finish_task(session, task, node.id, result=body.result, error=None):
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be completed")
         return {"ok": True}
 
     @app.post("/v1/agent/tasks/{task_id}/fail")
     def agent_task_fail(task_id: str, body: TaskFail, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         task = session.get(Task, task_id)
-        if task is None or not finish_task(session, task, node.id, result=None, error=body.error):
+        if task is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be failed")
+        if task.type == TaskType.BENCHMARK.value:
+            failure_code = (
+                body.error
+                if body.error in BENCHMARK_TASK_FAILURE_CODES
+                and body.error != "BENCHMARK_CANCELED"
+                else "BENCHMARK_EXECUTION_FAILED"
+            )
+            try:
+                accepted, run = fail_benchmark_task(
+                    session, task, node.id, failure_code
+                )
+            except BenchmarkRunError as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, _benchmark_run_error_detail(exc)
+                ) from exc
+            if not accepted:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "task cannot be failed"
+                )
+            return {
+                "ok": True,
+                "benchmark_run": benchmark_run_dict(run) if run else None,
+            }
+        if not finish_task(session, task, node.id, result=None, error=body.error):
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be failed")
         return {"ok": True}
 
@@ -617,6 +757,74 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
+    @app.post(
+        "/v1/admin/benchmark-runs/prepare", dependencies=[Depends(admin_auth)]
+    )
+    def benchmark_run_prepare(
+        body: BenchmarkRunPrepare,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            run, created = prepare_benchmark_run(session, **body.model_dump())
+        except BenchmarkRunNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except BenchmarkNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except BenchmarkRunError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _benchmark_run_error_detail(exc)
+            ) from exc
+        except (BenchmarkIdentityMismatchError, BenchmarkPromotionError) as exc:
+            detail = (
+                _promotion_error_detail(exc)
+                if isinstance(exc, BenchmarkPromotionError)
+                else str(exc)
+            )
+            raise HTTPException(status.HTTP_409_CONFLICT, detail) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"benchmark_run": benchmark_run_dict(run), "created": created}
+
+    @app.post(
+        "/v1/admin/benchmark-runs/{request_id}/apply",
+        dependencies=[Depends(admin_auth)],
+    )
+    def benchmark_run_apply(
+        request_id: str,
+        body: BenchmarkRunApply,
+        session: Session = Depends(get_session),
+    ):
+        del body  # Literal[True] is the explicit mutation authorization gate.
+        try:
+            run, task, created = apply_benchmark_run(session, request_id)
+        except BenchmarkRunNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except BenchmarkRunError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _benchmark_run_error_detail(exc)
+            ) from exc
+        except BenchmarkNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return {
+            "benchmark_run": benchmark_run_dict(run),
+            "task": _task_dict(task),
+            "created": created,
+        }
+
+    @app.get(
+        "/v1/admin/benchmark-runs/{request_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def benchmark_run_detail(
+        request_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            run = get_benchmark_run(session, request_id)
+        except BenchmarkRunNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return {"benchmark_run": benchmark_run_dict(run)}
+
     @app.post("/v1/admin/benchmark-evidence", dependencies=[Depends(admin_auth)])
     def benchmark_evidence_create(
         body: BenchmarkEvidenceCreate,
@@ -741,7 +949,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if task is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "task not found")
         if not cancel_task(session, task):
-            raise HTTPException(status.HTTP_409_CONFLICT, "only queued tasks can be canceled")
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "only queued tasks or expired running BENCHMARK tasks can be canceled",
+            )
         return {"ok": True}
 
     return app

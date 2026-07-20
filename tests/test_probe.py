@@ -69,6 +69,18 @@ class ProbeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (model_path / ".dure-model.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "dure-model-cache-v1",
+                        "repository": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+                        "revision": "a" * 40,
+                        "manifest_digest": "sha256:" + "b" * 64,
+                        "quantization": "awq",
+                    }
+                ),
+                encoding="utf-8",
+            )
             incomplete = model_root / "partial-model"
             incomplete.mkdir()
             containers = "\n".join(
@@ -115,6 +127,9 @@ class ProbeTests(unittest.TestCase):
         by_id = {item.model_id: item for item in result.installed_models}
         self.assertTrue(by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].complete)
         self.assertEqual(by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].quantization, "awq")
+        self.assertEqual(
+            by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].revision, "a" * 40
+        )
         self.assertEqual(by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].size_mib, 10240)
         self.assertFalse(by_id["partial-model"].complete)
         self.assertEqual(len(result.workloads), 1)

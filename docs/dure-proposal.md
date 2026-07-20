@@ -7,7 +7,7 @@
 
 ## 구현 상태 안내
 
-이 문서는 제품 비전과 장기 MVP 가설을 설명합니다. 현재 저장소에 실제로 구현된 범위는 Linux 노드 조사, 제한된 Qwen2.5 배포 계획, Docker/Ray/vLLM lifecycle, pending 승인, outbound Agent, 중앙 task 관리, 읽기 전용 용량 진단·배포 추천, 모델 레지스트리와 증적 기반 승격 게이트입니다.
+이 문서는 제품 비전과 장기 MVP 가설을 설명합니다. 현재 저장소에 실제로 구현된 범위는 Linux 노드 조사, 제한된 Qwen2.5 배포 계획, Docker/Ray/vLLM lifecycle, pending 승인, outbound Agent, 중앙 task 관리, 읽기 전용 용량 진단·배포 추천, 모델 레지스트리와 증적 기반 승격 게이트, 승인된 단일 GPU의 폐쇄형 벤치마크 작업입니다.
 
 다음 항목은 이 제안서에 포함되지만 아직 구현되지 않았거나 계획 단계입니다.
 

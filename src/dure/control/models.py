@@ -250,12 +250,22 @@ class BenchmarkEvidence(Base):
             "length(evidence_digest) = 71 AND evidence_digest LIKE 'sha256:%'",
             name="ck_benchmark_evidence_digest_sha256",
         ),
+        CheckConstraint(
+            "benchmark_run_id IS NULL OR length(benchmark_run_id) = 36",
+            name="ck_benchmark_evidence_run_id_length",
+        ),
         Index("ix_benchmark_evidence_release_id", "release_id"),
         Index("ix_benchmark_evidence_placement_id", "placement_id"),
         Index("ix_benchmark_evidence_status", "status"),
+        Index(
+            "ux_benchmark_evidence_benchmark_run_id",
+            "benchmark_run_id",
+            unique=True,
+        ),
         UniqueConstraint("placement_id", "registration_sequence"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    benchmark_run_id: Mapped[str | None] = mapped_column(String(36))
     release_id: Mapped[str] = mapped_column(
         ForeignKey("model_releases.id"), nullable=False
     )
@@ -310,6 +320,78 @@ class Task(Base):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result: Mapped[dict | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BenchmarkRun(Base):
+    __tablename__ = "benchmark_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PREPARED', 'QUEUED', 'SUCCEEDED', 'FAILED')",
+            name="ck_benchmark_run_status",
+        ),
+        CheckConstraint(
+            "workload_id IN ('short-chat-1k-128', 'long-chat-4k-256', "
+            "'max-context', 'quality-eval')",
+            name="ck_benchmark_run_workload",
+        ),
+        CheckConstraint("input_tokens > 0", name="ck_benchmark_run_input_positive"),
+        CheckConstraint("output_tokens > 0", name="ck_benchmark_run_output_positive"),
+        CheckConstraint("concurrency > 0", name="ck_benchmark_run_concurrency_positive"),
+        CheckConstraint("warmup_requests >= 0", name="ck_benchmark_run_warmup_nonnegative"),
+        CheckConstraint("request_count > 0", name="ck_benchmark_run_requests_positive"),
+        CheckConstraint("duration_seconds > 0", name="ck_benchmark_run_duration_positive"),
+        CheckConstraint(
+            "length(inventory_fingerprint) = 71 AND inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_benchmark_run_inventory_fingerprint",
+        ),
+        CheckConstraint(
+            "length(request_digest) = 71 AND request_digest LIKE 'sha256:%'",
+            name="ck_benchmark_run_request_digest",
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR failure_code IN ("
+            "'BENCHMARK_EXECUTION_FAILED', 'BENCHMARK_PAYLOAD_REJECTED', "
+            "'BENCHMARK_RUNTIME_UNAVAILABLE', 'BENCHMARK_ARTIFACT_UNAVAILABLE', "
+            "'BENCHMARK_EVIDENCE_REJECTED', 'BENCHMARK_CANCELED')",
+            name="ck_benchmark_run_failure_code",
+        ),
+        Index("ix_benchmark_runs_request_digest", "request_digest"),
+        Index("ix_benchmark_runs_release_id", "release_id"),
+        Index("ix_benchmark_runs_status", "status"),
+        Index("ix_benchmark_runs_coordinator_node_id", "coordinator_node_id"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    release_id: Mapped[str] = mapped_column(ForeignKey("model_releases.id"), nullable=False)
+    placement_id: Mapped[str] = mapped_column(ForeignKey("placement_profiles.id"), nullable=False)
+    coordinator_node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    inventory_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    suite_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    workload_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    dure_commit: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    repository: Mapped[str] = mapped_column(String(255), nullable=False)
+    artifact_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_manifest_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    quantization: Mapped[str] = mapped_column(String(40), nullable=False)
+    runtime_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    concurrency: Mapped[int] = mapped_column(Integer, nullable=False)
+    warmup_requests: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="PREPARED", nullable=False)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"), unique=True)
+    evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey("benchmark_evidence.id"), unique=True
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

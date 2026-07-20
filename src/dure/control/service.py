@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
 import secrets
 import uuid
@@ -11,9 +13,27 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from dure.models import DeploymentPlan, NodeProfile
+from dure.task import (
+    MAX_BENCHMARK_CONTEXT_TOKENS,
+    MAX_BENCHMARK_INTEGER,
+    BenchmarkTaskPayload,
+)
 
+from .benchmark import (
+    BENCHMARK_POLICY_VERSION,
+    BENCHMARK_SUITE_ID,
+    MIN_MEASURED_REQUESTS,
+    MIN_MEASURED_SECONDS,
+    MIN_WARMUP_REQUESTS,
+    BenchmarkIdentityMismatchError,
+    BenchmarkNotFoundError,
+    BenchmarkPromotionError,
+    benchmark_context,
+    register_benchmark_evidence,
+)
 from .models import (
     AuditEvent,
+    BenchmarkRun,
     Deployment,
     EnrollmentToken,
     ModelArtifact,
@@ -40,10 +60,54 @@ MODEL_RELEASE_TRANSITIONS = {
 QUANTIZATIONS = {"awq", "gptq", "fp8", "fp16", "bf16", "int8"}
 GPU_ARCHITECTURES = {"ampere", "ada", "hopper", "blackwell"}
 TOPOLOGIES = {"single-gpu", "pipeline"}
+BENCHMARK_WORKLOAD_IDS = {
+    "short-chat-1k-128",
+    "long-chat-4k-256",
+    "max-context",
+    "quality-eval",
+}
+BENCHMARK_TASK_FAILURE_CODES = {
+    "BENCHMARK_EXECUTION_FAILED",
+    "BENCHMARK_PAYLOAD_REJECTED",
+    "BENCHMARK_RUNTIME_UNAVAILABLE",
+    "BENCHMARK_ARTIFACT_UNAVAILABLE",
+    "BENCHMARK_EVIDENCE_REJECTED",
+    "BENCHMARK_CANCELED",
+}
+BENCHMARK_RESULT_METRIC_FIELDS = {
+    "duration_seconds",
+    "request_count",
+    "warmup_requests",
+    "oom_count",
+    "crash_count",
+    "restart_count",
+    "ttft_p95_ms",
+    "tpot_p95_ms",
+    "e2e_p95_ms",
+    "throughput_tps",
+    "success_rate",
+    "vram_headroom_pct",
+    "quality_score",
+    "network_bandwidth_mbps",
+    "network_rtt_ms",
+    "packet_loss_pct",
+    "nccl_all_reduce_ok",
+}
 
 
 class RegistryConflictError(ValueError):
     pass
+
+
+class BenchmarkRunNotFoundError(ValueError):
+    pass
+
+
+class BenchmarkRunError(ValueError):
+    def __init__(self, message: str, *, code: str, details: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
 
 
 def secret_hash(value: str) -> str:
@@ -531,6 +595,789 @@ def save_deployment(
     return record
 
 
+def _canonical_uuid(value: str, *, field: str) -> str:
+    try:
+        if str(uuid.UUID(value)) != value:
+            raise ValueError
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a canonical UUID") from exc
+    return value
+
+
+def _canonical_digest(value: dict) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _benchmark_request(
+    *,
+    release_id: str,
+    placement_id: str,
+    node_ids: list[str],
+    workload_id: str,
+    dure_commit: str,
+) -> dict:
+    return {
+        "release_id": release_id,
+        "placement_id": placement_id,
+        "node_ids": sorted(node_ids),
+        "workload_id": workload_id,
+        "dure_commit": dure_commit,
+    }
+
+
+def _benchmark_workload(artifact: ModelArtifact, workload_id: str) -> dict:
+    presets = {
+        "short-chat-1k-128": (1024, 128, 8),
+        "long-chat-4k-256": (4096, 256, 4),
+        "quality-eval": (1024, 256, 1),
+    }
+    if workload_id == "max-context":
+        output_tokens = 256
+        input_tokens = artifact.default_max_model_len - output_tokens
+        concurrency = 1
+    else:
+        try:
+            input_tokens, output_tokens, concurrency = presets[workload_id]
+        except KeyError as exc:
+            raise ValueError("unsupported benchmark workload_id") from exc
+    if (
+        input_tokens <= 0
+        or input_tokens + output_tokens > artifact.default_max_model_len
+        or input_tokens + output_tokens > MAX_BENCHMARK_CONTEXT_TOKENS
+    ):
+        raise BenchmarkRunError(
+            "model artifact cannot satisfy the selected benchmark context length",
+            code="WORKLOAD_CONTEXT_UNSUPPORTED",
+            details={
+                "workload_id": workload_id,
+                "default_max_model_len": artifact.default_max_model_len,
+            },
+        )
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "concurrency": concurrency,
+        "warmup_requests": MIN_WARMUP_REQUESTS,
+        "request_count": MIN_MEASURED_REQUESTS,
+        "duration_seconds": float(MIN_MEASURED_SECONDS),
+    }
+
+
+def _benchmark_registry(
+    session: Session, release_id: str
+) -> tuple[ModelRelease, ModelArtifact, RuntimeRelease]:
+    release = session.get(ModelRelease, release_id)
+    if release is None:
+        raise BenchmarkNotFoundError("model release not found")
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    runtime = session.get(RuntimeRelease, release.runtime_id)
+    if artifact is None or runtime is None:
+        raise BenchmarkIdentityMismatchError(
+            "model release registry binding is incomplete"
+        )
+    return release, artifact, runtime
+
+
+def _require_single_node_benchmark(
+    session: Session,
+    *,
+    release_id: str,
+    placement_id: str,
+    node_ids: list[str],
+) -> PlacementProfileRecord:
+    placement = session.get(PlacementProfileRecord, placement_id)
+    if placement is None or placement.release_id != release_id:
+        raise BenchmarkNotFoundError(
+            "placement profile not found for model release"
+        )
+    if (
+        placement.topology != "single-gpu"
+        or placement.node_count != 1
+        or placement.pipeline_parallel_size != 1
+        or placement.tensor_parallel_size != 1
+        or len(node_ids) != 1
+    ):
+        raise BenchmarkRunError(
+            "automatic benchmark execution supports only a single-GPU placement",
+            code="MULTI_NODE_BENCHMARK_UNSUPPORTED",
+            details={
+                "placement_topology": placement.topology,
+                "placement_node_count": placement.node_count,
+                "requested_node_count": len(node_ids),
+            },
+        )
+    return placement
+
+
+def benchmark_run_dict(run: BenchmarkRun) -> dict:
+    return {
+        key: getattr(run, key)
+        for key in (
+            "id",
+            "request_id",
+            "request_digest",
+            "release_id",
+            "placement_id",
+            "coordinator_node_id",
+            "node_ids",
+            "inventory_fingerprint",
+            "suite_id",
+            "policy_version",
+            "workload_id",
+            "dure_commit",
+            "model_id",
+            "repository",
+            "artifact_revision",
+            "artifact_manifest_digest",
+            "quantization",
+            "runtime_image",
+            "input_tokens",
+            "output_tokens",
+            "concurrency",
+            "warmup_requests",
+            "request_count",
+            "duration_seconds",
+            "status",
+            "task_id",
+            "evidence_id",
+            "failure_code",
+            "created_at",
+            "updated_at",
+        )
+    }
+
+
+def get_benchmark_run(session: Session, request_id: str) -> BenchmarkRun:
+    run = session.scalar(
+        select(BenchmarkRun).where(BenchmarkRun.request_id == request_id)
+    )
+    if run is None:
+        raise BenchmarkRunNotFoundError("benchmark run not found")
+    return run
+
+
+def prepare_benchmark_run(
+    session: Session,
+    *,
+    request_id: str,
+    release_id: str,
+    placement_id: str,
+    node_ids: list[str],
+    workload_id: str,
+    dure_commit: str,
+) -> tuple[BenchmarkRun, bool]:
+    _canonical_uuid(request_id, field="request_id")
+    _canonical_uuid(release_id, field="release_id")
+    _canonical_uuid(placement_id, field="placement_id")
+    if len(node_ids) != len(set(node_ids)):
+        raise ValueError("benchmark node_ids must not contain duplicates")
+    for node_id in node_ids:
+        _canonical_uuid(node_id, field="node_id")
+    if workload_id not in BENCHMARK_WORKLOAD_IDS:
+        raise ValueError("unsupported benchmark workload_id")
+    if re.fullmatch(r"[0-9a-f]{40,64}", dure_commit) is None:
+        raise ValueError("dure_commit must be an immutable commit hash")
+    request = _benchmark_request(
+        release_id=release_id,
+        placement_id=placement_id,
+        node_ids=node_ids,
+        workload_id=workload_id,
+        dure_commit=dure_commit,
+    )
+    request_digest = _canonical_digest(request)
+    existing = session.scalar(
+        select(BenchmarkRun).where(BenchmarkRun.request_id == request_id)
+    )
+    if existing is not None:
+        if existing.request_digest == request_digest:
+            return existing, False
+        raise BenchmarkRunError(
+            "request_id is already bound to a different benchmark request",
+            code="BENCHMARK_REQUEST_CONFLICT",
+            details={"request_id": request_id},
+        )
+
+    normalized_node_ids = request["node_ids"]
+    _require_single_node_benchmark(
+        session,
+        release_id=release_id,
+        placement_id=placement_id,
+        node_ids=normalized_node_ids,
+    )
+    context = benchmark_context(
+        session,
+        release_id=release_id,
+        placement_id=placement_id,
+        node_ids=normalized_node_ids,
+    )
+    _, artifact, runtime = _benchmark_registry(session, release_id)
+    workload = _benchmark_workload(artifact, workload_id)
+    run = BenchmarkRun(
+        request_id=request_id,
+        request_digest=request_digest,
+        release_id=release_id,
+        placement_id=placement_id,
+        coordinator_node_id=normalized_node_ids[0],
+        node_ids=normalized_node_ids,
+        inventory_fingerprint=context["inventory_fingerprint"],
+        suite_id=context["suite_id"],
+        policy_version=context["policy_version"],
+        workload_id=workload_id,
+        dure_commit=dure_commit,
+        model_id=artifact.model_id,
+        repository=artifact.repository,
+        artifact_revision=artifact.revision,
+        artifact_manifest_digest=artifact.manifest_digest,
+        quantization=artifact.quantization,
+        runtime_image=runtime.image,
+        status="PREPARED",
+        **workload,
+    )
+    session.add(run)
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        existing = session.scalar(
+            select(BenchmarkRun).where(BenchmarkRun.request_id == request_id)
+        )
+        if existing is not None and existing.request_digest == request_digest:
+            return existing, False
+        raise BenchmarkRunError(
+            "request_id is already bound to a different benchmark request",
+            code="BENCHMARK_REQUEST_CONFLICT",
+            details={"request_id": request_id},
+        ) from exc
+    audit(
+        session,
+        "admin",
+        "benchmark_run.prepare",
+        run.id,
+        "success",
+        request_id=request_id,
+        request_digest=request_digest,
+    )
+    session.commit()
+    return run, True
+
+
+def _benchmark_task_payload(run: BenchmarkRun) -> dict:
+    payload = {
+        "benchmark_id": run.id,
+        "release_id": run.release_id,
+        "placement_id": run.placement_id,
+        "suite_id": run.suite_id,
+        "policy_version": run.policy_version,
+        "dure_commit": run.dure_commit,
+        "model_id": run.model_id,
+        "model_repository": run.repository,
+        "artifact_revision": run.artifact_revision,
+        "artifact_manifest_digest": run.artifact_manifest_digest,
+        "quantization": run.quantization,
+        "runtime_image": run.runtime_image,
+        "coordinator_node_id": run.coordinator_node_id,
+        "node_ids": list(run.node_ids),
+        "inventory_fingerprint": run.inventory_fingerprint,
+        "workload_id": run.workload_id,
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "concurrency": run.concurrency,
+        "warmup_requests": run.warmup_requests,
+        "request_count": run.request_count,
+        "duration_seconds": run.duration_seconds,
+        "apply": True,
+    }
+    # Keep the producer and node-agent consumer on one exact, closed schema.
+    BenchmarkTaskPayload.from_dict(payload)
+    return payload
+
+
+def apply_benchmark_run(
+    session: Session, request_id: str
+) -> tuple[BenchmarkRun, Task, bool]:
+    identity = session.execute(
+        select(
+            BenchmarkRun.release_id,
+            BenchmarkRun.coordinator_node_id,
+        ).where(BenchmarkRun.request_id == request_id)
+    ).one_or_none()
+    if identity is None:
+        raise BenchmarkRunNotFoundError("benchmark run not found")
+    locked_release = session.scalar(
+        select(ModelRelease)
+        .where(ModelRelease.id == identity.release_id)
+        .with_for_update()
+    )
+    locked_node = session.scalar(
+        select(Node)
+        .where(Node.id == identity.coordinator_node_id)
+        .with_for_update()
+    )
+    run = session.scalar(
+        select(BenchmarkRun)
+        .where(BenchmarkRun.request_id == request_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if run is None:
+        raise BenchmarkRunNotFoundError("benchmark run not found")
+    if (
+        locked_release is None
+        or locked_node is None
+        or run.release_id != identity.release_id
+        or run.coordinator_node_id != identity.coordinator_node_id
+    ):
+        raise BenchmarkRunError(
+            "prepared benchmark context is no longer available",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        )
+    if run.status != "PREPARED":
+        task = session.get(Task, run.task_id) if run.task_id else None
+        if task is None:
+            raise BenchmarkRunError(
+                "benchmark run has no corresponding task",
+                code="BENCHMARK_TASK_STATE_INVALID",
+            )
+        return run, task, False
+
+    _require_single_node_benchmark(
+        session,
+        release_id=run.release_id,
+        placement_id=run.placement_id,
+        node_ids=list(run.node_ids),
+    )
+    try:
+        context = benchmark_context(
+            session,
+            release_id=run.release_id,
+            placement_id=run.placement_id,
+            node_ids=list(run.node_ids),
+        )
+        _, artifact, runtime = _benchmark_registry(session, run.release_id)
+        workload = _benchmark_workload(artifact, run.workload_id)
+    except (
+        BenchmarkIdentityMismatchError,
+        BenchmarkNotFoundError,
+        BenchmarkPromotionError,
+        ValueError,
+    ) as exc:
+        raise BenchmarkRunError(
+            "prepared benchmark context is no longer eligible",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        ) from exc
+    current = {
+        "inventory_fingerprint": context["inventory_fingerprint"],
+        "suite_id": context["suite_id"],
+        "policy_version": context["policy_version"],
+        "model_id": artifact.model_id,
+        "repository": artifact.repository,
+        "artifact_revision": artifact.revision,
+        "artifact_manifest_digest": artifact.manifest_digest,
+        "quantization": artifact.quantization,
+        "runtime_image": runtime.image,
+        **workload,
+    }
+    changed = sorted(
+        key for key, value in current.items() if getattr(run, key) != value
+    )
+    if changed:
+        raise BenchmarkRunError(
+            "prepared benchmark context has changed",
+            code="BENCHMARK_CONTEXT_CHANGED",
+            details={"changed_fields": changed},
+        )
+
+    try:
+        payload = _benchmark_task_payload(run)
+    except ValueError as exc:  # pragma: no cover - persisted runs use this schema
+        raise BenchmarkRunError(
+            "prepared benchmark payload no longer matches the closed schema",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        ) from exc
+    task = Task(
+        bulk_id=run.request_id,
+        node_id=run.coordinator_node_id,
+        type=TaskType.BENCHMARK.value,
+        deployment_id=None,
+        payload=payload,
+    )
+    session.add(task)
+    session.flush()
+    run.task_id = task.id
+    run.status = "QUEUED"
+    run.updated_at = utcnow()
+    if not locked_node.approved:  # pragma: no cover - context locked it
+        session.rollback()
+        raise BenchmarkRunError(
+            "prepared benchmark coordinator is no longer approved",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        )
+    locked_node.desired_state = TaskType.BENCHMARK.value
+    audit(
+        session,
+        "admin",
+        "benchmark_run.apply",
+        run.id,
+        "success",
+        task_id=task.id,
+    )
+    session.commit()
+    return run, task, True
+
+
+def _number(value, *, field: str, minimum: float | None = None, maximum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"benchmark metric {field} must be numeric")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"benchmark metric {field} must be finite")
+    if minimum is not None and normalized < minimum:
+        raise ValueError(f"benchmark metric {field} is out of range")
+    if maximum is not None and normalized > maximum:
+        raise ValueError(f"benchmark metric {field} is out of range")
+    return normalized
+
+
+def _integer(value, *, field: str, minimum: int) -> int:
+    if (
+        type(value) is not int
+        or value < minimum
+        or value > MAX_BENCHMARK_INTEGER
+    ):
+        raise ValueError(f"benchmark metric {field} must be an integer in range")
+    return value
+
+
+def validate_benchmark_task_result(run: BenchmarkRun, result: dict) -> dict:
+    if not isinstance(result, dict):
+        raise ValueError("BENCHMARK result must be an object")
+    expected_outer = {"benchmark_id", "workload_id", "metrics"}
+    if set(result) != expected_outer:
+        unexpected = sorted(set(result) - expected_outer)
+        missing = sorted(expected_outer - set(result))
+        detail = unexpected or missing
+        raise ValueError(
+            "BENCHMARK result fields do not match the closed schema: "
+            + ", ".join(detail)
+        )
+    if result["benchmark_id"] != run.id:
+        raise ValueError("BENCHMARK result benchmark_id does not match the run")
+    if result["workload_id"] != run.workload_id:
+        raise ValueError("BENCHMARK result workload_id does not match the run")
+    metrics = result["metrics"]
+    if not isinstance(metrics, dict):
+        raise ValueError("BENCHMARK result metrics must be an object")
+    if set(metrics) != BENCHMARK_RESULT_METRIC_FIELDS:
+        unexpected = sorted(set(metrics) - BENCHMARK_RESULT_METRIC_FIELDS)
+        missing = sorted(BENCHMARK_RESULT_METRIC_FIELDS - set(metrics))
+        detail = unexpected or missing
+        raise ValueError(
+            "BENCHMARK metric fields do not match the closed schema: "
+            + ", ".join(detail)
+        )
+
+    normalized = {
+        "duration_seconds": _number(
+            metrics["duration_seconds"], field="duration_seconds", minimum=0.000001
+        ),
+        "request_count": _integer(
+            metrics["request_count"], field="request_count", minimum=1
+        ),
+        "warmup_requests": _integer(
+            metrics["warmup_requests"], field="warmup_requests", minimum=0
+        ),
+        "oom_count": _integer(metrics["oom_count"], field="oom_count", minimum=0),
+        "crash_count": _integer(
+            metrics["crash_count"], field="crash_count", minimum=0
+        ),
+        "restart_count": _integer(
+            metrics["restart_count"], field="restart_count", minimum=0
+        ),
+        "success_rate": _number(
+            metrics["success_rate"], field="success_rate", minimum=0, maximum=1
+        ),
+        "vram_headroom_pct": _number(
+            metrics["vram_headroom_pct"],
+            field="vram_headroom_pct",
+            minimum=0,
+            maximum=100,
+        ),
+        "quality_score": _number(
+            metrics["quality_score"], field="quality_score", minimum=0, maximum=1
+        ),
+    }
+    if (
+        normalized["request_count"] != run.request_count
+        or normalized["warmup_requests"] != run.warmup_requests
+    ):
+        raise ValueError(
+            "BENCHMARK result measurement counts do not match the prepared run"
+        )
+    for field in (
+        "ttft_p95_ms",
+        "tpot_p95_ms",
+        "e2e_p95_ms",
+        "throughput_tps",
+    ):
+        value = metrics[field]
+        normalized[field] = (
+            None if value is None else _number(value, field=field, minimum=0.000001)
+        )
+    for field in (
+        "network_bandwidth_mbps",
+        "network_rtt_ms",
+        "packet_loss_pct",
+        "nccl_all_reduce_ok",
+    ):
+        if metrics[field] is not None:
+            raise ValueError(
+                f"single-node BENCHMARK metric {field} must be null"
+            )
+        normalized[field] = None
+    return {
+        "benchmark_id": run.id,
+        "workload_id": run.workload_id,
+        "metrics": normalized,
+    }
+
+
+def _fail_benchmark_record(
+    session: Session,
+    *,
+    task: Task,
+    run: BenchmarkRun,
+    node_id: str,
+    failure_code: str,
+) -> None:
+    task.status = TaskStatus.FAILED.value
+    task.result = None
+    task.error = failure_code
+    task.lease_until = None
+    run.status = "FAILED"
+    run.failure_code = failure_code
+    run.updated_at = utcnow()
+    node = session.get(Node, node_id)
+    if node is not None:
+        node.desired_state = None
+    audit(
+        session,
+        f"node:{node_id}",
+        "benchmark_run.fail",
+        run.id,
+        "failed",
+        task_id=task.id,
+        failure_code=failure_code,
+    )
+    session.commit()
+
+
+def _lock_benchmark_terminal(
+    session: Session, *, task_id: str, node_id: str
+) -> tuple[Node | None, Task | None, BenchmarkRun | None]:
+    release_id = session.scalar(
+        select(BenchmarkRun.release_id).where(BenchmarkRun.task_id == task_id)
+    )
+    if release_id is None:
+        return None, None, None
+    release = session.scalar(
+        select(ModelRelease)
+        .where(ModelRelease.id == release_id)
+        .with_for_update()
+    )
+    if release is None:
+        return None, None, None
+    node = session.scalar(
+        select(Node).where(Node.id == node_id).with_for_update()
+    )
+    task = session.scalar(
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    run = session.scalar(
+        select(BenchmarkRun)
+        .where(BenchmarkRun.task_id == task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return node, task, run
+
+
+def complete_benchmark_task(
+    session: Session, task: Task, node_id: str, result: dict
+) -> tuple[bool, BenchmarkRun | None]:
+    if task.type != TaskType.BENCHMARK.value or task.node_id != node_id:
+        return False, None
+    task_id = task.id
+    _, task, run = _lock_benchmark_terminal(
+        session, task_id=task_id, node_id=node_id
+    )
+    if (
+        task is None
+        or run is None
+        or task.type != TaskType.BENCHMARK.value
+        or task.node_id != node_id
+        or run.coordinator_node_id != node_id
+    ):
+        return False, None
+    normalized = validate_benchmark_task_result(run, result)
+    result_digest = _canonical_digest(normalized)
+    if task.status == TaskStatus.SUCCEEDED.value:
+        if (
+            not isinstance(task.result, dict)
+            or task.result.get("result_digest") != result_digest
+            or task.result.get("evidence_id") != run.evidence_id
+            or run.status != "SUCCEEDED"
+        ):
+            raise BenchmarkRunError(
+                "completed benchmark task result cannot be replaced",
+                code="BENCHMARK_RESULT_CONFLICT",
+            )
+        return True, run
+    if task.status != TaskStatus.RUNNING.value or run.status != "QUEUED":
+        return False, run
+    metrics = normalized["metrics"]
+    try:
+        evidence = register_benchmark_evidence(
+            session,
+            release_id=run.release_id,
+            placement_id=run.placement_id,
+            suite_id=run.suite_id,
+            node_ids=list(run.node_ids),
+            inventory_fingerprint=run.inventory_fingerprint,
+            artifact_revision=run.artifact_revision,
+            artifact_manifest_digest=run.artifact_manifest_digest,
+            runtime_image=run.runtime_image,
+            dure_commit=run.dure_commit,
+            policy_version=run.policy_version,
+            input_tokens=run.input_tokens,
+            output_tokens=run.output_tokens,
+            concurrency=run.concurrency,
+            benchmark_run_id=run.id,
+            actor=f"node:{node_id}",
+            commit=False,
+            **metrics,
+        )
+    except (
+        BenchmarkIdentityMismatchError,
+        BenchmarkNotFoundError,
+        BenchmarkPromotionError,
+        ValueError,
+    ):
+        session.rollback()
+        _, task, run = _lock_benchmark_terminal(
+            session, task_id=task_id, node_id=node_id
+        )
+        if (
+            task is not None
+            and run is not None
+            and task.status == TaskStatus.SUCCEEDED.value
+            and run.status == "SUCCEEDED"
+        ):
+            if (
+                isinstance(task.result, dict)
+                and task.result.get("result_digest") == result_digest
+            ):
+                return True, run
+            raise BenchmarkRunError(
+                "completed benchmark task result cannot be replaced",
+                code="BENCHMARK_RESULT_CONFLICT",
+            )
+        if (
+            task is not None
+            and run is not None
+            and task.status == TaskStatus.RUNNING.value
+            and run.status == "QUEUED"
+        ):
+            _fail_benchmark_record(
+                session,
+                task=task,
+                run=run,
+                node_id=node_id,
+                failure_code="BENCHMARK_EVIDENCE_REJECTED",
+            )
+            return True, run
+        return False, run
+
+    _, task, run = _lock_benchmark_terminal(
+        session, task_id=task_id, node_id=node_id
+    )
+    if task is None or run is None:  # pragma: no cover - foreign keys preserve both
+        return False, None
+    task.status = TaskStatus.SUCCEEDED.value
+    task.result = {
+        "benchmark_id": run.id,
+        "workload_id": run.workload_id,
+        "evidence_id": evidence.id,
+        "result_digest": result_digest,
+    }
+    task.error = None
+    task.lease_until = None
+    run.status = "SUCCEEDED"
+    run.evidence_id = evidence.id
+    run.failure_code = None
+    run.updated_at = utcnow()
+    node = session.get(Node, node_id)
+    if node is not None:
+        node.desired_state = None
+    audit(
+        session,
+        f"node:{node_id}",
+        "benchmark_run.complete",
+        run.id,
+        "success",
+        task_id=task.id,
+        evidence_id=evidence.id,
+        evidence_status=evidence.status,
+    )
+    session.commit()
+    return True, run
+
+
+def fail_benchmark_task(
+    session: Session, task: Task, node_id: str, failure_code: str
+) -> tuple[bool, BenchmarkRun | None]:
+    if (
+        task.type != TaskType.BENCHMARK.value
+        or task.node_id != node_id
+        or failure_code not in BENCHMARK_TASK_FAILURE_CODES
+        or failure_code == "BENCHMARK_CANCELED"
+    ):
+        return False, None
+    _, task, run = _lock_benchmark_terminal(
+        session, task_id=task.id, node_id=node_id
+    )
+    if (
+        task is None
+        or run is None
+        or task.type != TaskType.BENCHMARK.value
+        or task.node_id != node_id
+        or run.coordinator_node_id != node_id
+    ):
+        return False, None
+    if task.status == TaskStatus.FAILED.value:
+        if task.error != failure_code or run.failure_code != failure_code:
+            raise BenchmarkRunError(
+                "failed benchmark task outcome cannot be replaced",
+                code="BENCHMARK_RESULT_CONFLICT",
+            )
+        return True, run
+    if task.status != TaskStatus.RUNNING.value or run.status != "QUEUED":
+        return False, run
+    _fail_benchmark_record(
+        session,
+        task=task,
+        run=run,
+        node_id=node_id,
+        failure_code=failure_code,
+    )
+    return True, run
+
+
 def create_tasks(
     session: Session,
     *,
@@ -539,6 +1386,10 @@ def create_tasks(
     deployment_id: str | None,
     options: dict,
 ) -> tuple[str, list[Task], dict[str, str]]:
+    if task_type == TaskType.BENCHMARK:
+        raise ValueError(
+            "BENCHMARK tasks require a prepared benchmark run and explicit apply"
+        )
     bulk_id = str(uuid.uuid4())
     tasks: list[Task] = []
     errors: dict[str, str] = {}
@@ -639,6 +1490,8 @@ def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int =
 
 
 def finish_task(session: Session, task: Task, node_id: str, *, result: dict | None, error: str | None) -> bool:
+    if task.type == TaskType.BENCHMARK.value:
+        return False
     if task.node_id != node_id:
         return False
     terminal = {TaskStatus.SUCCEEDED.value, TaskStatus.FAILED.value}
@@ -666,12 +1519,57 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
 
 
 def cancel_task(session: Session, task: Task) -> bool:
-    if task.status != TaskStatus.QUEUED.value:
+    identity = session.execute(
+        select(Task.type, Task.node_id).where(Task.id == task.id)
+    ).one_or_none()
+    if identity is None:
         return False
+    run = None
+    if identity.type == TaskType.BENCHMARK.value:
+        locked_node, locked_task, run = _lock_benchmark_terminal(
+            session, task_id=task.id, node_id=identity.node_id
+        )
+        if (
+            locked_node is None
+            or locked_task is None
+            or run is None
+            or locked_task.type != TaskType.BENCHMARK.value
+            or locked_task.node_id != identity.node_id
+            or run.coordinator_node_id != identity.node_id
+            or run.status != "QUEUED"
+        ):
+            return False
+    else:
+        locked_node = session.scalar(
+            select(Node).where(Node.id == identity.node_id).with_for_update()
+        )
+        locked_task = session.scalar(
+            select(Task)
+            .where(Task.id == task.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked_node is None or locked_task is None:
+            return False
+    task = locked_task
+    lease_until = task.lease_until
+    if lease_until is not None and lease_until.tzinfo is None:
+        lease_until = lease_until.replace(tzinfo=timezone.utc)
+    expired_benchmark_lease = (
+        task.type == TaskType.BENCHMARK.value
+        and task.status == TaskStatus.RUNNING.value
+        and (lease_until is None or lease_until < utcnow())
+    )
+    if task.status != TaskStatus.QUEUED.value and not expired_benchmark_lease:
+        return False
+    if task.type == TaskType.BENCHMARK.value:
+        assert run is not None
+        run.status = "FAILED"
+        run.failure_code = "BENCHMARK_CANCELED"
+        run.updated_at = utcnow()
     task.status = TaskStatus.CANCELED.value
-    node = session.get(Node, task.node_id)
-    if node is not None:
-        node.desired_state = None
+    task.lease_until = None
+    locked_node.desired_state = None
     audit(session, "admin", "task.cancel", task.id, "success")
     session.commit()
     return True
