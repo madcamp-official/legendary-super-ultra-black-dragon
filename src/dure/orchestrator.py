@@ -4,6 +4,14 @@ from pathlib import Path
 
 from .command import Runner, SubprocessRunner
 from .models import CheckResult, DeploymentPlan, NodeProfile
+from .pipeline_runtime import (
+    STAGE_CACHE_CHECK,
+    is_stage_pipeline_plan,
+    is_strict_pipeline_plan,
+    validate_strict_pipeline_node,
+    validate_strict_pipeline_plan,
+    validate_strict_stage_cache,
+)
 from .planner import build_plan, classify_node
 from .probe import NodeProbe
 from .readiness import ReadinessVerifier
@@ -35,6 +43,12 @@ class InitOrchestrator:
         replace: bool = False,
         serve: bool = False,
     ) -> tuple[NodeProfile, DeploymentPlan | None, list[CheckResult]]:
+        if plan is not None:
+            plan.validate_execution_contract()
+            if is_strict_pipeline_plan(plan):
+                # Reject central runtime inputs before state, model, image, or
+                # container mutations occur on the host.
+                validate_strict_pipeline_plan(plan)
         checks: list[CheckResult] = []
         state = NodeState(phase="PROBING")
         self.store.save(state)
@@ -73,6 +87,15 @@ class InitOrchestrator:
             self.store.save(state)
             checks.append(CheckResult("assignment", False, state.detail))
             return profile, plan, checks
+
+        if is_strict_pipeline_plan(plan):
+            try:
+                validate_strict_pipeline_node(
+                    plan, assignment, profile, require_model_cache=True
+                )
+            except ValueError as exc:
+                checks.append(CheckResult("deployment-plan", False, str(exc)))
+                return self._fail(state, profile, plan, checks, str(exc))
 
         state.deployment_id = plan.deployment_id
         state.generation = plan.generation
@@ -128,9 +151,23 @@ class InitOrchestrator:
 
         state.phase = "DOWNLOADING"
         self.store.save(state)
-        model_check = ModelStore(self.runner).ensure(
-            plan, accept_download=accept_model_download
-        )
+        if is_stage_pipeline_plan(plan):
+            try:
+                stage_cache = validate_strict_stage_cache(plan, assignment)
+            except ValueError as exc:
+                model_check = CheckResult(STAGE_CACHE_CHECK, False, str(exc))
+            else:
+                assert stage_cache is not None
+                model_check = CheckResult(
+                    STAGE_CACHE_CHECK,
+                    True,
+                    "Verified immutable rank-local STAGE cache "
+                    f"{stage_cache.cache_identity_digest}",
+                )
+        else:
+            model_check = ModelStore(self.runner).ensure(
+                plan, accept_download=accept_model_download
+            )
         checks.append(model_check)
         if not model_check.ok:
             return self._fail(state, profile, plan, checks, model_check.detail)
@@ -155,19 +192,32 @@ class InitOrchestrator:
             profile.runtime.engine or "docker",
             node_id=profile.node_id,
         )
-        for check in (verifier.host_gpu(profile), verifier.container_gpu(plan)):
+        for check in (
+            verifier.host_gpu(profile),
+            verifier.container_gpu(plan, assignment),
+        ):
             checks.append(check)
             if not check.ok:
                 return self._fail(state, profile, plan, checks, check.detail)
 
-        cluster_check = verifier.ray_cluster(plan)
-        checks.append(cluster_check)
-        if not cluster_check.ok:
-            cluster_check.blocking = False
-            state.phase = "WAITING_FOR_PEERS"
-            state.detail = cluster_check.detail
-            self.store.save(state)
-            return profile, plan, checks
+        if is_strict_pipeline_plan(plan):
+            cluster_check = verifier.wait_pipeline_rank_contract(
+                plan, assignment, profile, require_actors=False
+            )
+            if not cluster_check.ok:
+                checks.append(cluster_check)
+                return self._fail(
+                    state, profile, plan, checks, cluster_check.detail
+                )
+        else:
+            cluster_check = verifier.ray_cluster(plan)
+            checks.append(cluster_check)
+            if not cluster_check.ok:
+                cluster_check.blocking = False
+                state.phase = "WAITING_FOR_PEERS"
+                state.detail = cluster_check.detail
+                self.store.save(state)
+                return profile, plan, checks
 
         if serve and assignment.role == "ray-head":
             api_start = runtime.start_api(plan, assignment, replace=replace)
@@ -178,6 +228,18 @@ class InitOrchestrator:
             checks.append(api_ready)
             if not api_ready.ok:
                 return self._fail(state, profile, plan, checks, api_ready.detail)
+            if is_strict_pipeline_plan(plan):
+                cluster_check = verifier.wait_pipeline_rank_contract(
+                    plan, assignment, profile, require_actors=True
+                )
+                if not cluster_check.ok:
+                    checks.append(cluster_check)
+                    return self._fail(
+                        state, profile, plan, checks, cluster_check.detail
+                    )
+
+        if is_strict_pipeline_plan(plan):
+            checks.append(cluster_check)
 
         state.phase = "READY"
         state.detail = "Node and Ray deployment passed readiness checks"

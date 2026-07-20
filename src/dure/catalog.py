@@ -25,6 +25,14 @@ class PlacementProfile:
 
 
 @dataclass(frozen=True)
+class NetworkEvidenceBinding:
+    evidence_id: str
+    evidence_digest: str
+    node_ids: tuple[str, ...]
+    registered_at: str
+
+
+@dataclass(frozen=True)
 class CatalogEntry:
     model: ModelSpec
     placement: PlacementProfile
@@ -32,6 +40,7 @@ class CatalogEntry:
     artifact_revision: str | None = None
     candidate_id: str | None = None
     gpu_architectures: tuple[str, ...] = ()
+    network_evidence: tuple[NetworkEvidenceBinding, ...] = ()
 
 
 @dataclass(frozen=True)

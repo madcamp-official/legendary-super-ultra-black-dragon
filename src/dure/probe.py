@@ -6,9 +6,19 @@ import platform
 import re
 import shutil
 import socket
+import stat
 from pathlib import Path
 
 from .command import Runner, SubprocessRunner
+from .model_cache import (
+    MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_MARKER_FILE,
+    MODEL_CACHE_SCHEMA_V1,
+    ModelCacheMarker,
+    ModelCacheMarkerError,
+    read_model_cache_marker,
+)
+from .model_store import DURE_MODEL_STAGING_DIRECTORY
 from .models import (
     GPUProfile,
     InstalledModelProfile,
@@ -20,13 +30,16 @@ from .models import (
 
 
 DURE_MODEL_ROOT = Path("/var/lib/dure/models")
+DURE_STAGE_ROOT = DURE_MODEL_ROOT / "stages"
 DEFAULT_MODEL_ROOTS = (
     DURE_MODEL_ROOT,
+    DURE_STAGE_ROOT,
     Path.home() / ".cache" / "huggingface" / "hub",
 )
 MAX_DISCOVERED_MODELS = 100
-DURE_MODEL_METADATA_FILE = ".dure-model.json"
-DURE_MODEL_METADATA_SCHEMA = "dure-model-cache-v1"
+MAX_MODEL_CONFIG_BYTES = 1024 * 1024
+DURE_MODEL_METADATA_FILE = MODEL_CACHE_MARKER_FILE
+DURE_MODEL_METADATA_SCHEMA = MODEL_CACHE_SCHEMA_V1
 LLM_RUNTIME_MARKERS = {
     "vllm": "vllm",
     "ollama": "ollama",
@@ -134,14 +147,111 @@ class NodeProbe:
         )
 
     @staticmethod
-    def _model_config(path: Path) -> dict:
+    def _model_config(path: Path) -> dict | None:
+        descriptor = -1
         try:
-            if path.stat().st_size > 1024 * 1024:
-                return {}
-            value = json.loads(path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+            observed = path.lstat()
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or observed.st_mode & 0o022
+                or observed.st_size > MAX_MODEL_CONFIG_BYTES
+            ):
+                return None
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_dev != observed.st_dev
+                or before.st_ino != observed.st_ino
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or before.st_mode & 0o022
+                or before.st_size != observed.st_size
+            ):
+                return None
+            payload = bytearray()
+            while len(payload) <= MAX_MODEL_CONFIG_BYTES:
+                block = os.read(
+                    descriptor,
+                    min(8192, MAX_MODEL_CONFIG_BYTES + 1 - len(payload)),
+                )
+                if not block:
+                    break
+                payload.extend(block)
+            after = os.fstat(descriptor)
+            if (
+                len(payload) != before.st_size
+                or (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+            ):
+                return None
+
+            def unique_object(pairs: list[tuple[str, object]]) -> dict:
+                value: dict = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("duplicate model config key")
+                    value[key] = item
+                return value
+
+            value = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=unique_object,
+            )
+            return value if type(value) is dict else None
+        except (OSError, RecursionError, UnicodeError, ValueError):
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    @staticmethod
+    def _safe_model_directory(path: Path) -> bool:
+        try:
+            observed = path.lstat()
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (
+            stat.S_ISDIR(observed.st_mode)
+            and observed.st_uid == os.geteuid()
+            and not observed.st_mode & 0o022
+            and resolved == Path(os.path.abspath(path))
+        )
+
+    @classmethod
+    def _huggingface_model_config(
+        cls, path: Path, repository: Path
+    ) -> dict | None:
+        try:
+            resolved_repository = repository.resolve(strict=True)
+            resolved_blobs = (resolved_repository / "blobs").resolve(strict=True)
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if not resolved.is_relative_to(resolved_blobs):
+            return None
+        return cls._model_config(resolved)
 
     def _model_size_mib(self, path: Path) -> int | None:
         if not self.runner.exists("du"):
@@ -163,63 +273,57 @@ class NodeProbe:
         return None
 
     @staticmethod
-    def _dure_model_metadata(candidate: Path) -> dict[str, str]:
+    def _dure_model_metadata(candidate: Path) -> ModelCacheMarker | None:
         path = candidate / DURE_MODEL_METADATA_FILE
         try:
-            if path.stat().st_size > 64 * 1024:
-                return {}
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return {}
-        expected = {
-            "schema",
-            "repository",
-            "revision",
-            "manifest_digest",
-            "quantization",
-        }
-        if not isinstance(value, dict) or set(value) != expected:
-            return {}
-        if value.get("schema") != DURE_MODEL_METADATA_SCHEMA:
-            return {}
-        if not isinstance(value.get("repository"), str) or re.fullmatch(
-            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value["repository"]
-        ) is None:
-            return {}
-        if not isinstance(value.get("revision"), str) or re.fullmatch(
-            r"[0-9a-f]{40,64}", value["revision"]
-        ) is None:
-            return {}
-        if not isinstance(value.get("manifest_digest"), str) or re.fullmatch(
-            r"sha256:[0-9a-f]{64}", value["manifest_digest"]
-        ) is None:
-            return {}
-        if not isinstance(value.get("quantization"), str) or re.fullmatch(
-            r"[a-z0-9][a-z0-9._-]{1,39}", value["quantization"]
-        ) is None:
-            return {}
-        return value
+            return read_model_cache_marker(path)
+        except ModelCacheMarkerError:
+            return None
 
     def _probe_dure_models(self, root: Path) -> list[InstalledModelProfile]:
+        if not self._safe_model_directory(root):
+            return []
+        stage_root = root == DURE_STAGE_ROOT or root.name == DURE_STAGE_ROOT.name
         try:
-            candidates = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name)
+            candidates = []
+            for item in root.iterdir():
+                if item.name == DURE_MODEL_STAGING_DIRECTORY or (
+                    root == DURE_MODEL_ROOT and item == DURE_STAGE_ROOT
+                ):
+                    continue
+                try:
+                    state = item.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISDIR(state.st_mode) and self._safe_model_directory(item):
+                    candidates.append(item)
+            candidates.sort(key=lambda item: item.name)
         except OSError:
             return []
         models: list[InstalledModelProfile] = []
         for candidate in candidates[:MAX_DISCOVERED_MODELS]:
             config_path = candidate / "config.json"
-            config = self._model_config(config_path) if config_path.is_file() else {}
-            metadata = self._dure_model_metadata(candidate)
+            parsed_config = self._model_config(config_path)
+            config = parsed_config or {}
+            metadata = (
+                self._dure_model_metadata(candidate)
+                if parsed_config is not None
+                else None
+            )
             configured_quantization = self._quantization(config)
             if (
                 metadata
                 and configured_quantization
-                and metadata["quantization"] != configured_quantization
+                and metadata.quantization != configured_quantization
             ):
-                metadata = {}
+                metadata = None
             configured_name = config.get("_name_or_path")
+            advisory_stage = stage_root or (
+                metadata is not None
+                and metadata.cache_kind == MODEL_CACHE_KIND_STAGE
+            )
             model_id = (
-                metadata["repository"]
+                metadata.repository
                 if metadata
                 else (
                     str(configured_name)
@@ -232,14 +336,92 @@ class NodeProbe:
                     source="dure",
                     model_id=model_id,
                     path=str(candidate),
-                    revision=metadata.get("revision") if metadata else None,
+                    revision=metadata.revision if metadata else None,
                     quantization=(
-                        metadata["quantization"]
+                        metadata.quantization
                         if metadata
                         else configured_quantization
                     ),
                     size_mib=self._model_size_mib(candidate),
-                    complete=config_path.is_file(),
+                    # Heartbeat probing does not rehash a potentially huge stage
+                    # tree.  The identity is advisory until the start/readiness
+                    # gate validates every file through the canonical manifest.
+                    complete=parsed_config is not None and not advisory_stage,
+                    manifest_digest=metadata.manifest_digest if metadata else None,
+                    cache_kind=metadata.cache_kind if metadata else None,
+                    verification_version=(
+                        metadata.verification_version if metadata else None
+                    ),
+                    artifact_set_digest=(
+                        getattr(metadata, "artifact_set_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    contract_identity_digest=(
+                        getattr(metadata, "contract_identity_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    source_manifest_digest=(
+                        getattr(metadata, "source_manifest_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    runtime_image=(
+                        getattr(metadata, "runtime_image", None)
+                        if metadata
+                        else None
+                    ),
+                    vllm_version=(
+                        getattr(metadata, "vllm_version", None)
+                        if metadata
+                        else None
+                    ),
+                    exporter_build_digest=(
+                        getattr(metadata, "exporter_build_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    architecture=(
+                        getattr(metadata, "architecture", None)
+                        if metadata
+                        else None
+                    ),
+                    loader_format=(
+                        getattr(metadata, "loader_format", None)
+                        if metadata
+                        else None
+                    ),
+                    tensor_parallel_size=(
+                        getattr(metadata, "tensor_parallel_size", None)
+                        if metadata
+                        else None
+                    ),
+                    pipeline_parallel_size=(
+                        getattr(metadata, "pipeline_parallel_size", None)
+                        if metadata
+                        else None
+                    ),
+                    pipeline_rank=(
+                        getattr(metadata, "pipeline_rank", None)
+                        if metadata
+                        else None
+                    ),
+                    tensor_rank=(
+                        getattr(metadata, "tensor_rank", None)
+                        if metadata
+                        else None
+                    ),
+                    tensor_keys_digest=(
+                        getattr(metadata, "tensor_keys_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    cache_identity_digest=(
+                        getattr(metadata, "cache_identity_digest", None)
+                        if metadata
+                        else None
+                    ),
                 )
             )
         return models
@@ -266,7 +448,12 @@ class NodeProbe:
                 snapshots = []
             snapshot = snapshots[0] if snapshots else None
             config_path = snapshot / "config.json" if snapshot else None
-            config = self._model_config(config_path) if config_path and config_path.is_file() else {}
+            parsed_config = (
+                self._huggingface_model_config(config_path, repository)
+                if config_path
+                else None
+            )
+            config = parsed_config or {}
             models.append(
                 InstalledModelProfile(
                     source="huggingface-cache",
@@ -275,7 +462,7 @@ class NodeProbe:
                     revision=snapshot.name if snapshot else None,
                     quantization=self._quantization(config),
                     size_mib=self._model_size_mib(repository),
-                    complete=bool(snapshot and config_path and config_path.is_file()),
+                    complete=bool(snapshot and parsed_config is not None),
                 )
             )
         return models
@@ -449,15 +636,22 @@ class NodeProbe:
 
     def _probe_network(self) -> NetworkProfile:
         addresses: list[str] = []
+        addresses_by_interface: dict[str, list[str]] = {}
         default_interface = None
         if self.runner.exists("ip"):
             address_result = self.runner.run(["ip", "-j", "address", "show"], timeout=5)
             if address_result.ok:
                 try:
                     for interface in json.loads(address_result.stdout):
+                        interface_name = interface.get("ifname")
                         for info in interface.get("addr_info", []):
                             if info.get("family") == "inet" and info.get("local") != "127.0.0.1":
-                                addresses.append(info["local"])
+                                address = info["local"]
+                                addresses.append(address)
+                                if type(interface_name) is str:
+                                    addresses_by_interface.setdefault(
+                                        interface_name, []
+                                    ).append(address)
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
             route_result = self.runner.run(["ip", "-j", "route", "show", "default"], timeout=5)
@@ -468,4 +662,12 @@ class NodeProbe:
                         default_interface = routes[0].get("dev")
                 except (json.JSONDecodeError, TypeError):
                     pass
-        return NetworkProfile(default_interface=default_interface, addresses=addresses)
+        return NetworkProfile(
+            default_interface=default_interface,
+            addresses=addresses,
+            default_interface_addresses=(
+                addresses_by_interface.get(default_interface, [])
+                if type(default_interface) is str
+                else []
+            ),
+        )

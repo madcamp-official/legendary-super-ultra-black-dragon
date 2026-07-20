@@ -10,6 +10,12 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from ..model_cache import MODEL_CACHE_KIND_STAGE
+from ..models import DeploymentPlan, VLLM_RAY_PP_BACKEND
+from ..pipeline_runtime import (
+    pipeline_contract_detail,
+    validate_strict_pipeline_plan,
+)
 from ..task import TaskStatus, TaskType
 from .models import (
     AuditEvent,
@@ -23,6 +29,8 @@ from .models import (
 
 
 ROLLOUT_AGENT_VERSION = (0, 3, 12)
+STRICT_RAY_AGENT_VERSION = (0, 3, 18)
+STAGE_ARTIFACT_AGENT_VERSION = (0, 3, 19)
 ROLLBACK_NODE_PHASES = ("STOP_SOURCE", "START_TARGET", "VERIFY_TARGET")
 ROLLBACK_API_PHASES = ("START_API", "VERIFY_API")
 TERMINAL_TASK_STATUSES = {
@@ -44,6 +52,8 @@ DEPLOYMENT_MUTATION_TASK_TYPES = {
     TaskType.START_DEPLOYMENT.value,
     TaskType.STOP_DEPLOYMENT.value,
     TaskType.RESTART_DEPLOYMENT.value,
+    TaskType.PREPARE_MODEL.value,
+    TaskType.PREPARE_IMAGE.value,
 }
 PHASE_ORDER = {
     phase: index
@@ -144,6 +154,16 @@ def _supports_rollout(node: Node) -> bool:
     return version is not None and version >= ROLLOUT_AGENT_VERSION
 
 
+def _supports_strict_ray(node: Node) -> bool:
+    version = _agent_version(node.agent_version)
+    return version is not None and version >= STRICT_RAY_AGENT_VERSION
+
+
+def _supports_stage_artifact(node: Node) -> bool:
+    version = _agent_version(node.agent_version)
+    return version is not None and version >= STAGE_ARTIFACT_AGENT_VERSION
+
+
 def _node_is_online(node: Node, now: datetime) -> bool:
     seen = _aware(node.last_seen)
     return seen is not None and now - seen <= timedelta(seconds=30)
@@ -182,6 +202,23 @@ def _plan_assignments(
             code="ROLLBACK_PLAN_IDENTITY_MISMATCH",
         )
     _require_digest_image(plan, "deployment")
+    strict_ray = plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+    if "execution_backend" in plan:
+        if not strict_ray:
+            raise DeploymentRolloutError(
+                "deployment execution backend is not supported",
+                code="ROLLBACK_PLAN_INVALID",
+            )
+        try:
+            strict_plan = DeploymentPlan.from_dict(plan)
+            validate_strict_pipeline_plan(
+                strict_plan, require_manifest_cache_path=False
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeploymentRolloutError(
+                "strict Ray deployment contract is invalid",
+                code="ROLLBACK_PLAN_INVALID",
+            ) from exc
     assignments = plan.get("assignments")
     if type(assignments) is not list or not assignments:
         raise DeploymentRolloutError(
@@ -237,6 +274,12 @@ def _plan_assignments(
         "ray_head_address",
         "network_interface",
     )
+    if strict_ray:
+        topology_fields += (
+            "execution_backend",
+            "runtime_vllm_version",
+            "model_cache_kind",
+        )
     if any(field not in plan for field in topology_fields):
         raise DeploymentRolloutError(
             "deployment topology is incomplete", code="ROLLBACK_PLAN_INVALID"
@@ -398,6 +441,7 @@ def _operation_audit(
 
 
 def _phase_payload(
+    session: Session,
     operation: DeploymentOperation,
     phase: str,
     source: Deployment,
@@ -411,8 +455,17 @@ def _phase_payload(
                 "rollback target is missing", code="ROLLBACK_TARGET_NOT_FOUND"
             )
         deployment = target
+    plan = deployment.plan
+    if deployment.source_recommendation_id is not None:
+        from .preparation import effective_deployment_plan
+
+        plan = effective_deployment_plan(
+            session,
+            deployment,
+            require_prepared=phase != "STOP_SOURCE",
+        )
     payload: dict[str, Any] = {
-        "plan": deployment.plan,
+        "plan": plan,
         "generation": deployment.generation,
     }
     if phase == "APPLY":
@@ -421,8 +474,14 @@ def _phase_payload(
         payload["serve"] = False
         payload["accept_model_download"] = bool(
             deployment.accept_model_download
+            if deployment.source_recommendation_id is None
+            else False
         )
-        payload["pull_image"] = bool(deployment.pull_image)
+        payload["pull_image"] = bool(
+            deployment.pull_image
+            if deployment.source_recommendation_id is None
+            else False
+        )
     elif phase == "START_TARGET":
         payload["serve"] = False
     elif phase == "START_API":
@@ -474,7 +533,9 @@ def _queue_phase(
     )
     if source is None:
         raise DeploymentRolloutNotFoundError()
-    deployment, payload = _phase_payload(operation, phase, source, target)
+    deployment, payload = _phase_payload(
+        session, operation, phase, source, target
+    )
     records = _phase_nodes(session, operation, phase, lock=True)
     if retry_failed_only:
         records = [item for item in records if item.status in {"FAILED", "CANCELED"}]
@@ -652,6 +713,21 @@ def _validate_rollback(
             details={"expected_node_ids": source_nodes},
         )
     _validate_rollback_nodes(session, node_ids, now=utcnow())
+    if (
+        source.plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+        or target.plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+    ):
+        for node_id in node_ids:
+            node = session.get(Node, node_id)
+            if node is None or not _supports_strict_ray(node):
+                raise DeploymentRolloutError(
+                    "strict Ray rollback requires Dure Agent 0.3.18 or newer",
+                    code="ROLLBACK_AGENT_TOO_OLD",
+                    details={
+                        "node_id": node_id,
+                        "agent_version": node.agent_version if node else None,
+                    },
+                )
     return source, target, lineage_id
 
 
@@ -750,6 +826,43 @@ def prepare_or_apply_rollback(
     source, target, lineage_id = _validate_rollback(
         session, source_id, normalized_node_ids
     )
+    strict_rollback = (
+        source.plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+        or target.plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+    )
+    if strict_rollback and not serve:
+        raise DeploymentRolloutError(
+            "strict Ray rollback requires API start and actor attestation",
+            code="ROLLBACK_STRICT_API_ATTESTATION_REQUIRED",
+        )
+    from .preparation import effective_deployment_plan
+
+    # Rollback is deliberately network-free. A recommended target must already
+    # have a fully successful exact preparation record; these calls only read
+    # immutable evidence and never queue preparation. STOP_SOURCE deliberately
+    # retains a revoked source's stored effective plan for exact containment.
+    effective_source = effective_deployment_plan(
+        session, source, require_prepared=False
+    )
+    effective_target = effective_deployment_plan(
+        session, target, require_prepared=True
+    )
+    if any(
+        plan.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+        for plan in (effective_source, effective_target)
+    ):
+        unsupported = sorted(
+            node_id
+            for node_id in normalized_node_ids
+            if (node := session.get(Node, node_id)) is None
+            or not _supports_stage_artifact(node)
+        )
+        if unsupported:
+            raise DeploymentRolloutError(
+                "stage artifact rollback requires Dure Agent 0.3.19 or newer",
+                code="ROLLBACK_STAGE_AGENT_TOO_OLD",
+                details={"node_ids": unsupported},
+            )
     digest = _rollback_request_digest(
         source, target, normalized_node_ids, serve=serve
     )
@@ -952,6 +1065,13 @@ def attach_deployment_bulk_operation(
         )
     deployment = locked_deployment
     expected_nodes, _, _ = _plan_assignments(deployment)
+    if deployment.plan.get("execution_backend") == VLLM_RAY_PP_BACKEND:
+        required_option = "serve" if task_type == TaskType.APPLY_DEPLOYMENT else "api"
+        if normalized_options.get(required_option) is not True:
+            raise DeploymentRolloutError(
+                "strict Ray operations require live vLLM API verification",
+                code="DEPLOYMENT_STRICT_RUNTIME_ATTESTATION_REQUIRED",
+            )
     if any(node_id not in expected_nodes for node_id in node_ids):
         raise DeploymentRolloutError(
             "deployment operation contains an unassigned node",
@@ -1001,7 +1121,9 @@ def attach_deployment_bulk_operation(
     )
     session.add(operation)
     task_by_node = {task.node_id: task for task in tasks}
-    _, payload = _phase_payload(operation, phase, deployment, None)
+    _, payload = _phase_payload(
+        session, operation, phase, deployment, None
+    )
     for node_id in node_ids:
         record = DeploymentOperationNode(
             id=str(uuid.uuid4()),
@@ -1146,20 +1268,61 @@ def claim_operation_task(session: Session, task: Task, node_id: str) -> bool:
 def _valid_operation_success_result(
     task: Task, operation: DeploymentOperation, result: dict[str, Any] | None
 ) -> bool:
+    return valid_deployment_task_success_result(
+        task,
+        result,
+        operation_kind=operation.kind,
+        operation_phase=operation.phase,
+    )
+
+
+def valid_deployment_task_success_result(
+    task: Task,
+    result: dict[str, Any] | None,
+    *,
+    operation_kind: str | None = None,
+    operation_phase: str | None = None,
+) -> bool:
+    """Validate a deployment task result against its persisted plan.
+
+    Direct START/RESTART/STOP tasks and rollout-bound tasks use the same
+    strict backend schema. Legacy APPLY keeps its historical unstructured
+    result compatibility only outside the strict backend.
+    """
     if type(result) is not dict:
         return False
-    if operation.kind != "ROLLBACK" and task.type == TaskType.APPLY_DEPLOYMENT.value:
+    plan = task.payload.get("plan") if type(task.payload) is dict else None
+    strict_pipeline = (
+        type(plan) is dict
+        and plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+    )
+    if strict_pipeline and operation_kind is None:
+        if (
+            task.type
+            in {
+                TaskType.APPLY_DEPLOYMENT.value,
+                TaskType.START_DEPLOYMENT.value,
+                TaskType.RESTART_DEPLOYMENT.value,
+            }
+            and task.payload.get("serve") is not True
+        ) or (
+            task.type == TaskType.VERIFY.value
+            and task.payload.get("api") is not True
+        ):
+            return False
+    if operation_kind != "ROLLBACK" and task.type == TaskType.APPLY_DEPLOYMENT.value:
         # Preserve arbitrary legacy success dictionaries. New Agent results that
         # contain checks still receive the rollout-aware blocking validation.
         if "checks" not in result:
-            return True
+            return not strict_pipeline
     expected = {"checks", "ok"} if task.type == TaskType.VERIFY.value else {"checks"}
     if set(result) != expected or ("ok" in result and result["ok"] is not True):
         return False
     checks = result.get("checks")
-    if type(checks) is not list or not checks:
+    if type(checks) is not list or not checks or len(checks) > 16:
         return False
     check_names: set[str] = set()
+    checks_by_name: dict[str, dict[str, Any]] = {}
     for check in checks:
         if (
             type(check) is not dict
@@ -1168,22 +1331,31 @@ def _valid_operation_success_result(
             or type(check["ok"]) is not bool
             or type(check["detail"]) is not str
             or type(check["blocking"]) is not bool
+            or not 1 <= len(check["name"]) <= 128
+            or len(check["detail"]) > 8192
         ):
             return False
         if check["name"] in check_names:
             return False
         check_names.add(check["name"])
+        checks_by_name[check["name"]] = check
         if not check["ok"]:
+            if strict_pipeline:
+                return False
             allows_nonblocking_wait = (
                 task.type == TaskType.APPLY_DEPLOYMENT.value
                 or (
                     task.type == TaskType.START_DEPLOYMENT.value
-                    and operation.phase == "START_TARGET"
+                    and operation_phase == "START_TARGET"
                 )
             )
             if not allows_nonblocking_wait or check["blocking"]:
                 return False
-    required = {"host-gpu", "container-gpu", "ray-cluster"}
+    required = {
+        "host-gpu",
+        "container-gpu",
+        "pipeline-rank-contract" if strict_pipeline else "ray-cluster",
+    }
     if task.type == TaskType.STOP_DEPLOYMENT.value:
         required = {"deployment-stop"}
     elif task.type in {
@@ -1191,16 +1363,21 @@ def _valid_operation_success_result(
         TaskType.START_DEPLOYMENT.value,
         TaskType.RESTART_DEPLOYMENT.value,
     }:
+        model_check = (
+            "stage-cache"
+            if strict_pipeline
+            and plan.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+            else "model"
+        )
         required.update(
             {
                 "node-profile",
                 "deployment-plan",
-                "model",
+                model_check,
                 "container-image",
                 "ray-container",
             }
         )
-        plan = task.payload.get("plan") if type(task.payload) is dict else None
         is_head = (
             type(plan) is dict
             and plan.get("ray_head_node_id") == task.node_id
@@ -1208,7 +1385,6 @@ def _valid_operation_success_result(
         if task.payload.get("serve") is True and is_head:
             required.update({"vllm-api-start", "vllm-api"})
     elif task.type == TaskType.VERIFY.value:
-        plan = task.payload.get("plan") if type(task.payload) is dict else None
         is_head = (
             type(plan) is dict
             and plan.get("ray_head_node_id") == task.node_id
@@ -1217,7 +1393,51 @@ def _valid_operation_success_result(
             required.add("vllm-api")
     else:
         return False
-    return required.issubset(check_names)
+    if strict_pipeline:
+        if check_names != required:
+            return False
+    elif not required.issubset(check_names):
+        return False
+    if (
+        strict_pipeline
+        and task.type != TaskType.STOP_DEPLOYMENT.value
+    ):
+        contract = checks_by_name.get("pipeline-rank-contract")
+        if (
+            contract is None
+            or contract["ok"] is not True
+            or contract["blocking"] is not True
+            or not _valid_pipeline_rank_contract(task, plan, contract["detail"])
+        ):
+            return False
+    return True
+
+
+def _valid_pipeline_rank_contract(
+    task: Task,
+    plan: dict[str, Any],
+    raw_detail: str,
+) -> bool:
+    """Match the agent attestation to the exact persisted node contract.
+
+    The shared canonical encoder is intentionally used for both FULL and STAGE
+    plans.  A STAGE attestation therefore binds the selected variant, the
+    rank-local manifest/tensor set, and the derived cache identity in addition
+    to the existing topology fields; extra, missing, duplicate, or reordered
+    JSON fields cannot compare equal.
+    """
+    try:
+        typed_plan = DeploymentPlan.from_dict(plan)
+        assignment = typed_plan.assignment_for(task.node_id)
+        if assignment is None:
+            return False
+        expected = pipeline_contract_detail(
+            typed_plan,
+            assignment,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return type(raw_detail) is str and raw_detail == expected
 
 
 def _operation_full_node_set(

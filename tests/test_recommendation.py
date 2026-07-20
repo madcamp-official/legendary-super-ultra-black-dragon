@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -27,6 +27,7 @@ from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.models import (
     AuditEvent,
     BenchmarkEvidence,
+    BenchmarkRun,
     Deployment,
     ModelArtifact,
     ModelRelease,
@@ -40,6 +41,7 @@ from dure.control.models import (
 from dure.control.recommendation import recommend_deployment
 from dure.control.service import (
     add_placement_profile,
+    aware,
     create_model_artifact,
     create_model_release,
     create_runtime_release,
@@ -57,10 +59,23 @@ COUNTED_MODELS = (
     ModelRelease,
     PlacementProfileRecord,
     BenchmarkEvidence,
+    BenchmarkRun,
     Deployment,
     Task,
     AuditEvent,
 )
+
+PIPELINE_OVERRIDES = {
+    "profile_id": "pipeline-3x24g",
+    "topology": "pipeline",
+    "node_count": 3,
+    "pipeline_parallel_size": 3,
+    "requires_network_evidence": True,
+    "requires_nccl": True,
+    "min_bandwidth_mbps": 10000,
+    "max_rtt_ms": 5.0,
+    "max_packet_loss_pct": 0.1,
+}
 
 
 def _hex(seed: str, length: int) -> str:
@@ -90,8 +105,14 @@ def _add_node(
     session.add(node)
     session.flush()
     if stored_profile is not None:
+        address_seed = hashlib.sha256(name.encode("utf-8")).digest()
+        address = (
+            f"10.{address_seed[0]}.{address_seed[1]}."
+            f"{(address_seed[2] % 254) + 1}"
+        )
         value = profile(
             "agent-reported-id",
+            address=address,
             compute_capability=compute_capability,
         ).to_dict()
         if stored_profile != "valid":
@@ -117,6 +138,7 @@ def _add_release(
     gpu_architectures: list[str] | None = None,
     placement_overrides: dict | None = None,
     evidence_nodes: list[Node] | None = None,
+    evidence_created_at: datetime | None = None,
 ):
     artifact = create_model_artifact(
         session,
@@ -177,7 +199,7 @@ def _add_release(
         requires_network = (
             placement.requires_network_evidence or placement.node_count > 1
         )
-        register_benchmark_evidence(
+        evidence = register_benchmark_evidence(
             session,
             release_id=release.id,
             placement_id=placement.id,
@@ -210,6 +232,10 @@ def _add_release(
             packet_loss_pct=(0.0 if requires_network else None),
             nccl_all_reduce_ok=(True if placement.requires_nccl else None),
         )
+        evidence.created_at = evidence_created_at or max(
+            node.last_seen for node in evidence_nodes
+        )
+        session.commit()
         promoted, _, changed = promote_model_release(session, release.id)
         if not changed or promoted.status != "ACTIVE":
             raise AssertionError("fixture release was not promoted through benchmark evidence")
@@ -218,6 +244,106 @@ def _add_release(
     if status == "REVOKED":
         transition_model_release(session, release.id, "REVOKED")
     return release, placement
+
+
+def _register_network_evidence(
+    session,
+    *,
+    release: ModelRelease,
+    placement: PlacementProfileRecord,
+    nodes: list[Node],
+    created_at,
+    bandwidth_mbps: float = 20000.0,
+):
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    runtime = session.get(RuntimeRelease, release.runtime_id)
+    assert artifact is not None
+    assert runtime is not None
+    node_ids = [node.id for node in nodes]
+    evidence = register_benchmark_evidence(
+        session,
+        release_id=release.id,
+        placement_id=placement.id,
+        suite_id=BENCHMARK_SUITE_ID,
+        node_ids=node_ids,
+        inventory_fingerprint=benchmark_inventory_fingerprint(session, node_ids),
+        artifact_revision=artifact.revision,
+        artifact_manifest_digest=artifact.manifest_digest,
+        runtime_image=runtime.image,
+        dure_commit="e" * 40,
+        policy_version=BENCHMARK_POLICY_VERSION,
+        input_tokens=4096,
+        output_tokens=256,
+        concurrency=8,
+        warmup_requests=20,
+        request_count=200,
+        duration_seconds=900.0,
+        oom_count=0,
+        crash_count=0,
+        restart_count=0,
+        ttft_p95_ms=900.0,
+        tpot_p95_ms=90.0,
+        e2e_p95_ms=4500.0,
+        throughput_tps=12.0,
+        success_rate=1.0,
+        vram_headroom_pct=12.0,
+        quality_score=0.90,
+        network_bandwidth_mbps=bandwidth_mbps,
+        network_rtt_ms=1.0,
+        packet_loss_pct=0.0,
+        nccl_all_reduce_ok=True,
+    )
+    evidence.created_at = created_at
+    session.commit()
+    return evidence
+
+
+def _add_unresolved_benchmark_run(
+    session,
+    *,
+    release: ModelRelease,
+    placement: PlacementProfileRecord,
+    nodes: list[Node],
+    status: str,
+    updated_at,
+) -> BenchmarkRun:
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    runtime = session.get(RuntimeRelease, release.runtime_id)
+    assert artifact is not None
+    assert runtime is not None
+    node_ids = sorted(node.id for node in nodes)
+    run = BenchmarkRun(
+        request_id=str(uuid.uuid4()),
+        request_digest="sha256:" + _hex(str(uuid.uuid4()), 64),
+        release_id=release.id,
+        placement_id=placement.id,
+        coordinator_node_id=node_ids[0],
+        node_ids=node_ids,
+        inventory_fingerprint=benchmark_inventory_fingerprint(session, node_ids),
+        suite_id=BENCHMARK_SUITE_ID,
+        policy_version=BENCHMARK_POLICY_VERSION,
+        workload_id="long-chat-4k-256",
+        dure_commit="f" * 40,
+        model_id=artifact.model_id,
+        repository=artifact.repository,
+        artifact_revision=artifact.revision,
+        artifact_manifest_digest=artifact.manifest_digest,
+        quantization=artifact.quantization,
+        runtime_image=runtime.image,
+        input_tokens=4096,
+        output_tokens=256,
+        concurrency=4,
+        warmup_requests=20,
+        request_count=200,
+        duration_seconds=900.0,
+        status=status,
+        failure_code=("BENCHMARK_EXECUTION_FAILED" if status == "FAILED" else None),
+        created_at=updated_at,
+        updated_at=updated_at,
+    )
+    session.add(run)
+    session.commit()
+    return run
 
 
 def _row_counts(session) -> dict[str, int]:
@@ -325,25 +451,16 @@ class RecommendationServiceTests(unittest.TestCase):
                 <= codes
             )
 
-    def test_multinode_candidate_fails_closed_without_network_evidence(self):
+    def test_multinode_candidate_uses_only_the_evidenced_exact_node_set(self):
         with self.factory() as session:
             nodes = [_add_node(session, f"node-{index}", now=self.now) for index in range(3)]
+            outsider = _add_node(session, "outsider", now=self.now)
             release, _ = _add_release(
                 session,
                 "pipeline",
                 quality_rank=72,
                 evidence_nodes=nodes,
-                placement_overrides={
-                    "profile_id": "pipeline-3x24g",
-                    "topology": "pipeline",
-                    "node_count": 3,
-                    "pipeline_parallel_size": 3,
-                    "requires_network_evidence": True,
-                    "requires_nccl": True,
-                    "min_bandwidth_mbps": 10000,
-                    "max_rtt_ms": 5.0,
-                    "max_packet_loss_pct": 0.1,
-                },
+                placement_overrides=PIPELINE_OVERRIDES,
             )
 
             self.assertEqual(release.status, "ACTIVE")
@@ -359,7 +476,41 @@ class RecommendationServiceTests(unittest.TestCase):
 
             result = recommend_deployment(
                 session,
-                node_ids=[item.id for item in nodes],
+                node_ids=[outsider.id, *(item.id for item in reversed(nodes))],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+
+            selected = result["selected"]
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual(selected["model_release_id"], release.id)
+            self.assertEqual(selected["node_ids"], sorted(item.id for item in nodes))
+            self.assertNotIn(outsider.id, selected["node_ids"])
+            self.assertEqual(selected["network_evidence_id"], evidence.id)
+            self.assertEqual(
+                selected["network_evidence_digest"], evidence.evidence_digest
+            )
+            self.assertEqual(
+                selected["network_evidence_registered_at"],
+                aware(evidence.created_at).isoformat(),
+            )
+            self.assertEqual(result["policy_version"], "central-quality-within-slo-v3")
+
+    def test_multinode_evidence_for_a_different_node_set_is_rejected(self):
+        with self.factory() as session:
+            nodes = [_add_node(session, f"exact-{index}", now=self.now) for index in range(3)]
+            replacement = _add_node(session, "replacement", now=self.now)
+            _add_release(
+                session,
+                "different-set",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+
+            result = recommend_deployment(
+                session,
+                node_ids=[nodes[0].id, nodes[1].id, replacement.id],
                 all_online=False,
                 now=self.now,
             )["recommendation"]
@@ -367,6 +518,295 @@ class RecommendationServiceTests(unittest.TestCase):
             self.assertIsNone(result["selected"])
             codes = {item["code"] for item in result["candidates"][0]["rejections"]}
             self.assertIn("NETWORK_EVIDENCE", codes)
+
+    def test_stale_and_future_multinode_evidence_fail_closed(self):
+        with self.factory() as session:
+            nodes = [_add_node(session, f"age-{index}", now=self.now) for index in range(3)]
+            release, _ = _add_release(
+                session,
+                "evidence-age",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+            evidence = session.get(BenchmarkEvidence, release.promotion_evidence_ids[0])
+            assert evidence is not None
+            evidence.created_at = self.now - timedelta(hours=24)
+            session.commit()
+            boundary = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+            self.assertIsNotNone(boundary["selected"])
+
+            evidence.created_at = self.now - timedelta(hours=24, microseconds=1)
+            session.commit()
+
+            stale = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+            self.assertIsNone(stale["selected"])
+            self.assertIn(
+                "NETWORK_EVIDENCE",
+                {item["code"] for item in stale["candidates"][0]["rejections"]},
+            )
+
+            evidence.created_at = self.now + timedelta(microseconds=1)
+            session.commit()
+            future = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+            self.assertIsNone(future["selected"])
+            self.assertIn(
+                "NETWORK_EVIDENCE",
+                {item["code"] for item in future["candidates"][0]["rejections"]},
+            )
+
+    def test_changed_profile_invalidates_exact_multinode_evidence(self):
+        with self.factory() as session:
+            nodes = [_add_node(session, f"changed-{index}", now=self.now) for index in range(3)]
+            _add_release(
+                session,
+                "changed-profile",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+            record = session.get(NodeProfileRecord, nodes[0].id)
+            assert record is not None
+            changed = dict(record.profile)
+            changed["cpu_count"] += 1
+            record.profile = changed
+            record.updated_at = self.now
+            session.commit()
+
+            result = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+
+            self.assertIsNone(result["selected"])
+            self.assertIn(
+                "NETWORK_EVIDENCE",
+                {item["code"] for item in result["candidates"][0]["rejections"]},
+            )
+
+    def test_latest_failed_evidence_blocks_an_older_pass_for_the_same_nodes(self):
+        with self.factory() as session:
+            nodes = [_add_node(session, f"failed-{index}", now=self.now) for index in range(3)]
+            release, placement = _add_release(
+                session,
+                "failed-latest",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+            failed = _register_network_evidence(
+                session,
+                release=release,
+                placement=placement,
+                nodes=nodes,
+                bandwidth_mbps=9999.0,
+                created_at=self.now + timedelta(seconds=10),
+            )
+            self.assertEqual(failed.status, "FAILED")
+
+            result = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now + timedelta(seconds=20),
+            )["recommendation"]
+
+            self.assertIsNone(result["selected"])
+            self.assertIn(
+                "NETWORK_EVIDENCE",
+                {item["code"] for item in result["candidates"][0]["rejections"]},
+            )
+
+    def test_newer_failed_and_queued_runs_block_without_task_mutation(self):
+        with self.factory() as session:
+            nodes = [_add_node(session, f"queued-{index}", now=self.now) for index in range(3)]
+            release, placement = _add_release(
+                session,
+                "queued-latest",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+            failed_run = _add_unresolved_benchmark_run(
+                session,
+                release=release,
+                placement=placement,
+                nodes=nodes,
+                status="FAILED",
+                updated_at=self.now + timedelta(seconds=5),
+            )
+            before = _row_counts(session)
+
+            failed_result = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now + timedelta(seconds=10),
+            )["recommendation"]
+
+            self.assertIsNone(failed_result["selected"])
+            self.assertIn(
+                "NETWORK_EVIDENCE",
+                {
+                    item["code"]
+                    for item in failed_result["candidates"][0]["rejections"]
+                },
+            )
+            self.assertEqual(_row_counts(session), before)
+            self.assertEqual(session.get(BenchmarkRun, failed_run.id).status, "FAILED")
+
+            failed_run.status = "SUCCEEDED"
+            failed_run.failure_code = None
+            failed_run.updated_at = self.now + timedelta(seconds=11)
+            session.commit()
+            queued_run = _add_unresolved_benchmark_run(
+                session,
+                release=release,
+                placement=placement,
+                nodes=nodes,
+                status="QUEUED",
+                updated_at=self.now + timedelta(seconds=15),
+            )
+            before = _row_counts(session)
+            queued_result = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now + timedelta(seconds=20),
+            )["recommendation"]
+            self.assertIsNone(queued_result["selected"])
+            self.assertIn(
+                "NETWORK_EVIDENCE",
+                {
+                    item["code"]
+                    for item in queued_result["candidates"][0]["rejections"]
+                },
+            )
+            self.assertEqual(_row_counts(session), before)
+            self.assertEqual(session.get(BenchmarkRun, queued_run.id).status, "QUEUED")
+            self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
+            self.assertEqual(session.scalar(select(func.count()).select_from(Deployment)), 0)
+
+    def test_newer_prepared_run_blocks_an_older_pass(self):
+        with self.factory() as session:
+            nodes = [
+                _add_node(session, f"prepared-{index}", now=self.now)
+                for index in range(3)
+            ]
+            release, placement = _add_release(
+                session,
+                "prepared-latest",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+            prepared = _add_unresolved_benchmark_run(
+                session,
+                release=release,
+                placement=placement,
+                nodes=nodes,
+                status="PREPARED",
+                updated_at=self.now + timedelta(seconds=5),
+            )
+            before = _row_counts(session)
+
+            result = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now + timedelta(seconds=10),
+            )["recommendation"]
+
+            self.assertIsNone(result["selected"])
+            self.assertIn(
+                "NETWORK_EVIDENCE",
+                {item["code"] for item in result["candidates"][0]["rejections"]},
+            )
+            self.assertEqual(_row_counts(session), before)
+            self.assertEqual(session.get(BenchmarkRun, prepared.id).status, "PREPARED")
+
+    def test_network_nccl_and_runtime_identity_are_rechecked(self):
+        with self.factory() as session:
+            nodes = [
+                _add_node(session, f"recheck-{index}", now=self.now)
+                for index in range(3)
+            ]
+            release, placement = _add_release(
+                session,
+                "recheck-gates",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+            evidence = session.get(
+                BenchmarkEvidence,
+                release.promotion_evidence_ids[0],
+            )
+            assert evidence is not None
+
+            for label, mutate, restore in (
+                (
+                    "bandwidth",
+                    lambda: setattr(placement, "min_bandwidth_mbps", 30000),
+                    lambda: setattr(placement, "min_bandwidth_mbps", 10000),
+                ),
+                (
+                    "nccl",
+                    lambda: setattr(evidence, "nccl_all_reduce_ok", False),
+                    lambda: setattr(evidence, "nccl_all_reduce_ok", True),
+                ),
+                (
+                    "runtime",
+                    lambda: setattr(
+                        evidence,
+                        "runtime_image",
+                        f"registry.example/mismatch@sha256:{'0' * 64}",
+                    ),
+                    lambda: setattr(
+                        evidence,
+                        "runtime_image",
+                        session.get(RuntimeRelease, release.runtime_id).image,
+                    ),
+                ),
+            ):
+                with self.subTest(label=label):
+                    mutate()
+                    session.commit()
+                    result = recommend_deployment(
+                        session,
+                        node_ids=[item.id for item in nodes],
+                        all_online=False,
+                        now=self.now,
+                    )["recommendation"]
+                    self.assertIsNone(result["selected"])
+                    self.assertIn(
+                        "NETWORK_EVIDENCE",
+                        {
+                            item["code"]
+                            for item in result["candidates"][0]["rejections"]
+                        },
+                    )
+                    restore()
+                    session.commit()
+
+            restored = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+            self.assertIsNotNone(restored["selected"])
 
     def test_missing_invalid_profiles_and_runtime_architecture_fail_closed(self):
         with self.factory() as session:
@@ -512,6 +952,47 @@ class RecommendationAPITests(unittest.TestCase):
         self.assertIn("policy_version", recommendation)
         self.assertIn("catalog_version", recommendation)
         self.assertIn("inventory_fingerprint", recommendation)
+        with self.client.app.state.session_factory() as session:
+            self.assertEqual(_row_counts(session), before)
+            self.assertEqual(session.scalar(select(func.count()).select_from(Deployment)), 0)
+            self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
+
+    def test_api_binds_exact_multinode_evidence_without_hybrid_assignment(self):
+        with self.client.app.state.session_factory() as session:
+            nodes = [
+                _add_node(session, f"api-exact-{index}", now=self.now)
+                for index in range(3)
+            ]
+            outsider = _add_node(session, "api-outsider", now=self.now)
+            release, _ = _add_release(
+                session,
+                "api-pipeline",
+                evidence_nodes=nodes,
+                placement_overrides=PIPELINE_OVERRIDES,
+            )
+            evidence = session.get(
+                BenchmarkEvidence,
+                release.promotion_evidence_ids[0],
+            )
+            assert evidence is not None
+            expected_nodes = sorted(node.id for node in nodes)
+            requested_nodes = [outsider.id, *reversed(expected_nodes)]
+            evidence_id = evidence.id
+            evidence_digest = evidence.evidence_digest
+            before = _row_counts(session)
+
+        response = self.client.post(
+            "/v1/admin/deployment-recommendations",
+            headers=self.admin,
+            json={"node_ids": requested_nodes, "objective": "quality-first"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        selected = response.json()["recommendation"]["selected"]
+        self.assertEqual(selected["node_ids"], expected_nodes)
+        self.assertNotIn(outsider.id, selected["node_ids"])
+        self.assertEqual(selected["network_evidence_id"], evidence_id)
+        self.assertEqual(selected["network_evidence_digest"], evidence_digest)
         with self.client.app.state.session_factory() as session:
             self.assertEqual(_row_counts(session), before)
             self.assertEqual(session.scalar(select(func.count()).select_from(Deployment)), 0)

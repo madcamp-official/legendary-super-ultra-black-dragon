@@ -64,12 +64,13 @@ python3 -m pip wheel . --no-deps --no-build-isolation -w /tmp/dure-wheel-check
 - 추천 수락 테스트는 실제 `PASSED` 증적과 승격 게이트를 거친 `ACTIVE` 릴리스를 사용하고, 상태 직접 변경으로 게이트를 우회하지 않습니다.
 - 추천 수락으로 만든 세대는 다운로드·pull 플래그가 항상 거짓이어야 하며, 명시적 apply 전에는 task나 호스트 변경이 없어야 합니다.
 - `APPLY`·`VERIFY` operation은 전체 상태, 노드별 상태와 task 시도 번호를 함께 검증합니다. 성공 경로뿐 아니라 부분 실패, 취소, 실패 노드 재시도와 이전 시도의 늦은 claim·완료 거부를 테스트합니다.
-- `verified_at`은 계획의 정확한 전체 노드가 모두 성공하고 모든 노드 Agent가 0.3.12 이상일 때만 기록되는지 검증합니다. 부분 노드와 다중 노드 배포에서 전체 배정 집합을 충족하지 않는 Ray head 전용 API 검증은 증거를 만들면 안 됩니다.
+- `verified_at`은 계획의 정확한 전체 노드가 모두 성공하고 legacy Agent는 0.3.12 이상, `VLLM_RAY_PP_V1` Agent는 0.3.18 이상, `STAGE` Agent는 0.3.19 이상이며 엄격한 rank·API 검증까지 통과할 때만 기록되는지 검증합니다. 부분 노드와 전체 배정 집합을 충족하지 않는 Ray head 전용 API 검증은 증거를 만들면 안 됩니다.
+- `STAGE` 테스트는 exact `VALIDATED` digest만 선택하는지, node UUID↔PP rank 매니페스트가 교환되면 거부하는지, 복합 cache identity·marker·정규 sidecar·전체 tree가 바뀌면 Docker 호출 전에 실패하는지, `FULL_SNAPSHOT`으로 자동 fallback하지 않는지를 확인합니다. 일반 probe는 대용량 stage를 매 heartbeat마다 재해시하지 않으므로 관측 identity를 권위 있는 `READY` 증거로 사용하면 안 됩니다.
 - 롤백 테스트는 기본 준비에서 task가 0개인지, `apply=true`에서만 시작하는지, 직접 직전 검증 세대·동일 전체 노드·동일 토폴로지·승인·온라인·다이제스트 이미지 조건을 모두 확인합니다.
 - 롤백 단계는 `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET`과 선택적 `START_API → VERIFY_API`를 순서대로 검증하고, 각 단계의 모든 노드가 성공하기 전에 다음 task를 만들면 안 됩니다.
 - 호스트 명령 테스트는 `dure.deployment`, `dure.generation`, `dure.node`가 모두 정확히 일치하는 컨테이너만 조작하는지 확인합니다. `dure.node`가 없는 레거시 호환은 배포와 세대가 모두 일치할 때만 허용하고 다른 레이블 불일치는 항상 거부합니다.
 - 롤백 task는 모델 다운로드와 이미지 pull을 허용하지 않으며 실제 GPU, Docker 데몬, PostgreSQL이나 인터넷 없이 단위 테스트할 수 있어야 합니다.
 
-GPU 수용 검사는 보호된 환경에서만 실행하며 공개 CI나 신뢰할 수 없는 PR에 GPU 실행기·모델 자격 증명·서명 비밀값을 노출하지 않습니다. 자세한 기준은 [benchmarking.md](benchmarking.md)를 참고합니다.
+GPU 수용 검사는 보호된 환경에서만 실행하며 공개 CI나 신뢰할 수 없는 PR에 GPU 실행기·모델 자격 증명·서명 비밀값을 노출하지 않습니다. `acceptance-vllm-stage-ray-pp.py`를 포함한 opt-in harness의 기본 `NOT_RUN(77)`은 성공으로 바꾸지 않습니다. 자세한 기준은 [benchmarking.md](benchmarking.md)를 참고합니다.
 
 소스 checkout이나 editable 설치에서 폐쇄형 `BENCHMARK` 작업을 직접 시험할 때는 실행 중인 코드의 40~64자리 커밋 해시를 `DURE_BUILD_COMMIT`으로 명시합니다. 공식 Debian 빌드는 이 값을 `/usr/share/dure/build-commit`에 설치합니다. 값이 없거나 작업의 `dure_commit`과 다르면 Agent는 GPU 조사나 컨테이너 실행 전에 작업을 거부합니다.
