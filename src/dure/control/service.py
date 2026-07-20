@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,14 +15,30 @@ from .models import (
     AuditEvent,
     Deployment,
     EnrollmentToken,
+    ModelArtifact,
+    ModelRelease,
     Node,
     NodeCredential,
     NodeProfileRecord,
+    PlacementProfileRecord,
+    RuntimeRelease,
     Task,
     TaskStatus,
     TaskType,
     utcnow,
 )
+
+
+MODEL_RELEASE_TRANSITIONS = {
+    "DRAFT": {"VALIDATED", "REVOKED"},
+    "VALIDATED": {"ACTIVE", "REVOKED"},
+    "ACTIVE": {"DEPRECATED", "REVOKED"},
+    "DEPRECATED": {"REVOKED"},
+    "REVOKED": set(),
+}
+QUANTIZATIONS = {"awq", "gptq", "fp8", "fp16", "bf16", "int8"}
+GPU_ARCHITECTURES = {"ampere", "ada", "hopper", "blackwell"}
+TOPOLOGIES = {"single-gpu", "pipeline"}
 
 
 def secret_hash(value: str) -> str:
@@ -36,6 +53,235 @@ def aware(value: datetime | None) -> datetime | None:
 
 def audit(session: Session, actor: str, action: str, target: str | None, outcome: str, **detail) -> None:
     session.add(AuditEvent(actor=actor, action=action, target=target, outcome=outcome, detail=detail))
+
+
+def _require_digest(value: str, *, field: str) -> None:
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{field} must be an immutable sha256 digest")
+
+
+def create_model_artifact(
+    session: Session,
+    *,
+    model_id: str,
+    repository: str,
+    revision: str,
+    manifest_digest: str,
+    quantization: str,
+    size_mib: int,
+    default_max_model_len: int,
+    layer_count: int,
+    license_id: str,
+) -> ModelArtifact:
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,99}", model_id) is None:
+        raise ValueError("invalid model_id")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
+        raise ValueError("invalid model repository")
+    if re.fullmatch(r"[0-9a-f]{40,64}", revision) is None:
+        raise ValueError("model revision must be an immutable commit hash")
+    _require_digest(manifest_digest, field="manifest_digest")
+    if quantization not in QUANTIZATIONS:
+        raise ValueError("unsupported quantization")
+    if min(size_mib, default_max_model_len, layer_count) <= 0:
+        raise ValueError("model sizes and layer count must be positive")
+    if not license_id.strip() or len(license_id) > 100:
+        raise ValueError("license_id is required")
+    record = ModelArtifact(
+        model_id=model_id,
+        repository=repository,
+        revision=revision,
+        manifest_digest=manifest_digest,
+        quantization=quantization,
+        size_mib=size_mib,
+        default_max_model_len=default_max_model_len,
+        layer_count=layer_count,
+        license_id=license_id,
+    )
+    session.add(record)
+    session.flush()
+    audit(session, "admin", "model_artifact.create", record.id, "success")
+    session.commit()
+    return record
+
+
+def create_runtime_release(
+    session: Session,
+    *,
+    version: str,
+    image: str,
+    vllm_version: str,
+    cuda_version: str,
+    gpu_architectures: list[str],
+) -> RuntimeRelease:
+    if re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image) is None:
+        raise ValueError("runtime image must be OCI digest-pinned")
+    if not all(isinstance(item, str) for item in gpu_architectures):
+        raise ValueError("unsupported GPU architecture")
+    normalized_architectures = sorted(set(gpu_architectures))
+    if not normalized_architectures or not set(normalized_architectures) <= GPU_ARCHITECTURES:
+        raise ValueError("unsupported GPU architecture")
+    if not version.strip() or not vllm_version.strip() or not cuda_version.strip():
+        raise ValueError("runtime version fields are required")
+    record = RuntimeRelease(
+        version=version,
+        image=image,
+        vllm_version=vllm_version,
+        cuda_version=cuda_version,
+        gpu_architectures=normalized_architectures,
+    )
+    session.add(record)
+    session.flush()
+    audit(session, "admin", "runtime_release.create", record.id, "success")
+    session.commit()
+    return record
+
+
+def create_model_release(
+    session: Session, *, artifact_id: str, runtime_id: str, quality_rank: int
+) -> ModelRelease:
+    if session.get(ModelArtifact, artifact_id) is None:
+        raise ValueError("unknown model artifact")
+    if session.get(RuntimeRelease, runtime_id) is None:
+        raise ValueError("unknown runtime release")
+    if quality_rank <= 0:
+        raise ValueError("quality_rank must be positive")
+    record = ModelRelease(
+        artifact_id=artifact_id,
+        runtime_id=runtime_id,
+        quality_rank=quality_rank,
+        status="DRAFT",
+    )
+    session.add(record)
+    session.flush()
+    audit(session, "admin", "model_release.create", record.id, "success")
+    session.commit()
+    return record
+
+
+def add_placement_profile(
+    session: Session,
+    *,
+    release_id: str,
+    profile_id: str,
+    topology: str,
+    node_count: int,
+    min_gpu_memory_mib: int,
+    min_disk_free_mib: int,
+    pipeline_parallel_size: int,
+    tensor_parallel_size: int,
+    requires_network_evidence: bool,
+    requires_nccl: bool,
+    min_bandwidth_mbps: int | None,
+    max_rtt_ms: float | None,
+    max_packet_loss_pct: float | None,
+    max_ttft_p95_ms: float,
+    max_tpot_p95_ms: float,
+    max_e2e_p95_ms: float,
+    min_success_rate: float,
+    min_vram_headroom_pct: float,
+    min_throughput_tps: float,
+) -> PlacementProfileRecord:
+    release = session.get(ModelRelease, release_id)
+    if release is None:
+        raise ValueError("unknown model release")
+    if release.status != "DRAFT":
+        raise ValueError("placement profiles can only be added to DRAFT releases")
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,99}", profile_id) is None:
+        raise ValueError("invalid placement profile_id")
+    if topology not in TOPOLOGIES:
+        raise ValueError("unsupported topology")
+    if min(node_count, min_gpu_memory_mib, min_disk_free_mib) <= 0:
+        raise ValueError("placement resource requirements must be positive")
+    if pipeline_parallel_size <= 0 or tensor_parallel_size <= 0:
+        raise ValueError("parallel sizes must be positive")
+    if pipeline_parallel_size * tensor_parallel_size != node_count:
+        raise ValueError("parallel sizes must match node_count")
+    if topology == "single-gpu" and node_count != 1:
+        raise ValueError("single-gpu topology requires one node")
+    network_values = (min_bandwidth_mbps, max_rtt_ms, max_packet_loss_pct)
+    if node_count > 1 and (
+        not requires_network_evidence
+        or not requires_nccl
+        or any(value is None for value in network_values)
+    ):
+        raise ValueError("multi-node placement requires network and NCCL thresholds")
+    if requires_network_evidence and (
+        min_bandwidth_mbps is None
+        or min_bandwidth_mbps <= 0
+        or max_rtt_ms is None
+        or max_rtt_ms < 0
+        or max_packet_loss_pct is None
+        or not 0 <= max_packet_loss_pct <= 100
+    ):
+        raise ValueError("network thresholds are out of range")
+    if any(value <= 0 for value in (max_ttft_p95_ms, max_tpot_p95_ms, max_e2e_p95_ms)):
+        raise ValueError("latency SLO values must be positive")
+    if not 0 <= min_success_rate <= 1 or not 0 <= min_vram_headroom_pct <= 100:
+        raise ValueError("success and VRAM thresholds are out of range")
+    if min_throughput_tps <= 0:
+        raise ValueError("throughput SLO must be positive")
+    record = PlacementProfileRecord(
+        release_id=release_id,
+        profile_id=profile_id,
+        topology=topology,
+        node_count=node_count,
+        min_gpu_memory_mib=min_gpu_memory_mib,
+        min_disk_free_mib=min_disk_free_mib,
+        pipeline_parallel_size=pipeline_parallel_size,
+        tensor_parallel_size=tensor_parallel_size,
+        requires_network_evidence=requires_network_evidence,
+        requires_nccl=requires_nccl,
+        min_bandwidth_mbps=min_bandwidth_mbps,
+        max_rtt_ms=max_rtt_ms,
+        max_packet_loss_pct=max_packet_loss_pct,
+        max_ttft_p95_ms=max_ttft_p95_ms,
+        max_tpot_p95_ms=max_tpot_p95_ms,
+        max_e2e_p95_ms=max_e2e_p95_ms,
+        min_success_rate=min_success_rate,
+        min_vram_headroom_pct=min_vram_headroom_pct,
+        min_throughput_tps=min_throughput_tps,
+    )
+    session.add(record)
+    session.flush()
+    audit(session, "admin", "placement_profile.create", record.id, "success")
+    session.commit()
+    return record
+
+
+def transition_model_release(
+    session: Session, release_id: str, target_status: str
+) -> ModelRelease:
+    release = session.scalar(
+        select(ModelRelease).where(ModelRelease.id == release_id).with_for_update()
+    )
+    if release is None:
+        raise ValueError("unknown model release")
+    if target_status not in MODEL_RELEASE_TRANSITIONS:
+        raise ValueError("unknown model release status")
+    if target_status not in MODEL_RELEASE_TRANSITIONS[release.status]:
+        raise ValueError(f"invalid model release transition: {release.status} -> {target_status}")
+    if target_status in {"VALIDATED", "ACTIVE"}:
+        placement = session.scalar(
+            select(PlacementProfileRecord.id).where(
+                PlacementProfileRecord.release_id == release.id
+            )
+        )
+        if placement is None:
+            raise ValueError("model release requires a placement profile")
+    previous = release.status
+    release.status = target_status
+    release.updated_at = utcnow()
+    audit(
+        session,
+        "admin",
+        "model_release.transition",
+        release.id,
+        "success",
+        previous=previous,
+        current=target_status,
+    )
+    session.commit()
+    return release
 
 
 def create_enrollment(session: Session, expires_in: timedelta) -> tuple[EnrollmentToken, str]:

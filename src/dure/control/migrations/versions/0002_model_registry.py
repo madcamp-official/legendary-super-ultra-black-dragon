@@ -66,6 +66,10 @@ def upgrade() -> None:
             sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
             sa.CheckConstraint("quality_rank > 0", name="ck_model_release_quality_positive"),
+            sa.CheckConstraint(
+                "status IN ('DRAFT', 'VALIDATED', 'ACTIVE', 'DEPRECATED', 'REVOKED')",
+                name="ck_model_release_status",
+            ),
             sa.ForeignKeyConstraint(["artifact_id"], ["model_artifacts.id"]),
             sa.ForeignKeyConstraint(["runtime_id"], ["runtime_releases.id"]),
             sa.UniqueConstraint("artifact_id", "runtime_id"),
@@ -119,6 +123,20 @@ def upgrade() -> None:
             sa.CheckConstraint(
                 "min_vram_headroom_pct >= 0 AND min_vram_headroom_pct <= 100",
                 name="ck_placement_vram_headroom_range",
+            ),
+            sa.CheckConstraint("max_ttft_p95_ms > 0", name="ck_placement_ttft_positive"),
+            sa.CheckConstraint("max_tpot_p95_ms > 0", name="ck_placement_tpot_positive"),
+            sa.CheckConstraint("max_e2e_p95_ms > 0", name="ck_placement_e2e_positive"),
+            sa.CheckConstraint(
+                "min_throughput_tps > 0", name="ck_placement_throughput_positive"
+            ),
+            sa.CheckConstraint(
+                "min_bandwidth_mbps IS NULL OR min_bandwidth_mbps > 0",
+                name="ck_placement_bandwidth_positive",
+            ),
+            sa.CheckConstraint(
+                "max_rtt_ms IS NULL OR max_rtt_ms >= 0",
+                name="ck_placement_rtt_nonnegative",
             ),
             sa.ForeignKeyConstraint(
                 ["release_id"], ["model_releases.id"], ondelete="CASCADE"
