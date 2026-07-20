@@ -49,6 +49,8 @@ jobs:
 
       - name: Build and test Debian package
         id: package
+        env:
+          DURE_BUILD_COMMIT: ${{ github.sha }}
         run: |
           package_path=$(scripts/build-deb.sh)
           echo "path=$package_path" >> "$GITHUB_OUTPUT"
@@ -56,6 +58,7 @@ jobs:
       - name: Install Debian node package
         run: |
           sudo apt-get install -y "${{ steps.package.outputs.path }}"
+          test "$(cat /usr/share/dure/build-commit)" = "$GITHUB_SHA"
           /usr/bin/dure --version
           /usr/bin/dure doctor --json >/dev/null
 
