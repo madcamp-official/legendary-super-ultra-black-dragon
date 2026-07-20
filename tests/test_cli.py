@@ -472,6 +472,88 @@ class DeploymentGenerationCLITests(unittest.TestCase):
         )
         self.assertEqual(json.loads(output), FakeJSONClient.response)
 
+    def test_prepare_previews_by_default_and_applies_only_when_explicit(self):
+        request_id = "79848aaa-c0cc-42cb-8944-c93e9466f8ef"
+        FakeJSONClient.response = {
+            "preparation": {"id": "preparation-1", "status": "PREPARED"},
+            "tasks": [],
+            "changed": True,
+        }
+        common = self.command(
+            "prepare",
+            "generation-2",
+            "--request-id",
+            request_id,
+        )
+
+        result, output = self.run_cli(common)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output), FakeJSONClient.response)
+        self.assertEqual(
+            FakeJSONClient.calls[-1][2:],
+            (
+                "POST",
+                "/v1/admin/deployments/generation-2/prepare",
+                {"request_id": request_id, "apply": False},
+            ),
+        )
+
+        FakeJSONClient.calls = []
+        result, output = self.run_cli([*common, "--apply"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output), FakeJSONClient.response)
+        self.assertEqual(
+            FakeJSONClient.calls[-1][4],
+            {"request_id": request_id, "apply": True},
+        )
+
+    def test_preparation_reads_the_operation_detail_endpoint(self):
+        FakeJSONClient.response = {
+            "preparation": {"id": "preparation-1", "status": "RUNNING"}
+        }
+
+        result, output = self.run_cli(
+            self.command("preparation", "preparation-1")
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output), FakeJSONClient.response)
+        self.assertEqual(
+            FakeJSONClient.calls[-1][2:],
+            (
+                "GET",
+                "/v1/admin/deployment-preparations/preparation-1",
+                None,
+            ),
+        )
+
+    def test_prepare_rejects_a_missing_or_noncanonical_request_id(self):
+        invalid_commands = (
+            self.command("prepare", "generation-2"),
+            self.command(
+                "prepare",
+                "generation-2",
+                "--request-id",
+                "not-a-uuid",
+            ),
+            self.command(
+                "prepare",
+                "generation-2",
+                "--request-id",
+                "79848AAA-C0CC-42CB-8944-C93E9466F8EF",
+            ),
+        )
+
+        for arguments in invalid_commands:
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    main(arguments)
+                self.assertEqual(raised.exception.code, 2)
+
+        self.assertEqual(FakeJSONClient.calls, [])
+
     def test_rollback_prepares_by_default_and_applies_only_when_explicit(self):
         FakeJSONClient.response = {
             "operation": {"id": "operation-1", "status": "PREPARED"},

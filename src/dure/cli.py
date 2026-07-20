@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from . import __version__
@@ -19,6 +20,15 @@ from .state import StateStore
 def _add_admin_connection(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--server", default=None, help="Control plane URL (or DURE_SERVER)")
     parser.add_argument("--token", default=None, help="Admin token (or DURE_ADMIN_TOKEN)")
+
+
+def _canonical_uuid_argument(value: str) -> str:
+    try:
+        if str(uuid.UUID(value)) != value:
+            raise ValueError
+    except (AttributeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a canonical UUID") from exc
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -133,6 +143,25 @@ def _parser() -> argparse.ArgumentParser:
         "generations", help="List every generation in a deployment lineage"
     )
     deployment_generations.add_argument("deployment_id")
+    deployment_prepare = deployment_sub.add_parser(
+        "prepare", help="Preview or explicitly start model and image preparation"
+    )
+    deployment_prepare.add_argument("deployment_id")
+    deployment_prepare.add_argument(
+        "--request-id",
+        required=True,
+        type=_canonical_uuid_argument,
+        help="Canonical UUID used to retry the same immutable preparation request",
+    )
+    deployment_prepare.add_argument(
+        "--apply",
+        action="store_true",
+        help="Queue preparation tasks after all server-side safety checks pass",
+    )
+    deployment_preparation = deployment_sub.add_parser(
+        "preparation", help="Show one model and image preparation operation"
+    )
+    deployment_preparation.add_argument("preparation_id")
     deployment_rollback = deployment_sub.add_parser(
         "rollback", help="Prepare or explicitly apply a rollback to the previous generation"
     )
@@ -453,6 +482,24 @@ def _admin(args: argparse.Namespace) -> int:
             value = client.request(
                 "GET",
                 f"/v1/admin/deployments/{args.deployment_id}/generations",
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.deployment_command == "prepare":
+            value = client.request(
+                "POST",
+                f"/v1/admin/deployments/{args.deployment_id}/prepare",
+                {
+                    "request_id": args.request_id,
+                    "apply": args.apply,
+                },
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.deployment_command == "preparation":
+            value = client.request(
+                "GET",
+                f"/v1/admin/deployment-preparations/{args.preparation_id}",
             )
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0
