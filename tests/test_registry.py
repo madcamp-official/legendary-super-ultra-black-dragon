@@ -83,7 +83,7 @@ class RegistryTests(unittest.TestCase):
         values.update(overrides)
         return add_placement_profile(session, **values)
 
-    def test_release_lifecycle_and_draft_only_placement(self):
+    def test_release_lifecycle_requires_evidence_for_active(self):
         with self.factory() as session:
             release = self.release(session)
             placement = self.placement(session, release.id)
@@ -92,10 +92,11 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(transition_model_release(session, release.id, "VALIDATED").status, "VALIDATED")
             with self.assertRaisesRegex(ValueError, "DRAFT"):
                 self.placement(session, release.id, profile_id="late-profile")
-            self.assertEqual(transition_model_release(session, release.id, "ACTIVE").status, "ACTIVE")
-            self.assertEqual(transition_model_release(session, release.id, "DEPRECATED").status, "DEPRECATED")
+            with self.assertRaisesRegex(ValueError, "benchmark promotion gate"):
+                transition_model_release(session, release.id, "ACTIVE")
+            self.assertEqual(release.status, "VALIDATED")
             self.assertEqual(transition_model_release(session, release.id, "REVOKED").status, "REVOKED")
-            with self.assertRaisesRegex(ValueError, "invalid model release transition"):
+            with self.assertRaisesRegex(ValueError, "only VALIDATED releases"):
                 transition_model_release(session, release.id, "ACTIVE")
 
     def test_validation_requires_placement(self):

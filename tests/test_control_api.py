@@ -171,7 +171,7 @@ class ControlAPITests(unittest.TestCase):
         )
         self.assertEqual(unsafe_runtime.status_code, 400)
 
-    def test_model_registry_api_creates_and_transitions_release(self):
+    def test_model_registry_api_requires_evidence_for_active_transition(self):
         artifact = self.client.post(
             "/v1/admin/model-artifacts",
             headers=self.admin,
@@ -248,7 +248,12 @@ class ControlAPITests(unittest.TestCase):
             headers=self.admin,
             json={"status": "ACTIVE"},
         )
-        self.assertEqual(active.status_code, 200)
-        self.assertEqual(active.json()["release"]["status"], "ACTIVE")
+        self.assertEqual(active.status_code, 409)
+        self.assertEqual(active.json()["detail"]["code"], "BENCHMARK_GATE_FAILED")
+        self.assertEqual(
+            active.json()["detail"]["details"]["placements"][0]["code"],
+            "EVIDENCE_MISSING",
+        )
         listed = self.client.get("/v1/admin/model-releases", headers=self.admin)
+        self.assertEqual(listed.json()["releases"][0]["status"], "VALIDATED")
         self.assertEqual(listed.json()["releases"][0]["placements"][0]["profile_id"], "single-24g")
