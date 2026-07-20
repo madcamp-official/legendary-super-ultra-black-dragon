@@ -12,6 +12,20 @@ dure (0.3.10) UNRELEASED; urgency=medium
 
  -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 18:11:43 +0900
 
+dure (0.3.9) UNRELEASED; urgency=medium
+
+  * 모델 릴리스의 성능·안정성 벤치마크 증적과 영속 모델을 추가합니다.
+  * SLO, OCI 다이제스트 및 증적 조건을 모두 통과해야 ACTIVE로 승격하도록 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:30:00 +0900
+
+dure (0.3.8) UNRELEASED; urgency=medium
+
+  * 승인된 노드 인벤토리와 ACTIVE 모델 릴리스를 이용한 읽기 전용 배포 추천을 추가합니다.
+  * 추천 결과의 결정론성, 중앙 UUID, 고정 리비전과 다이제스트를 안전하게 검증합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:20:00 +0900
+
 dure (0.3.7) UNRELEASED; urgency=medium
 
   * 모델, 고정 리비전, OCI 다이제스트와 배치 프로필을 중앙 레지스트리에 영속화합니다.

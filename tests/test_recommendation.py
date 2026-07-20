@@ -26,6 +26,7 @@ from dure.control.benchmark import (
 from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.models import (
     AuditEvent,
+    BenchmarkEvidence,
     Deployment,
     ModelArtifact,
     ModelRelease,
@@ -55,6 +56,7 @@ COUNTED_MODELS = (
     RuntimeRelease,
     ModelRelease,
     PlacementProfileRecord,
+    BenchmarkEvidence,
     Deployment,
     Task,
     AuditEvent,
@@ -75,6 +77,7 @@ def _add_node(
     last_seen_age: int = 0,
     profile_age: int = 0,
     stored_profile: dict | None | str = "valid",
+    compute_capability: str = "8.6",
 ):
     node = Node(
         install_id=f"install-{name}",
@@ -87,7 +90,10 @@ def _add_node(
     session.add(node)
     session.flush()
     if stored_profile is not None:
-        value = profile("agent-reported-id").to_dict()
+        value = profile(
+            "agent-reported-id",
+            compute_capability=compute_capability,
+        ).to_dict()
         if stored_profile != "valid":
             value = stored_profile
         session.add(
@@ -124,13 +130,14 @@ def _add_release(
         layer_count=32,
         license_id="apache-2.0",
     )
+    architectures = gpu_architectures or ["ampere"]
     runtime = create_runtime_release(
         session,
         version=f"runtime-{key}",
         image=f"registry.example/{key}@sha256:{_hex(f'image-{key}', 64)}",
         vllm_version="0.9.0",
         cuda_version="12.8",
-        gpu_architectures=gpu_architectures or ["ampere"],
+        gpu_architectures=architectures,
     )
     release = create_model_release(
         session,
@@ -167,6 +174,9 @@ def _add_release(
         if not evidence_nodes:
             raise ValueError("ACTIVE recommendation fixtures require evidence_nodes")
         node_ids = [node.id for node in evidence_nodes]
+        requires_network = (
+            placement.requires_network_evidence or placement.node_count > 1
+        )
         register_benchmark_evidence(
             session,
             release_id=release.id,
@@ -195,9 +205,9 @@ def _add_release(
             success_rate=1.0,
             vram_headroom_pct=12.0,
             quality_score=0.90,
-            network_bandwidth_mbps=(20000.0 if placement.requires_network_evidence else None),
-            network_rtt_ms=(1.0 if placement.requires_network_evidence else None),
-            packet_loss_pct=(0.0 if placement.requires_network_evidence else None),
+            network_bandwidth_mbps=(20000.0 if requires_network else None),
+            network_rtt_ms=(1.0 if requires_network else None),
+            packet_loss_pct=(0.0 if requires_network else None),
             nccl_all_reduce_ok=(True if placement.requires_nccl else None),
         )
         promoted, _, changed = promote_model_release(session, release.id)
@@ -318,7 +328,7 @@ class RecommendationServiceTests(unittest.TestCase):
     def test_multinode_candidate_fails_closed_without_network_evidence(self):
         with self.factory() as session:
             nodes = [_add_node(session, f"node-{index}", now=self.now) for index in range(3)]
-            _add_release(
+            release, _ = _add_release(
                 session,
                 "pipeline",
                 quality_rank=72,
@@ -335,6 +345,17 @@ class RecommendationServiceTests(unittest.TestCase):
                     "max_packet_loss_pct": 0.1,
                 },
             )
+
+            self.assertEqual(release.status, "ACTIVE")
+            self.assertEqual(len(release.promotion_evidence_ids), 1)
+            evidence = session.get(
+                BenchmarkEvidence,
+                release.promotion_evidence_ids[0],
+            )
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertEqual(evidence.status, "PASSED")
+            self.assertTrue(evidence.nccl_all_reduce_ok)
 
             result = recommend_deployment(
                 session,

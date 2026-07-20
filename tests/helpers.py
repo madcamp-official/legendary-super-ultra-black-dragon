@@ -11,6 +11,7 @@ def profile(
     gpu_index: int = 0,
     address: str = "192.168.0.10",
     driver: str = "610.43.02",
+    compute_capability: str = "8.6",
 ) -> NodeProfile:
     gpus = []
     if gpu_memory_mib is not None:
@@ -21,7 +22,7 @@ def profile(
                 uuid=f"GPU-{node_id}",
                 driver_version=driver,
                 memory_mib=gpu_memory_mib,
-                compute_capability="8.6",
+                compute_capability=compute_capability,
             )
         )
     return NodeProfile(
