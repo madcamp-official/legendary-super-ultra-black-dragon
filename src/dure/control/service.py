@@ -308,6 +308,13 @@ def add_placement_profile(
 def transition_model_release(
     session: Session, release_id: str, target_status: str
 ) -> ModelRelease:
+    if target_status == "ACTIVE":
+        # ACTIVE is evidence-gated. Keep the existing transition API compatible
+        # while routing it through the same promotion service as /promote.
+        from .benchmark import promote_model_release
+
+        release, _, _ = promote_model_release(session, release_id)
+        return release
     release = session.scalar(
         select(ModelRelease).where(ModelRelease.id == release_id).with_for_update()
     )
