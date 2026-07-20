@@ -41,6 +41,7 @@ class Rejection:
 
 @dataclass(frozen=True)
 class CandidateEvaluation:
+    candidate_id: str
     model_id: str
     placement_profile_id: str
     quality_rank: int
@@ -50,6 +51,7 @@ class CandidateEvaluation:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "candidate_id": self.candidate_id,
             "model_id": self.model_id,
             "placement_profile_id": self.placement_profile_id,
             "quality_rank": self.quality_rank,
@@ -64,6 +66,7 @@ class ModelRecommendation:
     catalog_version: str
     policy_version: str
     inventory_fingerprint: str
+    selected_candidate_id: str | None
     selected_model_id: str | None
     selected_node_ids: tuple[str, ...]
     evaluations: tuple[CandidateEvaluation, ...]
@@ -73,6 +76,7 @@ class ModelRecommendation:
             "catalog_version": self.catalog_version,
             "policy_version": self.policy_version,
             "inventory_fingerprint": self.inventory_fingerprint,
+            "selected_candidate_id": self.selected_candidate_id,
             "selected_model_id": self.selected_model_id,
             "selected_node_ids": list(self.selected_node_ids),
             "evaluations": [item.to_dict() for item in self.evaluations],
@@ -269,6 +273,8 @@ def _evaluate(
     else:
         rejections = []
     return CandidateEvaluation(
+        candidate_id=entry.candidate_id
+        or f"local:{entry.model.model_id}:{entry.placement.profile_id}",
         model_id=entry.model.model_id,
         placement_profile_id=placement.profile_id,
         quality_rank=entry.quality_rank,
@@ -296,7 +302,14 @@ def recommend_model(
             entries = [catalog.entry(model_id)]
         except KeyError as exc:
             raise ValueError(f"unknown model: {model_id}") from exc
-    entries.sort(key=lambda entry: (-entry.quality_rank, entry.model.model_id))
+    entries.sort(
+        key=lambda entry: (
+            -entry.quality_rank,
+            entry.model.model_id,
+            entry.candidate_id or "",
+            entry.placement.profile_id,
+        )
+    )
     evaluations = tuple(
         _evaluate(entry, nodes, allow_unverified_network=allow_unverified_network)
         for entry in entries
@@ -306,6 +319,7 @@ def recommend_model(
         catalog_version=catalog.version,
         policy_version=catalog.policy_version,
         inventory_fingerprint=inventory_fingerprint(nodes),
+        selected_candidate_id=selected.candidate_id if selected else None,
         selected_model_id=selected.model_id if selected else None,
         selected_node_ids=selected.node_ids if selected else (),
         evaluations=evaluations,
