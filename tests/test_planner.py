@@ -55,6 +55,26 @@ class PlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate node"):
             build_plan([profile("same"), profile("same")])
 
+    def test_auto_selection_is_deterministic_and_rejects_22g_for_72b(self):
+        nodes = [
+            profile("node-c", gpu_memory_mib=22528),
+            profile("node-a", gpu_memory_mib=22528),
+            profile("node-b", gpu_memory_mib=22528),
+        ]
+
+        forward = build_plan(nodes)
+        reverse = build_plan(list(reversed(nodes)))
+
+        self.assertIsNotNone(forward)
+        self.assertIsNotNone(reverse)
+        assert forward is not None and reverse is not None
+        self.assertNotEqual(forward.model.model_id, "qwen2.5-72b-awq")
+        self.assertEqual(forward.model.model_id, reverse.model.model_id)
+        self.assertEqual(
+            [item.node_id for item in forward.assignments],
+            [item.node_id for item in reverse.assignments],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
