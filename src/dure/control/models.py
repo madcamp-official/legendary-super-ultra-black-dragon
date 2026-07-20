@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import (
     Boolean,
@@ -24,6 +25,11 @@ from ..task import TaskStatus, TaskType
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _deployment_lineage_default(context: Any) -> str:
+    """Keep legacy/manual deployments in a one-record lineage by default."""
+    return str(context.get_current_parameters()["id"])
 
 
 class Node(Base):
@@ -49,9 +55,67 @@ class NodeProfileRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class DeploymentRecommendationRecord(Base):
+    __tablename__ = "deployment_recommendations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 71 AND id LIKE 'sha256:%'",
+            name="ck_deployment_recommendation_id_sha256",
+        ),
+        CheckConstraint(
+            "selection_mode IN ('all_online', 'explicit_nodes')",
+            name="ck_deployment_recommendation_selection_mode",
+        ),
+        Index(
+            "ix_deployment_recommendations_created_at",
+            "created_at",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(71), primary_key=True)
+    objective: Mapped[str] = mapped_column(String(40), nullable=False)
+    selection_mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    requested_node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    catalog_version: Mapped[str] = mapped_column(String(71), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    inventory_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    recommendation_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    inventory_snapshot: Mapped[list[dict]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Deployment(Base):
     __tablename__ = "deployments"
+    __table_args__ = (
+        UniqueConstraint(
+            "lineage_id",
+            "generation",
+            name="uq_deployments_lineage_generation",
+        ),
+        UniqueConstraint(
+            "previous_generation_id",
+            name="uq_deployments_previous_generation_id",
+        ),
+        UniqueConstraint(
+            "source_recommendation_id",
+            name="uq_deployments_source_recommendation_id",
+        ),
+    )
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    lineage_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=_deployment_lineage_default
+    )
+    previous_generation_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "deployments.id",
+            name="fk_deployments_previous_generation_id",
+        )
+    )
+    source_recommendation_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "deployment_recommendations.id",
+            name="fk_deployments_source_recommendation_id",
+        )
+    )
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     plan: Mapped[dict] = mapped_column(JSON, nullable=False)
     accept_model_download: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
