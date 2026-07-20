@@ -1,3 +1,10 @@
+dure (0.3.11) UNRELEASED; urgency=medium
+
+  * 결정론적 추천과 정규화 인벤토리를 불변 스냅샷으로 저장합니다.
+  * 추천 유효성을 재검사해 적용 전 배포 세대만 만드는 명시적 수락을 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 20:30:00 +0900
+
 dure (0.3.10) UNRELEASED; urgency=medium
 
   * Add a closed, single-node GPU benchmark task and evidence collection path.
