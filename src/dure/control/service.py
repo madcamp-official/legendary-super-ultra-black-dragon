@@ -35,6 +35,8 @@ from .models import (
     AuditEvent,
     BenchmarkRun,
     Deployment,
+    DeploymentOperation,
+    DeploymentOperationNode,
     EnrollmentToken,
     ModelArtifact,
     ModelRelease,
@@ -47,6 +49,14 @@ from .models import (
     TaskStatus,
     TaskType,
     utcnow,
+)
+from .rollout import (
+    DeploymentRolloutConflictError,
+    PHASE_TASK_TYPES,
+    attach_deployment_bulk_operation,
+    cancel_operation_task,
+    claim_operation_task,
+    finish_operation_task,
 )
 
 
@@ -541,8 +551,17 @@ def node_status(last_seen: datetime | None, now: datetime | None = None) -> str:
     return "stale"
 
 
-def save_heartbeat(session: Session, node: Node, state: dict, profile: dict | None = None) -> None:
+def save_heartbeat(
+    session: Session,
+    node: Node,
+    state: dict,
+    profile: dict | None = None,
+    *,
+    agent_version: str | None = None,
+) -> None:
     node.last_seen = utcnow()
+    if agent_version is not None:
+        node.agent_version = agent_version
     node.observed_phase = state.get("phase")
     node.observed_role = state.get("role")
     node.observed_deployment_id = state.get("deployment_id")
@@ -1378,6 +1397,169 @@ def fail_benchmark_task(
     return True, run
 
 
+DEPLOYMENT_TASK_TYPES = {
+    TaskType.VERIFY,
+    TaskType.APPLY_DEPLOYMENT,
+    TaskType.START_DEPLOYMENT,
+    TaskType.STOP_DEPLOYMENT,
+    TaskType.RESTART_DEPLOYMENT,
+}
+DEPLOYMENT_MUTATION_TASK_TYPES = {
+    TaskType.APPLY_DEPLOYMENT.value,
+    TaskType.START_DEPLOYMENT.value,
+    TaskType.STOP_DEPLOYMENT.value,
+    TaskType.RESTART_DEPLOYMENT.value,
+}
+DEPLOYMENT_TASK_TYPE_VALUES = {item.value for item in DEPLOYMENT_TASK_TYPES}
+
+
+def _validate_task_options(task_type: TaskType, options: dict) -> None:
+    if type(options) is not dict or any(type(key) is not str for key in options):
+        raise ValueError("task options must be an object with string keys")
+    allowed_options = (
+        {"api"}
+        if task_type == TaskType.VERIFY
+        else {"serve"}
+        if task_type
+        in {
+            TaskType.APPLY_DEPLOYMENT,
+            TaskType.START_DEPLOYMENT,
+            TaskType.RESTART_DEPLOYMENT,
+        }
+        else set()
+    )
+    unknown = set(options) - allowed_options
+    if unknown:
+        raise ValueError(f"unsupported task options: {', '.join(sorted(unknown))}")
+    if any(type(value) is not bool for value in options.values()):
+        raise ValueError("task options must use strict boolean values")
+
+
+def _lock_deployment_lineage_for_task_creation(
+    session: Session, deployment: Deployment
+) -> None:
+    """Serialize deployment task creation on the lineage root.
+
+    Callers first lock their complete node set in UUID order, then this lineage
+    root. That order prevents overlapping lineages from racing onto one GPU.
+    """
+    lineage_id = deployment.lineage_id or deployment.id
+    root = session.scalar(
+        select(Deployment)
+        .where(Deployment.id == lineage_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if root is None or (root.lineage_id or root.id) != lineage_id:
+        raise DeploymentRolloutConflictError(
+            "deployment lineage root is invalid",
+            code="DEPLOYMENT_LINEAGE_INVALID",
+            details={"lineage_id": lineage_id},
+        )
+    active_operation_id = session.scalar(
+        select(DeploymentOperation.id)
+        .where(DeploymentOperation.active_lineage_id == lineage_id)
+    )
+    if active_operation_id is not None:
+        raise DeploymentRolloutConflictError(
+            "deployment lineage already has an active operation",
+            code="DEPLOYMENT_OPERATION_ACTIVE",
+            details={"operation_id": active_operation_id},
+        )
+    active_task_id = session.scalar(
+        select(Task.id)
+        .join(Deployment, Deployment.id == Task.deployment_id)
+        .where(
+            Deployment.lineage_id == lineage_id,
+            Task.type.in_(DEPLOYMENT_MUTATION_TASK_TYPES),
+            Task.status.in_(
+                {
+                    TaskStatus.QUEUED.value,
+                    TaskStatus.RUNNING.value,
+                }
+            ),
+        )
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    )
+    if active_task_id is not None:
+        raise DeploymentRolloutConflictError(
+            "deployment lineage already has a queued or running mutation",
+            code="DEPLOYMENT_MUTATION_ACTIVE",
+            details={"task_id": active_task_id},
+        )
+
+
+def _lock_deployment_task_nodes(
+    session: Session, node_ids: list[str]
+) -> dict[str, Node]:
+    normalized = sorted(set(node_ids))
+    if not normalized:
+        return {}
+    nodes = list(
+        session.scalars(
+            select(Node)
+            .where(Node.id.in_(normalized))
+            .order_by(Node.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    return {node.id: node for node in nodes}
+
+
+def _ensure_deployment_node_scope_available(
+    session: Session, node_ids: list[str]
+) -> None:
+    requested = set(node_ids)
+    if not requested:
+        return
+    for operation in session.scalars(
+        select(DeploymentOperation).where(
+            DeploymentOperation.active_lineage_id.is_not(None)
+        )
+    ):
+        overlap = sorted(requested.intersection(operation.node_ids))
+        if overlap:
+            raise DeploymentRolloutConflictError(
+                "assigned nodes already belong to an active operation",
+                code="DEPLOYMENT_NODE_OPERATION_ACTIVE",
+                details={
+                    "operation_id": operation.id,
+                    "node_ids": overlap,
+                },
+            )
+    active_task = session.execute(
+        select(Task.id, Task.node_id)
+        .where(
+            Task.node_id.in_(requested),
+            Task.type.in_(DEPLOYMENT_TASK_TYPE_VALUES),
+            Task.status.in_(
+                {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+            ),
+        )
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    ).one_or_none()
+    if active_task is not None:
+        raise DeploymentRolloutConflictError(
+            "assigned node already has a queued or running deployment task",
+            code="DEPLOYMENT_NODE_TASK_ACTIVE",
+            details={
+                "task_id": active_task.id,
+                "node_id": active_task.node_id,
+            },
+        )
+
+
+def _operation_hook_conflict(action: str, task_id: str) -> DeploymentRolloutConflictError:
+    return DeploymentRolloutConflictError(
+        f"operation-bound task cannot be {action}",
+        code="DEPLOYMENT_OPERATION_TASK_CONFLICT",
+        details={"task_id": task_id},
+    )
+
+
 def create_tasks(
     session: Session,
     *,
@@ -1390,55 +1572,78 @@ def create_tasks(
         raise ValueError(
             "BENCHMARK tasks require a prepared benchmark run and explicit apply"
         )
-    bulk_id = str(uuid.uuid4())
-    tasks: list[Task] = []
-    errors: dict[str, str] = {}
-    deployment = session.get(Deployment, deployment_id) if deployment_id else None
-    deployment_types = {
-        TaskType.VERIFY,
-        TaskType.APPLY_DEPLOYMENT,
-        TaskType.START_DEPLOYMENT,
-        TaskType.STOP_DEPLOYMENT,
-        TaskType.RESTART_DEPLOYMENT,
-    }
-    if task_type in deployment_types and deployment is None:
-        raise ValueError("a valid deployment_id is required")
-    allowed_options = {"api"} if task_type == TaskType.VERIFY else {"serve"} if task_type in {
-        TaskType.APPLY_DEPLOYMENT, TaskType.START_DEPLOYMENT, TaskType.RESTART_DEPLOYMENT
-    } else set()
-    unknown = set(options) - allowed_options
-    if unknown:
-        raise ValueError(f"unsupported task options: {', '.join(sorted(unknown))}")
-    assignments = {item["node_id"] for item in deployment.plan["assignments"]} if deployment else set()
-    for node_id in dict.fromkeys(node_ids):
-        node = session.get(Node, node_id)
-        if node is None or not node.approved:
-            errors[node_id] = "unknown, pending, or revoked node"
-            continue
-        if deployment is not None and node_id not in assignments:
-            errors[node_id] = "node is not assigned to deployment"
-            continue
-        payload = dict(options)
-        if deployment is not None:
-            payload.update(
-                plan=deployment.plan,
-                generation=deployment.generation,
-                accept_model_download=deployment.accept_model_download,
-                pull_image=deployment.pull_image,
-            )
-        task = Task(
-            bulk_id=bulk_id,
-            node_id=node_id,
-            type=task_type.value,
-            deployment_id=deployment_id,
-            payload=payload,
+    _validate_task_options(task_type, options)
+    try:
+        bulk_id = str(uuid.uuid4())
+        tasks: list[Task] = []
+        errors: dict[str, str] = {}
+        locked_nodes = _lock_deployment_task_nodes(session, node_ids)
+        deployment = (
+            session.get(Deployment, deployment_id) if deployment_id else None
         )
-        session.add(task)
-        tasks.append(task)
-        node.desired_state = task_type.value
-    audit(session, "admin", "tasks.create", bulk_id, "success", task_type=task_type.value, count=len(tasks))
-    session.commit()
-    return bulk_id, tasks, errors
+        if task_type in DEPLOYMENT_TASK_TYPES and deployment is None:
+            raise ValueError("a valid deployment_id is required")
+        if deployment is not None and task_type in DEPLOYMENT_TASK_TYPES:
+            _lock_deployment_lineage_for_task_creation(session, deployment)
+            _ensure_deployment_node_scope_available(session, node_ids)
+        assignments = (
+            {item["node_id"] for item in deployment.plan["assignments"]}
+            if deployment
+            else set()
+        )
+        for node_id in dict.fromkeys(node_ids):
+            node = locked_nodes.get(node_id)
+            if node is None or not node.approved:
+                errors[node_id] = "unknown, pending, or revoked node"
+                continue
+            if deployment is not None and node_id not in assignments:
+                errors[node_id] = "node is not assigned to deployment"
+                continue
+            payload = dict(options)
+            if deployment is not None:
+                payload.update(
+                    plan=deployment.plan,
+                    generation=deployment.generation,
+                    accept_model_download=deployment.accept_model_download,
+                    pull_image=deployment.pull_image,
+                )
+            task = Task(
+                bulk_id=bulk_id,
+                node_id=node_id,
+                type=task_type.value,
+                deployment_id=deployment_id,
+                payload=payload,
+            )
+            session.add(task)
+            tasks.append(task)
+            node.desired_state = task_type.value
+        if deployment is not None:
+            attach_deployment_bulk_operation(
+                session,
+                deployment=deployment,
+                task_type=task_type,
+                tasks=tasks,
+                options=options,
+            )
+            if tasks and task_type in {
+                TaskType.START_DEPLOYMENT,
+                TaskType.RESTART_DEPLOYMENT,
+            }:
+                deployment.verified_at = None
+        audit(
+            session,
+            "admin",
+            "tasks.create",
+            bulk_id,
+            "success",
+            task_type=task_type.value,
+            count=len(tasks),
+        )
+        session.commit()
+        return bulk_id, tasks, errors
+    except Exception:
+        session.rollback()
+        raise
 
 
 def claim_task(session: Session, node_id: str, lease_seconds: int = 300) -> Task | None:
@@ -1471,22 +1676,86 @@ def claim_task(session: Session, node_id: str, lease_seconds: int = 300) -> Task
     )
     if task is None:
         return None
-    task.status = TaskStatus.RUNNING.value
-    task.attempts += 1
-    task.lease_until = now + timedelta(seconds=lease_seconds)
-    session.commit()
-    return task
+    try:
+        if (
+            task.status == TaskStatus.RUNNING.value
+            and task.operation_node_id is not None
+            and task.operation_attempt is not None
+        ):
+            if not finish_operation_task(
+                session,
+                task,
+                node_id,
+                result=None,
+                error="TASK_LEASE_EXPIRED",
+            ):
+                raise _operation_hook_conflict("expired", task.id)
+            session.commit()
+            return None
+        task.status = TaskStatus.RUNNING.value
+        task.attempts += 1
+        task.lease_until = now + timedelta(seconds=lease_seconds)
+        if not claim_operation_task(session, task, node_id):
+            raise _operation_hook_conflict("claimed", task.id)
+        session.commit()
+        return task
+    except Exception:
+        session.rollback()
+        raise
 
 
 def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int = 300) -> bool:
-    if task.node_id != node_id or task.status != TaskStatus.RUNNING.value:
-        return False
-    task.lease_until = utcnow() + timedelta(seconds=lease_seconds)
-    node = session.get(Node, node_id)
-    if node is not None:
-        node.last_seen = utcnow()
-    session.commit()
-    return True
+    now = utcnow()
+    try:
+        node = session.scalar(
+            select(Node).where(Node.id == node_id).with_for_update()
+        )
+        locked_task = session.scalar(
+            select(Task)
+            .where(Task.id == task.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            node is None
+            or locked_task is None
+            or locked_task.node_id != node_id
+            or locked_task.status != TaskStatus.RUNNING.value
+            or aware(locked_task.lease_until) is None
+            or aware(locked_task.lease_until) < now
+        ):
+            session.rollback()
+            return False
+        if (
+            locked_task.operation_node_id is not None
+            or locked_task.operation_attempt is not None
+        ):
+            record = session.get(
+                DeploymentOperationNode, locked_task.operation_node_id
+            )
+            operation = (
+                session.get(DeploymentOperation, record.operation_id)
+                if record is not None
+                else None
+            )
+            if (
+                record is None
+                or operation is None
+                or locked_task.operation_attempt != record.attempt_count
+                or locked_task.type != PHASE_TASK_TYPES[record.phase].value
+                or record.node_id != node_id
+                or record.status != "RUNNING"
+                or record.phase != operation.phase
+            ):
+                session.rollback()
+                return False
+        locked_task.lease_until = now + timedelta(seconds=lease_seconds)
+        node.last_seen = now
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        raise
 
 
 def finish_task(session: Session, task: Task, node_id: str, *, result: dict | None, error: str | None) -> bool:
@@ -1494,36 +1763,134 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
         return False
     if task.node_id != node_id:
         return False
-    terminal = {TaskStatus.SUCCEEDED.value, TaskStatus.FAILED.value}
-    if task.status in terminal:
+    if task.operation_node_id is not None or task.operation_attempt is not None:
+        try:
+            locked_node = session.scalar(
+                select(Node).where(Node.id == node_id).with_for_update()
+            )
+            if locked_node is None:
+                session.rollback()
+                return False
+            accepted = finish_operation_task(
+                session,
+                task,
+                node_id,
+                result=result,
+                error=error,
+            )
+            if not accepted:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
+    try:
+        terminal = {TaskStatus.SUCCEEDED.value, TaskStatus.FAILED.value}
+        if task.status in terminal:
+            return True
+        if task.status != TaskStatus.RUNNING.value:
+            return False
+        task.status = TaskStatus.FAILED.value if error else TaskStatus.SUCCEEDED.value
+        task.result = result
+        task.error = error
+        task.lease_until = None
+        node = session.get(Node, node_id)
+        if node is not None:
+            node.desired_state = None
+        if (
+            not error
+            and task.type == TaskType.PROBE.value
+            and result
+            and isinstance(result.get("profile"), dict)
+        ):
+            NodeProfile.from_dict(result["profile"])
+            profile_record = session.get(NodeProfileRecord, node_id)
+            if profile_record is None:
+                session.add(
+                    NodeProfileRecord(node_id=node_id, profile=result["profile"])
+                )
+            else:
+                profile_record.profile = result["profile"]
+                profile_record.updated_at = utcnow()
+        session.commit()
         return True
-    if task.status != TaskStatus.RUNNING.value:
-        return False
-    task.status = TaskStatus.FAILED.value if error else TaskStatus.SUCCEEDED.value
-    task.result = result
-    task.error = error
-    task.lease_until = None
-    node = session.get(Node, node_id)
-    if node is not None:
-        node.desired_state = None
-    if not error and task.type == TaskType.PROBE.value and result and isinstance(result.get("profile"), dict):
-        NodeProfile.from_dict(result["profile"])
-        profile_record = session.get(NodeProfileRecord, node_id)
-        if profile_record is None:
-            session.add(NodeProfileRecord(node_id=node_id, profile=result["profile"]))
-        else:
-            profile_record.profile = result["profile"]
-            profile_record.updated_at = utcnow()
-    session.commit()
-    return True
+    except Exception:
+        session.rollback()
+        raise
 
 
 def cancel_task(session: Session, task: Task) -> bool:
     identity = session.execute(
-        select(Task.type, Task.node_id).where(Task.id == task.id)
+        select(
+            Task.type,
+            Task.node_id,
+            Task.status,
+            Task.operation_node_id,
+            Task.operation_attempt,
+        ).where(Task.id == task.id)
     ).one_or_none()
     if identity is None:
         return False
+    if (
+        identity.operation_node_id is not None
+        or identity.operation_attempt is not None
+    ):
+        try:
+            locked_node = session.scalar(
+                select(Node)
+                .where(Node.id == identity.node_id)
+                .with_for_update()
+            )
+            current_task = session.scalar(
+                select(Task)
+                .where(Task.id == task.id)
+                .execution_options(populate_existing=True)
+            )
+            if locked_node is None or current_task is None:
+                session.rollback()
+                return False
+            lease_until = aware(current_task.lease_until)
+            expired_running = (
+                current_task.status == TaskStatus.RUNNING.value
+                and lease_until is not None
+                and lease_until < utcnow()
+            )
+            expired_failure_replay = (
+                current_task.status == TaskStatus.FAILED.value
+                and current_task.error == "TASK_LEASE_EXPIRED"
+            )
+            if expired_running or expired_failure_replay:
+                accepted = finish_operation_task(
+                    session,
+                    current_task,
+                    identity.node_id,
+                    result=None,
+                    error="TASK_LEASE_EXPIRED",
+                )
+            else:
+                accepted = cancel_operation_task(session, current_task)
+            if not accepted:
+                session.rollback()
+                return False
+            if identity.status not in {
+                TaskStatus.CANCELED.value,
+                TaskStatus.FAILED.value,
+            }:
+                audit(
+                    session,
+                    "admin",
+                    "task.cancel",
+                    task.id,
+                    "success",
+                    expired_lease=expired_running or expired_failure_replay,
+                )
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
     run = None
     if identity.type == TaskType.BENCHMARK.value:
         locked_node, locked_task, run = _lock_benchmark_terminal(

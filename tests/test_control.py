@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import tempfile
 import unittest
 from datetime import timedelta
@@ -8,13 +9,25 @@ from pathlib import Path
 from sqlalchemy import select
 
 from dure.control.db import Base, make_engine, make_session_factory
-from dure.control.models import EnrollmentToken, NodeCredential, TaskStatus, TaskType, utcnow
+from dure.control.models import (
+    DeploymentOperation,
+    DeploymentOperationNode,
+    EnrollmentToken,
+    NodeCredential,
+    Task,
+    TaskStatus,
+    TaskType,
+    utcnow,
+)
+from dure.control.rollout import DeploymentRolloutConflictError
 from dure.control.service import (
     authenticate_node,
     claim_enrollment,
     claim_task,
+    cancel_task,
     create_enrollment,
     create_tasks,
+    extend_task,
     finish_task,
     join_node,
     node_status,
@@ -47,6 +60,20 @@ class ControlServiceTests(unittest.TestCase):
             profile=profile(name).to_dict(), agent_version="0.2.0",
         )
         return node, credential
+
+    def deployment(self, session, *, name="node-a", download=True, pull=True):
+        node, _ = self.enroll(session, name=name)
+        plan = build_plan(
+            [profile(name)],
+            image="registry.example/vllm@sha256:" + "a" * 64,
+        )
+        deployment = save_deployment(
+            session,
+            plan.to_dict(),
+            accept_model_download=download,
+            pull_image=pull,
+        )
+        return node, deployment
 
     def test_enrollment_is_hashed_one_time_and_revocable(self):
         with self.factory() as session:
@@ -146,3 +173,380 @@ class ControlServiceTests(unittest.TestCase):
             node, _ = self.enroll(session)
             with self.assertRaises(ValueError):
                 create_tasks(session, node_ids=[node.id], task_type=TaskType.PROBE, deployment_id=None, options={"command": "id"})
+
+    def test_deployment_apply_tracks_operation_and_preserves_payload(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            bulk_id, tasks, errors = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={"serve": False},
+            )
+            self.assertTrue(bulk_id)
+            self.assertFalse(errors)
+            self.assertEqual(len(tasks), 1)
+            task = tasks[0]
+            self.assertEqual(
+                task.payload,
+                {
+                    "serve": False,
+                    "plan": deployment.plan,
+                    "generation": deployment.generation,
+                    "accept_model_download": True,
+                    "pull_image": True,
+                },
+            )
+            self.assertIsNotNone(task.operation_node_id)
+            self.assertEqual(task.operation_attempt, 1)
+            operation = session.scalar(select(DeploymentOperation))
+            self.assertEqual(operation.kind, "APPLY")
+            self.assertEqual(operation.status, "QUEUED")
+            self.assertEqual(operation.active_lineage_id, deployment.lineage_id)
+
+            claimed = claim_task(session, node.id)
+            self.assertEqual(claimed.id, task.id)
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+            self.assertEqual(operation_node.status, "RUNNING")
+            self.assertTrue(
+                finish_task(
+                    session,
+                    claimed,
+                    node.id,
+                    result={"ok": True},
+                    error=None,
+                )
+            )
+            session.refresh(operation)
+            session.refresh(operation_node)
+            session.refresh(deployment)
+            self.assertEqual(operation.status, "SUCCEEDED")
+            self.assertIsNone(operation.active_lineage_id)
+            self.assertEqual(operation_node.status, "SUCCEEDED")
+            self.assertEqual(deployment.status, "APPLIED")
+
+    def test_deployment_task_options_require_strict_booleans_atomically(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            with self.assertRaisesRegex(ValueError, "strict boolean"):
+                create_tasks(
+                    session,
+                    node_ids=[node.id],
+                    task_type=TaskType.APPLY_DEPLOYMENT,
+                    deployment_id=deployment.id,
+                    options={"serve": 1},
+                )
+            self.assertEqual(session.query(Task).count(), 0)
+            self.assertEqual(session.query(DeploymentOperation).count(), 0)
+            session.refresh(node)
+            self.assertIsNone(node.desired_state)
+
+    def test_active_operation_blocks_another_lineage_mutation_atomically(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            _, tasks, _ = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={"serve": False},
+            )
+            with self.assertRaises(DeploymentRolloutConflictError) as context:
+                create_tasks(
+                    session,
+                    node_ids=[node.id],
+                    task_type=TaskType.STOP_DEPLOYMENT,
+                    deployment_id=deployment.id,
+                    options={},
+                )
+            self.assertEqual(context.exception.code, "DEPLOYMENT_OPERATION_ACTIVE")
+            self.assertEqual(session.query(Task).count(), 1)
+            session.refresh(node)
+            self.assertEqual(node.desired_state, TaskType.APPLY_DEPLOYMENT.value)
+            self.assertEqual(tasks[0].status, TaskStatus.QUEUED.value)
+
+    def test_legacy_queued_mutation_blocks_new_lineage_mutation(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            legacy = Task(
+                bulk_id="legacy-bulk",
+                node_id=node.id,
+                type=TaskType.START_DEPLOYMENT.value,
+                deployment_id=deployment.id,
+                payload={},
+            )
+            session.add(legacy)
+            session.commit()
+            with self.assertRaises(DeploymentRolloutConflictError) as context:
+                create_tasks(
+                    session,
+                    node_ids=[node.id],
+                    task_type=TaskType.VERIFY,
+                    deployment_id=deployment.id,
+                    options={"api": False},
+                )
+            self.assertEqual(context.exception.code, "DEPLOYMENT_MUTATION_ACTIVE")
+            self.assertEqual(context.exception.details["task_id"], legacy.id)
+            self.assertEqual(session.query(Task).count(), 1)
+
+    def test_claim_hook_rejection_rolls_back_task_lease(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            _, tasks, _ = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={},
+            )
+            task = tasks[0]
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+            operation_node.status = "FAILED"
+            session.commit()
+            with self.assertRaises(DeploymentRolloutConflictError) as context:
+                claim_task(session, node.id)
+            self.assertEqual(
+                context.exception.code, "DEPLOYMENT_OPERATION_TASK_CONFLICT"
+            )
+            session.refresh(task)
+            self.assertEqual(task.status, TaskStatus.QUEUED.value)
+            self.assertEqual(task.attempts, 0)
+            self.assertIsNone(task.lease_until)
+
+    def test_late_operation_attempt_cannot_finish_current_progress(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            _, tasks, _ = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={},
+            )
+            task = claim_task(session, node.id)
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+            operation = session.get(
+                DeploymentOperation, operation_node.operation_id
+            )
+            operation_node.attempt_count = 2
+            session.commit()
+            self.assertFalse(
+                finish_task(
+                    session,
+                    task,
+                    node.id,
+                    result={"ok": True},
+                    error=None,
+                )
+            )
+            session.refresh(task)
+            session.refresh(operation_node)
+            session.refresh(operation)
+            self.assertEqual(task.status, TaskStatus.RUNNING.value)
+            self.assertIsNone(task.result)
+            self.assertEqual(operation_node.status, "RUNNING")
+            self.assertEqual(operation.status, "RUNNING")
+
+    def test_expired_operation_lease_fails_instead_of_reclaiming_same_attempt(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            _, tasks, _ = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={},
+            )
+            task = claim_task(session, node.id, lease_seconds=-1)
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+            operation = session.get(
+                DeploymentOperation, operation_node.operation_id
+            )
+
+            self.assertIsNone(claim_task(session, node.id))
+
+            session.refresh(task)
+            session.refresh(operation_node)
+            session.refresh(operation)
+            session.refresh(deployment)
+            self.assertEqual(task.status, TaskStatus.FAILED.value)
+            self.assertEqual(task.error, "TASK_LEASE_EXPIRED")
+            self.assertEqual(task.attempts, 1)
+            self.assertEqual(operation_node.status, "FAILED")
+            self.assertEqual(
+                operation_node.failure_code, "TASK_LEASE_EXPIRED"
+            )
+            self.assertEqual(operation.status, "FAILED")
+            self.assertIsNone(operation.active_lineage_id)
+            self.assertEqual(deployment.status, "APPLY_FAILED")
+            self.assertFalse(
+                finish_task(
+                    session,
+                    task,
+                    node.id,
+                    result={"ok": True},
+                    error=None,
+                )
+            )
+
+    def test_operation_task_cancel_is_atomic_and_idempotent(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            _, tasks, _ = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={},
+            )
+            task = tasks[0]
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+            operation = session.get(
+                DeploymentOperation, operation_node.operation_id
+            )
+            self.assertTrue(cancel_task(session, task))
+            self.assertTrue(cancel_task(session, task))
+            session.refresh(task)
+            session.refresh(operation_node)
+            session.refresh(operation)
+            session.refresh(deployment)
+            self.assertEqual(task.status, TaskStatus.CANCELED.value)
+            self.assertEqual(operation_node.status, "CANCELED")
+            self.assertEqual(operation.status, "FAILED")
+            self.assertIsNone(operation.active_lineage_id)
+            self.assertEqual(deployment.status, "APPLY_FAILED")
+
+    def test_running_operation_task_cannot_be_canceled(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            _, tasks, _ = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={},
+            )
+            task = claim_task(session, node.id)
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+            operation = session.get(
+                DeploymentOperation, operation_node.operation_id
+            )
+            self.assertFalse(cancel_task(session, task))
+            session.refresh(task)
+            session.refresh(operation_node)
+            session.refresh(operation)
+            session.refresh(deployment)
+            self.assertEqual(task.status, TaskStatus.RUNNING.value)
+            self.assertEqual(operation_node.status, "RUNNING")
+            self.assertEqual(operation.status, "RUNNING")
+            self.assertEqual(operation.active_lineage_id, deployment.lineage_id)
+            self.assertEqual(deployment.status, "APPLYING")
+
+    def test_expired_operation_task_can_be_reconciled_by_admin_cancel(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            _, _tasks, _ = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={},
+            )
+            task = claim_task(session, node.id, lease_seconds=-1)
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+
+            self.assertTrue(cancel_task(session, task))
+            self.assertTrue(cancel_task(session, task))
+
+            session.refresh(task)
+            session.refresh(operation_node)
+            self.assertEqual(task.status, TaskStatus.FAILED.value)
+            self.assertEqual(task.error, "TASK_LEASE_EXPIRED")
+            self.assertEqual(operation_node.status, "FAILED")
+            self.assertEqual(
+                operation_node.failure_code, "TASK_LEASE_EXPIRED"
+            )
+
+    def test_task_heartbeat_cannot_revive_expired_or_stale_operation_attempt(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=deployment.id,
+                options={},
+            )
+            task = claim_task(session, node.id, lease_seconds=-1)
+            expired_lease = task.lease_until
+
+            self.assertFalse(extend_task(session, task, node.id))
+            session.refresh(task)
+            self.assertEqual(task.status, TaskStatus.RUNNING.value)
+            self.assertEqual(
+                task.lease_until.replace(tzinfo=None),
+                expired_lease.replace(tzinfo=None),
+            )
+
+            task.lease_until = utcnow() + timedelta(minutes=5)
+            operation_node = session.get(
+                DeploymentOperationNode, task.operation_node_id
+            )
+            operation_node.attempt_count += 1
+            session.commit()
+            current_lease = task.lease_until
+
+            self.assertFalse(extend_task(session, task, node.id))
+            session.refresh(task)
+            self.assertEqual(
+                task.lease_until.replace(tzinfo=None),
+                current_lease.replace(tzinfo=None),
+            )
+
+    def test_overlapping_lineages_cannot_activate_on_the_same_node(self):
+        with self.factory() as session:
+            node, first = self.deployment(session)
+            second_plan = copy.deepcopy(first.plan)
+            second_plan["deployment_id"] = "independent-lineage"
+            second = save_deployment(
+                session,
+                second_plan,
+                accept_model_download=False,
+                pull_image=False,
+            )
+            create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.APPLY_DEPLOYMENT,
+                deployment_id=first.id,
+                options={},
+            )
+
+            with self.assertRaises(DeploymentRolloutConflictError) as context:
+                create_tasks(
+                    session,
+                    node_ids=[node.id],
+                    task_type=TaskType.APPLY_DEPLOYMENT,
+                    deployment_id=second.id,
+                    options={},
+                )
+
+            self.assertEqual(
+                context.exception.code, "DEPLOYMENT_NODE_OPERATION_ACTIVE"
+            )
+            self.assertEqual(session.query(Task).count(), 1)

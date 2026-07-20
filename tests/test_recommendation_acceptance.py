@@ -15,6 +15,7 @@ from dure.control.models import (
     AuditEvent,
     BenchmarkRun,
     Deployment,
+    DeploymentOperation,
     DeploymentRecommendationRecord,
     Node,
     NodeProfileRecord,
@@ -434,6 +435,96 @@ class RecommendationAcceptanceTests(unittest.TestCase):
             self.assertEqual(
                 session.scalar(select(func.count()).select_from(Deployment)),
                 2,
+            )
+
+    def test_rolled_back_latest_generation_cannot_continue_the_old_lineage(self):
+        node_id, _, _ = self._seed_active_candidate("rolled-back-lineage")
+        first_recommendation = self._recommend(node_id)
+        first = self._accept(first_recommendation["id"])
+        self.assertEqual(first.status_code, 200, first.text)
+        first_deployment = first.json()["deployment"]
+        with self.factory() as session:
+            deployment = session.get(Deployment, first_deployment["id"])
+            deployment.status = "ROLLED_BACK"
+            deployment.verified_at = None
+            session.commit()
+
+        self._change_profile(node_id, 79000)
+        second_recommendation = self._recommend(node_id)
+        response = self._accept(
+            second_recommendation["id"],
+            previous_generation_id=first_deployment["id"],
+        )
+
+        self.assert_error_code(
+            response,
+            409,
+            "PREVIOUS_GENERATION_ROLLED_BACK",
+        )
+
+    def test_legacy_lineage_mutation_blocks_accepting_the_next_generation(self):
+        node_id, _, _ = self._seed_active_candidate("legacy-mutation-lineage")
+        first_recommendation = self._recommend(node_id)
+        first = self._accept(first_recommendation["id"])
+        self.assertEqual(first.status_code, 200, first.text)
+        first_deployment = first.json()["deployment"]
+        with self.factory() as session:
+            session.add(
+                Task(
+                    bulk_id="legacy-lineage-mutation",
+                    node_id=first_deployment["plan"]["assignments"][0]["node_id"],
+                    type="START_DEPLOYMENT",
+                    deployment_id=first_deployment["id"],
+                    payload={},
+                )
+            )
+            session.commit()
+
+        self._change_profile(node_id, 79000)
+        second_recommendation = self._recommend(node_id)
+        response = self._accept(
+            second_recommendation["id"],
+            previous_generation_id=first_deployment["id"],
+        )
+
+        self.assert_error_code(response, 409, "DEPLOYMENT_MUTATION_ACTIVE")
+
+    def test_accept_rejects_a_new_generation_while_lineage_operation_is_active(self):
+        node_id, _, _ = self._seed_active_candidate("active-operation")
+        first_recommendation = self._recommend(node_id)
+        first = self._accept(first_recommendation["id"])
+        self.assertEqual(first.status_code, 200, first.text)
+        first_deployment = first.json()["deployment"]
+
+        self._change_profile(node_id, 79000)
+        second_recommendation = self._recommend(node_id)
+        with self.factory() as session:
+            session.add(
+                DeploymentOperation(
+                    request_digest="sha256:" + "a" * 64,
+                    lineage_id=first_deployment["lineage_id"],
+                    deployment_id=first_deployment["id"],
+                    kind="VERIFY",
+                    status="RUNNING",
+                    phase="VERIFY",
+                    node_ids=[node_id],
+                    serve=False,
+                    api=False,
+                    active_lineage_id=first_deployment["lineage_id"],
+                )
+            )
+            session.commit()
+
+        response = self._accept(
+            second_recommendation["id"],
+            previous_generation_id=first_deployment["id"],
+        )
+
+        self.assert_error_code(response, 409, "DEPLOYMENT_OPERATION_ACTIVE")
+        with self.factory() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Deployment)),
+                1,
             )
 
     def test_accept_body_forbids_extra_fields_and_wrong_types(self):
