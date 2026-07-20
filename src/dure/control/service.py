@@ -9,10 +9,18 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from dure.models import DeploymentPlan, NodeProfile
+from dure.artifact_manifest import (
+    ArtifactManifestLimits,
+    canonical_artifact_manifest as parse_canonical_artifact_manifest,
+)
+from dure.artifact_prepare import validate_digest_pinned_runtime_image
+from dure.models import DeploymentPlan, NodeProfile, VLLM_RAY_PP_BACKEND
+from dure.pipeline_runtime import validate_strict_pipeline_plan
 from dure.task import (
     MAX_BENCHMARK_CONTEXT_TOKENS,
     MAX_BENCHMARK_INTEGER,
@@ -32,6 +40,10 @@ from .benchmark import (
     register_benchmark_evidence,
 )
 from .models import (
+    ArtifactChunk,
+    ArtifactFileChunk,
+    ArtifactManifest,
+    ArtifactManifestFile,
     AuditEvent,
     BenchmarkRun,
     Deployment,
@@ -57,6 +69,7 @@ from .rollout import (
     cancel_operation_task,
     claim_operation_task,
     finish_operation_task,
+    valid_deployment_task_success_result,
 )
 
 
@@ -67,6 +80,16 @@ MODEL_RELEASE_TRANSITIONS = {
     "DEPRECATED": {"REVOKED"},
     "REVOKED": set(),
 }
+STRICT_RAY_AGENT_VERSION = (0, 3, 18)
+
+
+def _agent_supports_strict_ray(value: str) -> bool:
+    if type(value) is not str:
+        return False
+    matched = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", value)
+    if matched is None:
+        return False
+    return tuple(int(part) for part in matched.groups()) >= STRICT_RAY_AGENT_VERSION
 QUANTIZATIONS = {"awq", "gptq", "fp8", "fp16", "bf16", "int8"}
 GPU_ARCHITECTURES = {"ampere", "ada", "hopper", "blackwell"}
 TOPOLOGIES = {"single-gpu", "pipeline"}
@@ -103,9 +126,24 @@ BENCHMARK_RESULT_METRIC_FIELDS = {
     "packet_loss_pct",
     "nccl_all_reduce_ok",
 }
+ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
+MAX_ARTIFACT_MANIFEST_FILES = 100_000
+MAX_ARTIFACT_MANIFEST_CHUNKS = 1_000_000
+MAX_ARTIFACT_PATH_LENGTH = 1024
+MAX_ARTIFACT_FILE_BYTES = 1 << 50
+MAX_ARTIFACT_TOTAL_BYTES = 1 << 50
+_ARTIFACT_CHUNK_BATCH_SIZE = 200
 
 
 class RegistryConflictError(ValueError):
+    pass
+
+
+class ArtifactManifestNotFoundError(ValueError):
+    pass
+
+
+class ArtifactManifestConflictError(ValueError):
     pass
 
 
@@ -137,6 +175,100 @@ def audit(session: Session, actor: str, action: str, target: str | None, outcome
 def _require_digest(value: str, *, field: str) -> None:
     if re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
         raise ValueError(f"{field} must be an immutable sha256 digest")
+
+
+def _canonical_artifact_manifest(
+    manifest: dict,
+) -> tuple[dict, str, str, int, int, int]:
+    return parse_canonical_artifact_manifest(
+        manifest,
+        limits=ArtifactManifestLimits(
+            max_files=MAX_ARTIFACT_MANIFEST_FILES,
+            max_chunks=MAX_ARTIFACT_MANIFEST_CHUNKS,
+            max_path_length=MAX_ARTIFACT_PATH_LENGTH,
+            max_file_bytes=MAX_ARTIFACT_FILE_BYTES,
+            max_total_bytes=MAX_ARTIFACT_TOTAL_BYTES,
+        ),
+    )
+
+
+def canonical_artifact_manifest_digest(manifest: dict) -> str:
+    return _canonical_artifact_manifest(manifest)[2]
+
+
+def _artifact_chunks_by_digest(
+    session: Session,
+    digests: list[str],
+) -> dict[str, ArtifactChunk]:
+    records: dict[str, ArtifactChunk] = {}
+    for start in range(0, len(digests), _ARTIFACT_CHUNK_BATCH_SIZE):
+        batch = digests[start : start + _ARTIFACT_CHUNK_BATCH_SIZE]
+        records.update(
+            {
+                record.digest: record
+                for record in session.scalars(
+                    select(ArtifactChunk).where(ArtifactChunk.digest.in_(batch))
+                )
+            }
+        )
+    return records
+
+
+def _ensure_artifact_chunks(
+    session: Session,
+    chunk_sizes: dict[str, int],
+) -> None:
+    digests = sorted(chunk_sizes)
+    stored = _artifact_chunks_by_digest(session, digests)
+    for digest, record in stored.items():
+        if record.size_bytes != chunk_sizes[digest]:
+            raise ArtifactManifestConflictError(
+                "stored chunk digest has a different immutable size"
+            )
+
+    missing = [digest for digest in digests if digest not in stored]
+    dialect = session.get_bind().dialect.name
+    for start in range(0, len(missing), _ARTIFACT_CHUNK_BATCH_SIZE):
+        batch = missing[start : start + _ARTIFACT_CHUNK_BATCH_SIZE]
+        values = [
+            {
+                "digest": digest,
+                "size_bytes": chunk_sizes[digest],
+                "created_at": utcnow(),
+            }
+            for digest in batch
+        ]
+        if dialect == "postgresql":
+            statement = postgresql_insert(ArtifactChunk).values(values)
+            session.execute(
+                statement.on_conflict_do_nothing(index_elements=["digest"])
+            )
+        elif dialect == "sqlite":
+            statement = sqlite_insert(ArtifactChunk).values(values)
+            session.execute(
+                statement.on_conflict_do_nothing(index_elements=["digest"])
+            )
+        else:  # pragma: no cover - production and development use PostgreSQL/SQLite
+            for value in values:
+                try:
+                    with session.begin_nested():
+                        session.add(ArtifactChunk(**value))
+                        session.flush()
+                except IntegrityError:
+                    pass
+
+    stored = _artifact_chunks_by_digest(session, digests)
+    if set(stored) != set(digests):
+        raise ArtifactManifestConflictError(
+            "artifact chunk registry is incomplete after registration"
+        )
+    if any(
+        stored[digest].size_bytes != size_bytes
+        for digest, size_bytes in chunk_sizes.items()
+    ):
+        raise ArtifactManifestConflictError(
+            "stored chunk digest has a different immutable size"
+        )
 
 
 def create_model_artifact(
@@ -201,6 +333,260 @@ def create_model_artifact(
     return record
 
 
+def _artifact_manifest_record_matches(
+    record: ArtifactManifest,
+    *,
+    artifact_id: str | None,
+    canonical_json: str,
+    total_size_bytes: int,
+    file_count: int,
+    chunk_count: int,
+) -> bool:
+    return (
+        record.model_artifact_id == artifact_id
+        and record.schema_version == ARTIFACT_MANIFEST_SCHEMA_VERSION
+        and record.canonical_json == canonical_json
+        and record.total_size_bytes == total_size_bytes
+        and record.file_count == file_count
+        and record.chunk_count == chunk_count
+    )
+
+
+def register_artifact_manifest(
+    session: Session,
+    *,
+    artifact_id: str,
+    manifest: dict,
+    commit: bool = True,
+) -> tuple[ArtifactManifest, bool]:
+    artifact = session.get(ModelArtifact, artifact_id)
+    if artifact is None:
+        raise ArtifactManifestNotFoundError("model artifact not found")
+    (
+        canonical,
+        canonical_json,
+        digest,
+        total_size_bytes,
+        file_count,
+        chunk_count,
+    ) = _canonical_artifact_manifest(manifest)
+    if artifact.manifest_digest != digest:
+        raise ArtifactManifestConflictError(
+            "canonical manifest digest does not match the model artifact"
+        )
+
+    def existing_is_exact(record: ArtifactManifest) -> bool:
+        if not _artifact_manifest_record_matches(
+            record,
+            artifact_id=artifact.id,
+            canonical_json=canonical_json,
+            total_size_bytes=total_size_bytes,
+            file_count=file_count,
+            chunk_count=chunk_count,
+        ):
+            return False
+        try:
+            stored = artifact_manifest_dict(session, record)
+        except ArtifactManifestConflictError:
+            return False
+        return (
+            stored["schema_version"] == canonical["schema_version"]
+            and stored["files"] == canonical["files"]
+        )
+
+    existing = session.get(ArtifactManifest, digest)
+    if existing is not None:
+        if existing_is_exact(existing):
+            return existing, False
+        raise ArtifactManifestConflictError(
+            "manifest digest is already bound to different immutable content"
+        )
+    artifact_manifest = session.scalar(
+        select(ArtifactManifest).where(
+            ArtifactManifest.model_artifact_id == artifact.id
+        )
+    )
+    if artifact_manifest is not None:
+        raise ArtifactManifestConflictError(
+            "model artifact is already bound to a different manifest"
+        )
+
+    chunk_sizes: dict[str, int] = {}
+    for file_item in canonical["files"]:
+        for chunk_item in file_item["chunks"]:
+            chunk_sizes[chunk_item["sha256"]] = chunk_item["length_bytes"]
+    record = ArtifactManifest(
+        digest=digest,
+        schema_version=ARTIFACT_MANIFEST_SCHEMA_VERSION,
+        model_artifact_id=artifact.id,
+        total_size_bytes=total_size_bytes,
+        file_count=file_count,
+        chunk_count=chunk_count,
+        canonical_json=canonical_json,
+    )
+    file_records: list[ArtifactManifestFile] = []
+    link_records: list[ArtifactFileChunk] = []
+    for file_ordinal, file_item in enumerate(canonical["files"]):
+        file_id = str(uuid.uuid4())
+        file_records.append(
+            ArtifactManifestFile(
+                id=file_id,
+                manifest_digest=digest,
+                ordinal=file_ordinal,
+                path=file_item["path"],
+                kind=file_item["kind"],
+                size_bytes=file_item["size_bytes"],
+                file_digest=file_item["sha256"],
+            )
+        )
+        link_records.extend(
+            ArtifactFileChunk(
+                file_id=file_id,
+                ordinal=chunk_item["ordinal"],
+                chunk_digest=chunk_item["sha256"],
+                offset_bytes=chunk_item["offset_bytes"],
+                length_bytes=chunk_item["length_bytes"],
+            )
+            for chunk_item in file_item["chunks"]
+        )
+
+    try:
+        with session.begin_nested():
+            _ensure_artifact_chunks(session, chunk_sizes)
+            session.add(record)
+            session.flush()
+            session.add_all(file_records)
+            session.flush()
+            session.add_all(link_records)
+            session.flush()
+    except IntegrityError as exc:
+        session.expire_all()
+        existing = session.get(ArtifactManifest, digest)
+        if existing is not None and existing_is_exact(existing):
+            return existing, False
+        raise ArtifactManifestConflictError(
+            "artifact manifest registration conflicts with immutable registry data"
+        ) from exc
+    if commit:
+        session.commit()
+    return record, True
+
+
+def get_artifact_manifest(
+    session: Session,
+    artifact_id: str,
+) -> ArtifactManifest | None:
+    if session.get(ModelArtifact, artifact_id) is None:
+        raise ArtifactManifestNotFoundError("model artifact not found")
+    return session.scalar(
+        select(ArtifactManifest).where(
+            ArtifactManifest.model_artifact_id == artifact_id
+        )
+    )
+
+
+def artifact_manifest_dict(
+    session: Session,
+    record: ArtifactManifest,
+) -> dict:
+    files = list(
+        session.scalars(
+            select(ArtifactManifestFile)
+            .where(ArtifactManifestFile.manifest_digest == record.digest)
+            .order_by(ArtifactManifestFile.ordinal, ArtifactManifestFile.id)
+        )
+    )
+    link_rows = list(
+        session.execute(
+            select(ArtifactFileChunk, ArtifactChunk.size_bytes)
+            .join(
+                ArtifactManifestFile,
+                ArtifactManifestFile.id == ArtifactFileChunk.file_id,
+            )
+            .outerjoin(
+                ArtifactChunk,
+                ArtifactChunk.digest == ArtifactFileChunk.chunk_digest,
+            )
+            .where(ArtifactManifestFile.manifest_digest == record.digest)
+            .order_by(
+                ArtifactManifestFile.ordinal,
+                ArtifactFileChunk.ordinal,
+            )
+        )
+    )
+    links_by_file: dict[str, list[ArtifactFileChunk]] = {
+        item.id: [] for item in files
+    }
+    invalid_chunk_link = False
+    for link, stored_size in link_rows:
+        if link.file_id not in links_by_file:
+            invalid_chunk_link = True
+            continue
+        links_by_file[link.file_id].append(link)
+        if stored_size is None or stored_size != link.length_bytes:
+            invalid_chunk_link = True
+    manifest = {
+        "schema_version": record.schema_version,
+        "files": [
+            {
+                "path": file_record.path,
+                "kind": file_record.kind,
+                "size_bytes": file_record.size_bytes,
+                "sha256": file_record.file_digest,
+                "chunks": [
+                    {
+                        "ordinal": link.ordinal,
+                        "offset_bytes": link.offset_bytes,
+                        "length_bytes": link.length_bytes,
+                        "sha256": link.chunk_digest,
+                    }
+                    for link in links_by_file[file_record.id]
+                ],
+            }
+            for file_record in files
+        ],
+    }
+    try:
+        (
+            canonical,
+            canonical_json,
+            digest,
+            total_size_bytes,
+            file_count,
+            chunk_count,
+        ) = _canonical_artifact_manifest(manifest)
+    except ValueError as exc:
+        raise ArtifactManifestConflictError(
+            "stored artifact manifest is internally inconsistent"
+        ) from exc
+    files_have_valid_ordinals = all(
+        file_record.ordinal == ordinal
+        for ordinal, file_record in enumerate(files)
+    )
+    if not files_have_valid_ordinals or invalid_chunk_link or not _artifact_manifest_record_matches(
+        record,
+        artifact_id=record.model_artifact_id,
+        canonical_json=canonical_json,
+        total_size_bytes=total_size_bytes,
+        file_count=file_count,
+        chunk_count=chunk_count,
+    ) or digest != record.digest:
+        raise ArtifactManifestConflictError(
+            "stored artifact manifest is internally inconsistent"
+        )
+    created_at = aware(record.created_at)
+    return {
+        "digest": record.digest,
+        "model_artifact_id": record.model_artifact_id,
+        "schema_version": canonical["schema_version"],
+        "total_size_bytes": record.total_size_bytes,
+        "file_count": record.file_count,
+        "chunk_count": record.chunk_count,
+        "files": canonical["files"],
+        "created_at": created_at.isoformat() if created_at is not None else None,
+    }
+
+
 def create_runtime_release(
     session: Session,
     *,
@@ -210,13 +596,10 @@ def create_runtime_release(
     cuda_version: str,
     gpu_architectures: list[str],
 ) -> RuntimeRelease:
-    if (
-        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}", image)
-        is None
-        or "/../" in image
-        or "//" in image
-    ):
-        raise ValueError("runtime image must be OCI digest-pinned")
+    try:
+        validate_digest_pinned_runtime_image(image)
+    except ValueError:
+        raise ValueError("runtime image must be OCI digest-pinned") from None
     if not all(isinstance(item, str) for item in gpu_architectures):
         raise ValueError("unsupported GPU architecture")
     normalized_architectures = sorted(set(gpu_architectures))
@@ -509,7 +892,9 @@ def approve_node(session: Session, node_id: str) -> bool:
 
 
 def revoke_node(session: Session, node_id: str) -> bool:
-    node = session.get(Node, node_id)
+    node = session.scalar(
+        select(Node).where(Node.id == node_id).with_for_update()
+    )
     if node is None:
         return False
     node.approved = False
@@ -518,7 +903,20 @@ def revoke_node(session: Session, node_id: str) -> bool:
         select(NodeCredential).where(NodeCredential.node_id == node_id, NodeCredential.revoked_at.is_(None))
     ):
         credential.revoked_at = now
-    audit(session, "admin", "node.revoke", node_id, "success")
+    from .preparation import revoke_preparation_tasks_for_node
+
+    canceled_preparations = revoke_preparation_tasks_for_node(
+        session, node_id
+    )
+    node.desired_state = None
+    audit(
+        session,
+        "admin",
+        "node.revoke",
+        node_id,
+        "success",
+        canceled_preparation_tasks=canceled_preparations,
+    )
     session.commit()
     return True
 
@@ -580,7 +978,18 @@ def save_deployment(
     session: Session, plan_data: dict, *, accept_model_download: bool, pull_image: bool
 ) -> Deployment:
     plan = DeploymentPlan.from_dict(plan_data)
-    if "@sha256:" not in plan.image:
+    strict_ray = plan.execution_backend == VLLM_RAY_PP_BACKEND
+    if strict_ray:
+        validate_strict_pipeline_plan(
+            plan, require_manifest_cache_path=False
+        )
+        try:
+            validate_digest_pinned_runtime_image(plan.image)
+        except ValueError as exc:
+            raise ValueError(
+                "strict Ray deployments require an exact OCI digest-pinned image"
+            ) from exc
+    elif "@sha256:" not in plan.image:
         raise ValueError("central deployments require an OCI digest-pinned image")
     if not plan.assignments:
         raise ValueError("deployment has no assignments")
@@ -589,11 +998,19 @@ def save_deployment(
     for assignment in plan.assignments:
         if session.get(Node, assignment.node_id) is not None:
             continue
+        if strict_ray:
+            raise ValueError(
+                "strict Ray deployment assignments require server-issued node UUIDs"
+            )
         matches = list(session.scalars(select(Node).where(Node.hostname == assignment.node_id, Node.approved.is_(True))))
         if len(matches) != 1:
             raise ValueError(f"unknown or ambiguous node assignment: {assignment.node_id}")
         assignment.node_id = matches[0].id
     if plan.ray_head_node_id not in {item.node_id for item in plan.assignments}:
+        if strict_ray:
+            raise ValueError(
+                "strict Ray deployment head requires a server-issued node UUID"
+            )
         head = next((item for item in plan.assignments if item.role == "ray-head"), None)
         if head is None:
             raise ValueError("deployment has no Ray head assignment")
@@ -962,6 +1379,43 @@ def apply_benchmark_run(
             )
         return run, task, False
 
+    active_task = session.scalar(
+        select(Task)
+        .where(
+            Task.node_id == locked_node.id,
+            Task.type.in_(NODE_EXCLUSIVE_TASK_TYPE_VALUES),
+            Task.status.in_(
+                {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+            ),
+        )
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    )
+    if active_task is not None:
+        raise BenchmarkRunError(
+            "benchmark coordinator node already has active work",
+            code="BENCHMARK_NODE_BUSY",
+            details={
+                "node_id": locked_node.id,
+                "task_id": active_task.id,
+                "task_type": active_task.type,
+            },
+        )
+    for operation in session.scalars(
+        select(DeploymentOperation).where(
+            DeploymentOperation.active_lineage_id.is_not(None)
+        )
+    ):
+        if locked_node.id in operation.node_ids:
+            raise BenchmarkRunError(
+                "benchmark coordinator node belongs to an active deployment operation",
+                code="BENCHMARK_NODE_BUSY",
+                details={
+                    "node_id": locked_node.id,
+                    "operation_id": operation.id,
+                },
+            )
+
     _require_single_node_benchmark(
         session,
         release_id=run.release_id,
@@ -1206,11 +1660,11 @@ def _lock_benchmark_terminal(
         .where(ModelRelease.id == release_id)
         .with_for_update()
     )
-    if release is None:
-        return None, None, None
     node = session.scalar(
         select(Node).where(Node.id == node_id).with_for_update()
     )
+    if release is None:
+        return node, None, None
     task = session.scalar(
         select(Task)
         .where(Task.id == task_id)
@@ -1409,8 +1863,15 @@ DEPLOYMENT_MUTATION_TASK_TYPES = {
     TaskType.START_DEPLOYMENT.value,
     TaskType.STOP_DEPLOYMENT.value,
     TaskType.RESTART_DEPLOYMENT.value,
+    TaskType.PREPARE_MODEL.value,
+    TaskType.PREPARE_IMAGE.value,
 }
 DEPLOYMENT_TASK_TYPE_VALUES = {item.value for item in DEPLOYMENT_TASK_TYPES}
+NODE_EXCLUSIVE_TASK_TYPE_VALUES = DEPLOYMENT_TASK_TYPE_VALUES | {
+    TaskType.BENCHMARK.value,
+    TaskType.PREPARE_MODEL.value,
+    TaskType.PREPARE_IMAGE.value,
+}
 
 
 def _validate_task_options(task_type: TaskType, options: dict) -> None:
@@ -1533,7 +1994,7 @@ def _ensure_deployment_node_scope_available(
         select(Task.id, Task.node_id)
         .where(
             Task.node_id.in_(requested),
-            Task.type.in_(DEPLOYMENT_TASK_TYPE_VALUES),
+            Task.type.in_(NODE_EXCLUSIVE_TASK_TYPE_VALUES),
             Task.status.in_(
                 {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
             ),
@@ -1572,6 +2033,10 @@ def create_tasks(
         raise ValueError(
             "BENCHMARK tasks require a prepared benchmark run and explicit apply"
         )
+    if task_type in {TaskType.PREPARE_MODEL, TaskType.PREPARE_IMAGE}:
+        raise ValueError(
+            "artifact preparation tasks require the dedicated deployment prepare API"
+        )
     _validate_task_options(task_type, options)
     try:
         bulk_id = str(uuid.uuid4())
@@ -1586,11 +2051,99 @@ def create_tasks(
         if deployment is not None and task_type in DEPLOYMENT_TASK_TYPES:
             _lock_deployment_lineage_for_task_creation(session, deployment)
             _ensure_deployment_node_scope_available(session, node_ids)
+        effective_plan = deployment.plan if deployment is not None else None
+        if deployment is not None and deployment.source_recommendation_id is not None:
+            from .preparation import effective_deployment_plan
+
+            effective_plan = effective_deployment_plan(
+                session,
+                deployment,
+                require_prepared=task_type != TaskType.STOP_DEPLOYMENT,
+            )
         assignments = (
-            {item["node_id"] for item in deployment.plan["assignments"]}
-            if deployment
+            {item["node_id"] for item in effective_plan["assignments"]}
+            if effective_plan
             else set()
         )
+        strict_ray = False
+        if type(effective_plan) is dict and "execution_backend" in effective_plan:
+            if effective_plan.get("execution_backend") != VLLM_RAY_PP_BACKEND:
+                raise DeploymentRolloutConflictError(
+                    "deployment execution backend is not supported",
+                    code="DEPLOYMENT_PLAN_INVALID",
+                )
+            try:
+                strict_plan = DeploymentPlan.from_dict(effective_plan)
+                validate_strict_pipeline_plan(
+                    strict_plan,
+                    require_manifest_cache_path=(
+                        task_type != TaskType.STOP_DEPLOYMENT
+                    ),
+                    validate_model_path=(
+                        task_type != TaskType.STOP_DEPLOYMENT
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment contract is invalid",
+                    code="DEPLOYMENT_PLAN_INVALID",
+                ) from exc
+            strict_ray = True
+        if strict_ray:
+            requested = set(dict.fromkeys(node_ids))
+            if (
+                task_type
+                in {
+                    TaskType.APPLY_DEPLOYMENT,
+                    TaskType.START_DEPLOYMENT,
+                    TaskType.RESTART_DEPLOYMENT,
+                }
+                and options.get("serve") is not True
+            ) or (
+                task_type == TaskType.VERIFY
+                and options.get("api") is not True
+            ):
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment operations require live vLLM API verification",
+                    code="DEPLOYMENT_STRICT_RUNTIME_ATTESTATION_REQUIRED",
+                )
+            if task_type != TaskType.STOP_DEPLOYMENT and (
+                requested != assignments or len(node_ids) != len(requested)
+            ):
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment operation requires the complete assigned node set",
+                    code="DEPLOYMENT_STRICT_NODE_SET_MISMATCH",
+                    details={
+                        "expected_node_ids": sorted(assignments),
+                        "requested_node_ids": sorted(requested),
+                    },
+                )
+            unavailable = sorted(
+                node_id
+                for node_id in requested
+                if (node := locked_nodes.get(node_id)) is None
+                or not node.approved
+                or node_status(node.last_seen, utcnow()) != "online"
+            )
+            if task_type != TaskType.STOP_DEPLOYMENT and unavailable:
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment requires every assigned node to be approved and online",
+                    code="DEPLOYMENT_STRICT_NODE_UNAVAILABLE",
+                    details={"node_ids": unavailable},
+                )
+            unsupported = sorted(
+                node_id
+                for node_id in requested
+                if (node := locked_nodes.get(node_id)) is not None
+                and node.approved
+                and not _agent_supports_strict_ray(node.agent_version)
+            )
+            if unsupported:
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment requires Dure Agent 0.3.18 or newer",
+                    code="DEPLOYMENT_STRICT_AGENT_TOO_OLD",
+                    details={"node_ids": unsupported},
+                )
         for node_id in dict.fromkeys(node_ids):
             node = locked_nodes.get(node_id)
             if node is None or not node.approved:
@@ -1602,10 +2155,18 @@ def create_tasks(
             payload = dict(options)
             if deployment is not None:
                 payload.update(
-                    plan=deployment.plan,
+                    plan=effective_plan,
                     generation=deployment.generation,
-                    accept_model_download=deployment.accept_model_download,
-                    pull_image=deployment.pull_image,
+                    accept_model_download=(
+                        deployment.accept_model_download
+                        if deployment.source_recommendation_id is None
+                        else False
+                    ),
+                    pull_image=(
+                        deployment.pull_image
+                        if deployment.source_recommendation_id is None
+                        else False
+                    ),
                 )
             task = Task(
                 bulk_id=bulk_id,
@@ -1692,11 +2253,31 @@ def claim_task(session: Session, node_id: str, lease_seconds: int = 300) -> Task
                 raise _operation_hook_conflict("expired", task.id)
             session.commit()
             return None
+        if (
+            task.status == TaskStatus.RUNNING.value
+            and task.type
+            in {TaskType.PREPARE_MODEL.value, TaskType.PREPARE_IMAGE.value}
+        ):
+            from .preparation import expire_preparation_task
+
+            if not expire_preparation_task(session, task, node_id):
+                session.rollback()
+                return None
+            session.commit()
+            return None
         task.status = TaskStatus.RUNNING.value
         task.attempts += 1
         task.lease_until = now + timedelta(seconds=lease_seconds)
         if not claim_operation_task(session, task, node_id):
             raise _operation_hook_conflict("claimed", task.id)
+        if task.type in {
+            TaskType.PREPARE_MODEL.value,
+            TaskType.PREPARE_IMAGE.value,
+        }:
+            from .preparation import claim_preparation_task
+
+            if not claim_preparation_task(session, task, node_id):
+                raise ValueError("preparation-bound task cannot be claimed")
         session.commit()
         return task
     except Exception:
@@ -1749,6 +2330,17 @@ def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int =
             ):
                 session.rollback()
                 return False
+        if locked_task.type in {
+            TaskType.PREPARE_MODEL.value,
+            TaskType.PREPARE_IMAGE.value,
+        }:
+            from .preparation import extend_preparation_task
+
+            if not node.approved or not extend_preparation_task(
+                session, locked_task, node_id
+            ):
+                session.rollback()
+                return False
         locked_task.lease_until = now + timedelta(seconds=lease_seconds)
         node.last_seen = now
         session.commit()
@@ -1763,6 +2355,31 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
         return False
     if task.node_id != node_id:
         return False
+    if task.type in {
+        TaskType.PREPARE_MODEL.value,
+        TaskType.PREPARE_IMAGE.value,
+    }:
+        from .preparation import finish_preparation_task
+
+        try:
+            accepted, _preparation = finish_preparation_task(
+                session,
+                task,
+                node_id,
+                result=result,
+                error=error,
+            )
+            if not accepted:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+        except Exception as exc:
+            if getattr(exc, "code", None) == "PREPARATION_RESULT_REJECTED":
+                session.commit()
+            else:
+                session.rollback()
+            raise
     if task.operation_node_id is not None or task.operation_attempt is not None:
         try:
             locked_node = session.scalar(
@@ -1792,9 +2409,25 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
             return True
         if task.status != TaskStatus.RUNNING.value:
             return False
-        task.status = TaskStatus.FAILED.value if error else TaskStatus.SUCCEEDED.value
-        task.result = result
-        task.error = error
+        terminal_error = error
+        terminal_result = result
+        plan = task.payload.get("plan") if type(task.payload) is dict else None
+        if (
+            terminal_error is None
+            and task.type in DEPLOYMENT_TASK_TYPE_VALUES
+            and type(plan) is dict
+            and plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+            and not valid_deployment_task_success_result(task, result)
+        ):
+            terminal_error = "TASK_RESULT_INVALID"
+            terminal_result = None
+        task.status = (
+            TaskStatus.FAILED.value
+            if terminal_error is not None
+            else TaskStatus.SUCCEEDED.value
+        )
+        task.result = terminal_result
+        task.error = terminal_error
         task.lease_until = None
         node = session.get(Node, node_id)
         if node is not None:
@@ -1833,6 +2466,31 @@ def cancel_task(session: Session, task: Task) -> bool:
     ).one_or_none()
     if identity is None:
         return False
+    if identity.type in {
+        TaskType.PREPARE_MODEL.value,
+        TaskType.PREPARE_IMAGE.value,
+    }:
+        from .preparation import cancel_preparation_task
+
+        try:
+            locked_node = session.scalar(
+                select(Node)
+                .where(Node.id == identity.node_id)
+                .with_for_update()
+            )
+            if locked_node is None:
+                session.rollback()
+                return False
+            accepted = cancel_preparation_task(session, task)
+            if not accepted:
+                session.rollback()
+                return False
+            audit(session, "admin", "task.cancel", task.id, "success")
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
     if (
         identity.operation_node_id is not None
         or identity.operation_attempt is not None

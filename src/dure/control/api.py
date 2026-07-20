@@ -6,7 +6,9 @@ from datetime import timedelta
 from functools import partial
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -46,12 +48,19 @@ from .models import (
     utcnow,
 )
 from .service import (
+    MAX_ARTIFACT_FILE_BYTES,
+    MAX_ARTIFACT_MANIFEST_CHUNKS,
+    MAX_ARTIFACT_MANIFEST_FILES,
+    MAX_ARTIFACT_PATH_LENGTH,
+    ArtifactManifestConflictError,
+    ArtifactManifestNotFoundError,
     BENCHMARK_TASK_FAILURE_CODES,
     BenchmarkRunError,
     BenchmarkRunNotFoundError,
     authenticate_node,
     apply_benchmark_run,
     approve_node,
+    artifact_manifest_dict,
     benchmark_run_dict,
     cancel_task,
     claim_enrollment,
@@ -65,6 +74,7 @@ from .service import (
     fail_benchmark_task,
     finish_task,
     get_benchmark_run,
+    get_artifact_manifest,
     join_node,
     node_status,
     revoke_node,
@@ -74,6 +84,7 @@ from .service import (
     add_placement_profile,
     RegistryConflictError,
     prepare_benchmark_run,
+    register_artifact_manifest,
     complete_benchmark_task,
     transition_model_release,
 )
@@ -84,6 +95,25 @@ from .recommendation import (
     accept_deployment_recommendation,
     recommend_deployment,
     show_deployment_recommendation,
+)
+from .preparation import (
+    ArtifactPreparationError,
+    ArtifactPreparationNotFoundError,
+    artifact_preparation_detail,
+    get_artifact_preparation,
+    manifest_for_preparation_task,
+    prepare_deployment_artifacts,
+)
+from .stage_artifacts import (
+    StageArtifactConflictError,
+    StageArtifactNotFoundError,
+    get_stage_artifact_variant,
+    list_stage_artifact_variants,
+    register_stage_artifact_evidence,
+    register_stage_artifact_variant,
+    stage_artifact_evidence_dict,
+    stage_artifact_variant_dict,
+    transition_stage_artifact_variant,
 )
 from .rollout import (
     DeploymentRolloutError,
@@ -162,6 +192,110 @@ class ModelArtifactCreate(StrictBody):
     license_id: str
 
 
+class ArtifactManifestChunkCreate(StrictBody):
+    ordinal: int = Field(ge=0, lt=MAX_ARTIFACT_MANIFEST_CHUNKS)
+    offset_bytes: int = Field(ge=0, le=MAX_ARTIFACT_FILE_BYTES)
+    length_bytes: int = Field(gt=0, le=MAX_ARTIFACT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class ArtifactManifestFileCreate(StrictBody):
+    path: str = Field(min_length=1, max_length=MAX_ARTIFACT_PATH_LENGTH)
+    kind: Literal["REGULAR"]
+    size_bytes: int = Field(ge=0, le=MAX_ARTIFACT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    chunks: list[ArtifactManifestChunkCreate] = Field(
+        max_length=MAX_ARTIFACT_MANIFEST_CHUNKS
+    )
+
+
+class ArtifactManifestCreate(StrictBody):
+    schema_version: Literal[1]
+    files: list[ArtifactManifestFileCreate] = Field(
+        min_length=1,
+        max_length=MAX_ARTIFACT_MANIFEST_FILES,
+    )
+
+
+class StageArtifactCreateStage(StrictBody):
+    pipeline_rank: int = Field(ge=0, lt=64)
+    tensor_rank: int = Field(ge=0, lt=64)
+    manifest_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    tensor_key_count: int = Field(gt=0)
+    tensor_keys_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    weight_size_bytes: int = Field(gt=0)
+    manifest: ArtifactManifestCreate
+
+
+class StageArtifactVariantCreate(StrictBody):
+    source_manifest_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    runtime_image: str = Field(min_length=73, max_length=512)
+    vllm_version: Literal["0.9.0"]
+    exporter_build_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    architecture: Literal["Qwen2ForCausalLM"]
+    quantization: Literal["awq"]
+    tensor_parallel_size: Literal[1]
+    pipeline_parallel_size: int = Field(ge=1, le=64)
+    loader_format: Literal["VLLM_SHARDED_STATE_V1"]
+    stages: list[StageArtifactCreateStage] = Field(min_length=1, max_length=64)
+
+
+class StageArtifactEvidenceRankCreate(StrictBody):
+    pipeline_rank: int = Field(ge=0, lt=64)
+    tensor_rank: int = Field(ge=0, lt=64)
+    manifest_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    tensor_keys_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    loaded_tensor_count: int = Field(gt=0)
+    loaded_weight_size_bytes: int = Field(gt=0)
+
+
+class StageArtifactEvidenceCreate(StrictBody):
+    schema_version: Literal[1]
+    variant_identity_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    validation_run_id: str = Field(
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        )
+    )
+    kind: Literal["SYNTHETIC", "GPU_EXPORT_LOAD"]
+    status: Literal["PASSED", "FAILED", "NOT_RUN"]
+    validator_version: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$",
+    )
+    validator_build_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    failure_code: Literal[
+        "STAGE_EXPORT_FAILED",
+        "STAGE_LOAD_FAILED",
+        "STAGE_TENSOR_COVERAGE_INVALID",
+        "STAGE_MANIFEST_MISMATCH",
+        "STAGE_TOPOLOGY_MISMATCH",
+        "STAGE_GPU_NOT_AVAILABLE",
+        "STAGE_VALIDATION_NOT_RUN",
+    ] | None = None
+    ranks: list[StageArtifactEvidenceRankCreate] = Field(max_length=64)
+
+    @model_validator(mode="after")
+    def validate_result_shape(self):
+        if self.status == "PASSED":
+            if self.failure_code is not None or not self.ranks:
+                raise ValueError("PASSED evidence requires ranks and no failure code")
+        elif self.failure_code is None:
+            raise ValueError("non-passing evidence requires a failure code")
+        if self.status == "NOT_RUN" and self.failure_code not in {
+            "STAGE_GPU_NOT_AVAILABLE",
+            "STAGE_VALIDATION_NOT_RUN",
+        }:
+            raise ValueError("NOT_RUN evidence requires a not-run failure code")
+        return self
+
+
+class StageArtifactVariantTransition(StrictBody):
+    status: Literal["DRAFT", "VALIDATED", "REVOKED"]
+
+
 class RuntimeReleaseCreate(StrictBody):
     version: str
     image: str
@@ -229,6 +363,20 @@ class DeploymentRollback(StrictBody):
     node_ids: list[str] = Field(min_length=1, max_length=64)
     apply: StrictBool = False
     serve: StrictBool = False
+
+
+class DeploymentPreparationRequest(StrictBody):
+    request_id: str
+    apply: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_request_id(self):
+        try:
+            if str(uuid.UUID(self.request_id)) != self.request_id:
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("request_id must be a canonical UUID") from exc
+        return self
 
 
 class BenchmarkContextRequest(StrictBody):
@@ -396,6 +544,10 @@ def _rollout_error_detail(exc: DeploymentRolloutError) -> dict:
     }
 
 
+def _preparation_error_detail(exc: ArtifactPreparationError) -> dict:
+    return exc.to_detail()
+
+
 def _task_dict(task: Task) -> dict:
     return {
         "id": task.id,
@@ -554,6 +706,24 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     expected_admin = admin_token or os.environ.get("DURE_ADMIN_TOKEN")
     get_session = partial(session_dependency, factory)
 
+    @app.exception_handler(RequestValidationError)
+    async def closed_request_validation_error(
+        _request: Request,
+        _error: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "detail": [
+                    {
+                        "type": "request_validation",
+                        "loc": ["request"],
+                        "msg": "Request does not match the closed schema",
+                    }
+                ]
+            },
+        )
+
     def admin_auth(authorization: str | None = Header(default=None)) -> str:
         supplied = _bearer(authorization)
         if not expected_admin or not __import__("hmac").compare_digest(supplied, expected_admin):
@@ -624,6 +794,31 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be extended")
         return {"ok": True, "lease_until": task.lease_until}
 
+    @app.get("/v1/agent/tasks/{task_id}/artifact-manifest")
+    def agent_task_artifact_manifest(
+        task_id: str,
+        node: Node = Depends(node_auth),
+        session: Session = Depends(get_session),
+    ):
+        if not node.approved:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "PREPARATION_MANIFEST_UNAVAILABLE",
+                    "message": "preparation manifest is unavailable",
+                    "details": {},
+                },
+            )
+        try:
+            manifest = manifest_for_preparation_task(
+                session, task_id, node.id
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        return {"manifest": manifest}
+
     @app.post("/v1/agent/tasks/{task_id}/complete")
     def agent_task_complete(task_id: str, body: TaskComplete, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         task = session.get(Task, task_id)
@@ -656,7 +851,16 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 "ok": True,
                 "benchmark_run": benchmark_run_dict(run) if run else None,
             }
-        if not finish_task(session, task, node.id, result=body.result, error=None):
+        try:
+            accepted = finish_task(
+                session, task, node.id, result=body.result, error=None
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                _preparation_error_detail(exc),
+            ) from exc
+        if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be completed")
         return {"ok": True}
 
@@ -688,7 +892,16 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 "ok": True,
                 "benchmark_run": benchmark_run_dict(run) if run else None,
             }
-        if not finish_task(session, task, node.id, result=None, error=body.error):
+        try:
+            accepted = finish_task(
+                session, task, node.id, result=None, error=body.error
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _preparation_error_detail(exc),
+            ) from exc
+        if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be failed")
         return {"ok": True}
 
@@ -748,7 +961,13 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
 
     @app.post("/v1/admin/nodes/{node_id}/revoke", dependencies=[Depends(admin_auth)])
     def node_revoke(node_id: str, session: Session = Depends(get_session)):
-        if not revoke_node(session, node_id):
+        try:
+            revoked = revoke_node(session, node_id)
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        if not revoked:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
         return {"ok": True}
 
@@ -776,6 +995,167 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"artifact": _artifact_dict(record)}
+
+    @app.post(
+        "/v1/admin/model-artifacts/{artifact_id}/manifest",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_manifest_register(
+        artifact_id: str,
+        body: ArtifactManifestCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record, created = register_artifact_manifest(
+                session,
+                artifact_id=artifact_id,
+                manifest=body.model_dump(),
+                commit=False,
+            )
+            value = artifact_manifest_dict(session, record)
+            session.commit()
+        except ArtifactManifestNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except ArtifactManifestConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                str(exc),
+            ) from exc
+        return {"manifest": value, "created": created}
+
+    @app.get(
+        "/v1/admin/model-artifacts/{artifact_id}/manifest",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_manifest_show(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record = get_artifact_manifest(session, artifact_id)
+            if record is None:
+                raise ArtifactManifestNotFoundError(
+                    "artifact manifest is not registered"
+                )
+            value = artifact_manifest_dict(session, record)
+        except ArtifactManifestNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except ArtifactManifestConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        return {"manifest": value}
+
+    @app.post(
+        "/v1/admin/stage-artifact-variants",
+        dependencies=[Depends(admin_auth)],
+    )
+    def stage_artifact_variant_create(
+        body: StageArtifactVariantCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record, created = register_stage_artifact_variant(
+                session,
+                **body.model_dump(),
+                commit=False,
+            )
+            value = stage_artifact_variant_dict(session, record)
+            session.commit()
+        except StageArtifactNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except StageArtifactConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                str(exc),
+            ) from exc
+        return {"variant": value, "created": created}
+
+    @app.get(
+        "/v1/admin/stage-artifact-variants",
+        dependencies=[Depends(admin_auth)],
+    )
+    def stage_artifact_variants(session: Session = Depends(get_session)):
+        try:
+            records = list_stage_artifact_variants(session)
+            values = [stage_artifact_variant_dict(session, item) for item in records]
+        except StageArtifactConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        return {"variants": values}
+
+    @app.get(
+        "/v1/admin/stage-artifact-variants/{artifact_set_digest}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def stage_artifact_variant_show(
+        artifact_set_digest: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record = get_stage_artifact_variant(session, artifact_set_digest)
+            value = stage_artifact_variant_dict(session, record)
+        except StageArtifactNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except StageArtifactConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        return {"variant": value}
+
+    @app.post(
+        "/v1/admin/stage-artifact-variants/{artifact_set_digest}/evidence",
+        dependencies=[Depends(admin_auth)],
+    )
+    def stage_artifact_evidence_create(
+        artifact_set_digest: str,
+        body: StageArtifactEvidenceCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record, created = register_stage_artifact_evidence(
+                session,
+                artifact_set_digest,
+                **body.model_dump(),
+                commit=False,
+            )
+            value = stage_artifact_evidence_dict(session, record)
+            session.commit()
+        except StageArtifactNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except StageArtifactConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                str(exc),
+            ) from exc
+        return {"evidence": value, "created": created}
+
+    @app.post(
+        "/v1/admin/stage-artifact-variants/{artifact_set_digest}/transition",
+        dependencies=[Depends(admin_auth)],
+    )
+    def stage_artifact_variant_transition(
+        artifact_set_digest: str,
+        body: StageArtifactVariantTransition,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record = transition_stage_artifact_variant(
+                session,
+                artifact_set_digest,
+                body.status,
+                commit=False,
+            )
+            value = stage_artifact_variant_dict(session, record)
+            session.commit()
+        except StageArtifactNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except StageArtifactConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"variant": value}
 
     @app.post("/v1/admin/runtime-releases", dependencies=[Depends(admin_auth)])
     def runtime_release_create(
@@ -1066,6 +1446,60 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"deployment": {"id": deployment.id, "generation": deployment.generation, "plan": deployment.plan}}
 
+    @app.post(
+        "/v1/admin/deployments/{deployment_id}/prepare",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_prepare(
+        deployment_id: str,
+        body: DeploymentPreparationRequest,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            preparation, tasks, changed = prepare_deployment_artifacts(
+                session,
+                deployment_id,
+                request_id=body.request_id,
+                apply=body.apply,
+            )
+        except ArtifactPreparationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _preparation_error_detail(exc)
+            ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        return {
+            "preparation": artifact_preparation_detail(
+                session, preparation
+            ),
+            "tasks": [_task_dict(task) for task in tasks],
+            "changed": changed,
+        }
+
+    @app.get(
+        "/v1/admin/deployment-preparations/{preparation_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_preparation_detail(
+        preparation_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            preparation = get_artifact_preparation(
+                session, preparation_id
+            )
+        except ArtifactPreparationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _preparation_error_detail(exc)
+            ) from exc
+        return {
+            "preparation": artifact_preparation_detail(
+                session, preparation
+            )
+        }
+
     @app.get("/v1/admin/deployments/{deployment_id}", dependencies=[Depends(admin_auth)])
     def deployment_detail(deployment_id: str, session: Session = Depends(get_session)):
         try:
@@ -1113,6 +1547,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, _rollout_error_detail(exc)
             ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
         except DeploymentRolloutError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
@@ -1136,6 +1574,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except DeploymentRolloutError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
+            ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
             ) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc

@@ -1,7 +1,53 @@
 from __future__ import annotations
 
+import ipaddress
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+from .model_cache import MODEL_CACHE_KIND_FULL_SNAPSHOT
+
+
+VLLM_RAY_PP_BACKEND = "VLLM_RAY_PP_V1"
+VLLM_RAY_PP_RUNTIME_VERSION = "0.9.0"
+_PRIVATE_IPV4_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+def canonical_private_ipv4(value: Any) -> str:
+    """Return a canonical RFC1918 IPv4 address or raise ``ValueError``."""
+    if type(value) is not str:
+        raise ValueError("runtime address must be a string")
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("runtime address must be a canonical private IPv4 address") from exc
+    if (
+        not isinstance(address, ipaddress.IPv4Address)
+        or str(address) != value
+        or not any(address in network for network in _PRIVATE_IPV4_NETWORKS)
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_reserved
+    ):
+        raise ValueError("runtime address must be a canonical private IPv4 address")
+    return str(address)
+
+
+def _canonical_uuid(value: Any, *, field_name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a canonical UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a canonical UUID") from exc
+    if str(parsed) != value:
+        raise ValueError(f"{field_name} must be a canonical UUID")
+    return value
 
 
 @dataclass
@@ -23,6 +69,7 @@ class GPUProfile:
 class NetworkProfile:
     default_interface: str | None = None
     addresses: list[str] = field(default_factory=list)
+    default_interface_addresses: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "NetworkProfile":
@@ -51,6 +98,9 @@ class InstalledModelProfile:
     quantization: str | None = None
     size_mib: int | None = None
     complete: bool = True
+    manifest_digest: str | None = None
+    cache_kind: str | None = None
+    verification_version: int | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "InstalledModelProfile":
@@ -105,7 +155,10 @@ class NodeProfile:
         return any(gpu.healthy for gpu in self.gpus)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        if not self.network.default_interface_addresses:
+            value["network"].pop("default_interface_addresses", None)
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "NodeProfile":
@@ -145,9 +198,15 @@ class NodeAssignment:
     layer_start: int
     layer_end: int
     role: str = "ray-worker"
+    expected_runtime_rank: int | None = None
+    runtime_address: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        for key in ("expected_runtime_rank", "runtime_address"):
+            if value[key] is None:
+                value.pop(key)
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "NodeAssignment":
@@ -171,6 +230,9 @@ class DeploymentPlan:
     gpu_memory_utilization: float = 0.90
     max_model_len: int = 8192
     warnings: list[str] = field(default_factory=list)
+    execution_backend: str | None = None
+    runtime_vllm_version: str | None = None
+    model_cache_kind: str | None = None
 
     @property
     def world_size(self) -> int:
@@ -179,18 +241,129 @@ class DeploymentPlan:
     def assignment_for(self, node_id: str) -> NodeAssignment | None:
         return next((item for item in self.assignments if item.node_id == node_id), None)
 
+    def validate_execution_contract(self) -> None:
+        strict_assignment_fields = any(
+            assignment.expected_runtime_rank is not None
+            or assignment.runtime_address is not None
+            for assignment in self.assignments
+        )
+        if self.execution_backend is None:
+            if (
+                self.runtime_vllm_version is not None
+                or self.model_cache_kind is not None
+                or strict_assignment_fields
+            ):
+                raise ValueError("legacy deployment plan contains strict backend metadata")
+            return
+        if self.execution_backend != VLLM_RAY_PP_BACKEND:
+            raise ValueError(f"unknown execution backend: {self.execution_backend}")
+        if self.runtime_vllm_version != VLLM_RAY_PP_RUNTIME_VERSION:
+            raise ValueError(
+                f"{VLLM_RAY_PP_BACKEND} requires vLLM "
+                f"{VLLM_RAY_PP_RUNTIME_VERSION}"
+            )
+        if self.model_cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT:
+            raise ValueError(
+                f"{VLLM_RAY_PP_BACKEND} requires "
+                f"{MODEL_CACHE_KIND_FULL_SNAPSHOT} model cache"
+            )
+        if self.model.quantization != "awq":
+            raise ValueError(f"{VLLM_RAY_PP_BACKEND} requires AWQ quantization")
+        if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size != 1:
+            raise ValueError(f"{VLLM_RAY_PP_BACKEND} requires tensor_parallel_size=1")
+        if (
+            type(self.pipeline_parallel_size) is not int
+            or self.pipeline_parallel_size not in {2, 3}
+            or self.pipeline_parallel_size != len(self.assignments)
+        ):
+            raise ValueError(
+                f"{VLLM_RAY_PP_BACKEND} requires exactly 2 or 3 "
+                "pipeline stages with one stage per node"
+            )
+        if (
+            type(self.model.layer_count) is not int
+            or self.model.layer_count < self.pipeline_parallel_size
+        ):
+            raise ValueError("pipeline stage count exceeds model layer count")
+
+        _canonical_uuid(self.ray_head_node_id, field_name="ray_head_node_id")
+        expected_ranks = list(range(self.pipeline_parallel_size))
+        if any(type(item.rank) is not int for item in self.assignments):
+            raise ValueError("assignment ranks must be integers")
+        if any(type(item.pipeline_rank) is not int for item in self.assignments):
+            raise ValueError("pipeline ranks must be integers")
+        if any(
+            type(item.expected_runtime_rank) is not int for item in self.assignments
+        ):
+            raise ValueError("runtime ranks must be integers")
+        if [item.rank for item in self.assignments] != expected_ranks:
+            raise ValueError("assignments must be ordered by contiguous rank")
+        if [item.pipeline_rank for item in self.assignments] != expected_ranks:
+            raise ValueError("pipeline ranks must be contiguous and match assignment rank")
+        if [item.expected_runtime_rank for item in self.assignments] != expected_ranks:
+            raise ValueError("runtime ranks must be contiguous and match assignment rank")
+
+        node_ids: list[str] = []
+        runtime_addresses: list[str] = []
+        expected_layer_start = 0
+        for expected_rank, assignment in enumerate(self.assignments):
+            node_ids.append(
+                _canonical_uuid(assignment.node_id, field_name="assignment node_id")
+            )
+            runtime_addresses.append(canonical_private_ipv4(assignment.runtime_address))
+            if type(assignment.gpu_index) is not int or assignment.gpu_index < 0:
+                raise ValueError("gpu_index must be a non-negative integer")
+            if (
+                type(assignment.layer_start) is not int
+                or type(assignment.layer_end) is not int
+                or assignment.layer_start != expected_layer_start
+                or assignment.layer_end < assignment.layer_start
+            ):
+                raise ValueError("pipeline layer ranges must be contiguous and non-empty")
+            expected_layer_start = assignment.layer_end + 1
+            expected_role = "ray-head" if expected_rank == 0 else "ray-worker"
+            if assignment.role != expected_role:
+                raise ValueError("assignment role does not match runtime rank")
+        if expected_layer_start != self.model.layer_count:
+            raise ValueError("pipeline layer ranges must cover every model layer exactly once")
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("assignment node UUIDs must be unique")
+        if len(runtime_addresses) != len(set(runtime_addresses)):
+            raise ValueError("runtime addresses must be unique")
+        if node_ids[0] != self.ray_head_node_id:
+            raise ValueError("ray_head_node_id must identify runtime rank 0")
+        if self.ray_head_address != f"{runtime_addresses[0]}:6379":
+            raise ValueError("ray_head_address must identify runtime rank 0 on port 6379")
+        if runtime_addresses[1:] != sorted(runtime_addresses[1:]):
+            raise ValueError("worker runtime ranks must be ordered by runtime address")
+
     def to_dict(self) -> dict[str, Any]:
+        self.validate_execution_contract()
         value = asdict(self)
+        value["assignments"] = [item.to_dict() for item in self.assignments]
+        for key in ("execution_backend", "runtime_vllm_version", "model_cache_kind"):
+            if value[key] is None:
+                value.pop(key)
         value["world_size"] = self.world_size
         return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DeploymentPlan":
         data = dict(value)
-        data.pop("world_size", None)
+        serialized_world_size = data.pop("world_size", None)
         data["model"] = ModelSpec(**data["model"])
         data["assignments"] = [NodeAssignment.from_dict(item) for item in data["assignments"]]
-        return cls(**data)
+        plan = cls(**data)
+        plan.validate_execution_contract()
+        if (
+            plan.execution_backend == VLLM_RAY_PP_BACKEND
+            and (
+                type(serialized_world_size) is not int
+                or serialized_world_size != plan.world_size
+            )
+        ):
+            raise ValueError("serialized world_size does not match the execution contract")
+        return plan
 
 
 @dataclass

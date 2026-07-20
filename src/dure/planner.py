@@ -2,14 +2,182 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import replace
+import uuid
+from dataclasses import dataclass, replace
 
 from .catalog import STATIC_CATALOG
-from .models import DeploymentPlan, ModelSpec, NodeAssignment, NodeProfile
+from .models import (
+    DeploymentPlan,
+    ModelSpec,
+    NodeAssignment,
+    NodeProfile,
+    canonical_private_ipv4,
+)
 from .selector import InventoryNode, recommend_model
 
 
 MODELS: dict[str, ModelSpec] = STATIC_CATALOG.models
+_NETWORK_INTERFACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}")
+
+
+class StrictRayPPTopologyError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        node_ids: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.node_ids = node_ids
+
+
+@dataclass(frozen=True)
+class StrictRayPPNode:
+    profile: NodeProfile
+    gpu_index: int
+    runtime_address: str
+
+
+def _canonical_node_uuid(value: str) -> bool:
+    try:
+        return str(uuid.UUID(value)) == value
+    except (AttributeError, ValueError):
+        return False
+
+
+def _private_runtime_address(profile: NodeProfile) -> str:
+    candidates = profile.network.default_interface_addresses
+    if not candidates:
+        raise StrictRayPPTopologyError(
+            "node has no address bound to its default interface",
+            reason="DEFAULT_INTERFACE_ADDRESS_REQUIRED",
+            node_ids=(profile.node_id,),
+        )
+    addresses: set[str] = set()
+    for value in candidates:
+        try:
+            addresses.add(canonical_private_ipv4(value))
+        except ValueError:
+            continue
+    if not addresses:
+        raise StrictRayPPTopologyError(
+            "node has no canonical private IPv4 runtime address",
+            reason="PRIVATE_IPV4_REQUIRED",
+            node_ids=(profile.node_id,),
+        )
+    if len(addresses) != 1:
+        raise StrictRayPPTopologyError(
+            "node has multiple private IPv4 addresses on its default interface",
+            reason="PRIVATE_IPV4_AMBIGUOUS",
+            node_ids=(profile.node_id,),
+        )
+    selected = next(iter(addresses))
+    if selected not in profile.network.addresses:
+        raise StrictRayPPTopologyError(
+            "default-interface address is absent from the node address inventory",
+            reason="DEFAULT_INTERFACE_ADDRESS_MISMATCH",
+            node_ids=(profile.node_id,),
+        )
+    return selected
+
+
+def strict_vllm_ray_pp_order(
+    profiles: list[NodeProfile],
+    *,
+    head_node_id: str,
+    minimum_gpu_memory_mib: int = 0,
+) -> list[StrictRayPPNode]:
+    """Bind a strict vLLM 0.9.0 Ray PP node set to deterministic ranks."""
+    if len(profiles) not in {2, 3}:
+        raise StrictRayPPTopologyError(
+            "strict Ray pipeline parallelism requires exactly two or three nodes",
+            reason="NODE_COUNT_UNSUPPORTED",
+        )
+    if type(minimum_gpu_memory_mib) is not int or minimum_gpu_memory_mib < 0:
+        raise ValueError("minimum_gpu_memory_mib must be a non-negative integer")
+    node_ids = [profile.node_id for profile in profiles]
+    if any(not _canonical_node_uuid(node_id) for node_id in node_ids):
+        raise StrictRayPPTopologyError(
+            "strict Ray pipeline node IDs must be canonical UUIDs",
+            reason="NODE_ID_INVALID",
+            node_ids=tuple(node_ids),
+        )
+    if len(node_ids) != len(set(node_ids)):
+        raise StrictRayPPTopologyError(
+            "strict Ray pipeline node IDs must be unique",
+            reason="DUPLICATE_NODE_ID",
+            node_ids=tuple(node_ids),
+        )
+    if head_node_id not in set(node_ids) or not _canonical_node_uuid(head_node_id):
+        raise StrictRayPPTopologyError(
+            "strict Ray pipeline head must identify exactly one selected node",
+            reason="HEAD_NODE_INVALID",
+            node_ids=(head_node_id,),
+        )
+
+    bindings: list[StrictRayPPNode] = []
+    for profile in profiles:
+        if (
+            type(profile.network.default_interface) is not str
+            or _NETWORK_INTERFACE.fullmatch(profile.network.default_interface)
+            is None
+        ):
+            raise StrictRayPPTopologyError(
+                "strict Ray pipeline requires an explicit safe default interface",
+                reason="DEFAULT_INTERFACE_REQUIRED",
+                node_ids=(profile.node_id,),
+            )
+        healthy_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
+        if len(healthy_gpus) != 1:
+            raise StrictRayPPTopologyError(
+                "strict Ray pipeline requires exactly one healthy GPU per node",
+                reason="HEALTHY_GPU_COUNT",
+                node_ids=(profile.node_id,),
+            )
+        gpu = healthy_gpus[0]
+        if type(gpu.index) is not int or gpu.index < 0:
+            raise StrictRayPPTopologyError(
+                "strict Ray pipeline GPU index is invalid",
+                reason="GPU_INDEX_INVALID",
+                node_ids=(profile.node_id,),
+            )
+        if type(gpu.memory_mib) is not int or gpu.memory_mib < minimum_gpu_memory_mib:
+            raise StrictRayPPTopologyError(
+                "strict Ray pipeline node does not meet the GPU memory requirement",
+                reason="GPU_MEMORY_INSUFFICIENT",
+                node_ids=(profile.node_id,),
+            )
+        bindings.append(
+            StrictRayPPNode(
+                profile=profile,
+                gpu_index=gpu.index,
+                runtime_address=_private_runtime_address(profile),
+            )
+        )
+
+    runtime_addresses = [item.runtime_address for item in bindings]
+    if len(runtime_addresses) != len(set(runtime_addresses)):
+        duplicate_nodes = tuple(
+            sorted(
+                item.profile.node_id
+                for item in bindings
+                if runtime_addresses.count(item.runtime_address) > 1
+            )
+        )
+        raise StrictRayPPTopologyError(
+            "strict Ray pipeline runtime addresses must be unique",
+            reason="DUPLICATE_RUNTIME_ADDRESS",
+            node_ids=duplicate_nodes,
+        )
+
+    head = next(item for item in bindings if item.profile.node_id == head_node_id)
+    workers = sorted(
+        (item for item in bindings if item.profile.node_id != head_node_id),
+        key=lambda item: item.runtime_address,
+    )
+    return [head, *workers]
 
 
 def _gpu_for(profile: NodeProfile, gpu_index: int):

@@ -1,10 +1,12 @@
+import copy
 import unittest
 
 from dure.command import CommandResult
+from dure.pipeline_runtime import RAY_COMPONENT, strict_runtime_contract_digest
 from dure.planner import build_plan
 from dure.runtime import ContainerRuntime, DEPLOYMENT_IDENTITY_FORMAT
 
-from .helpers import FakeRunner, profile
+from .helpers import FakeRunner, profile, strict_pipeline_fixture
 
 
 class RuntimeTests(unittest.TestCase):
@@ -12,6 +14,35 @@ class RuntimeTests(unittest.TestCase):
     def identity(container_id, state, deployment_id, generation, node_id):
         return (
             f"{container_id}\t{state}\t{deployment_id}\t{generation}\t{node_id}"
+        )
+
+    @staticmethod
+    def strict_identity(
+        container_id,
+        state,
+        deployment_id,
+        generation,
+        node_id,
+        backend,
+        pipeline_rank,
+        runtime_rank,
+        component,
+        runtime_contract,
+    ):
+        return "\t".join(
+            str(item)
+            for item in (
+                container_id,
+                state,
+                deployment_id,
+                generation,
+                node_id,
+                backend,
+                pipeline_rank,
+                runtime_rank,
+                component,
+                runtime_contract,
+            )
         )
 
     def test_stop_filters_generation_and_inspects_exact_node_identity(self):
@@ -204,6 +235,413 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run[entrypoint + 1], "vllm")
         image = run.index("registry.example/vllm@sha256:abc")
         self.assertEqual(run[image + 1 : image + 3], ("serve", "/models/model"))
+
+    def test_strict_worker_uses_fixed_address_environment_and_exact_labels(self):
+        plan, _, worker = strict_pipeline_fixture()
+        assignment = plan.assignments[1]
+        worker.network.addresses.insert(0, "10.9.8.7")
+        name = f"dure-ray-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        runner = FakeRunner(
+            responses={inspect: CommandResult(inspect, 1, stderr="not found")}
+        )
+
+        result = ContainerRuntime(runner).start_ray(
+            worker, plan, assignment, replace=False
+        )
+
+        self.assertTrue(result.ok, result.detail)
+        run = runner.calls[-1]
+        for label in (
+            "dure.backend=VLLM_RAY_PP_V1",
+            "dure.pipeline-rank=1",
+            "dure.runtime-rank=1",
+            "dure.component=ray-node",
+            "dure.runtime-contract="
+            + strict_runtime_contract_digest(plan, assignment, RAY_COMPONENT),
+        ):
+            self.assertIn(label, run)
+        for environment in (
+            "VLLM_HOST_IP=192.168.0.11",
+            "VLLM_USE_V1=0",
+            "VLLM_USE_RAY_SPMD_WORKER=0",
+            "VLLM_RAY_PER_WORKER_GPUS=1.0",
+            "VLLM_RAY_BUNDLE_INDICES=",
+            "VLLM_USE_RAY_COMPILED_DAG=0",
+        ):
+            self.assertIn(environment, run)
+        image = run.index(plan.image)
+        self.assertEqual(
+            run[image + 1 :],
+            (
+                "start",
+                "--block",
+                "--address=192.168.0.10:6379",
+                "--node-ip-address=192.168.0.11",
+                '--resources={"dure_node_22222222222242228222222222222222":1}',
+                "--min-worker-port=20000",
+                "--max-worker-port=21000",
+            ),
+        )
+        self.assertNotIn("10.9.8.7", run)
+        self.assertNotIn("sh", run)
+
+        head = strict_pipeline_fixture()[1]
+        head_name = f"dure-ray-{plan.deployment_id}"
+        head_inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            head_name,
+        )
+        head_runner = FakeRunner(
+            responses={
+                head_inspect: CommandResult(head_inspect, 1, stderr="not found")
+            }
+        )
+        head_result = ContainerRuntime(head_runner).start_ray(
+            head, plan, plan.assignments[0], replace=False
+        )
+        self.assertTrue(head_result.ok, head_result.detail)
+        head_run = head_runner.calls[-1]
+        head_image = head_run.index(plan.image)
+        self.assertEqual(
+            head_run[head_image + 1 :],
+            (
+                "start",
+                "--block",
+                "--head",
+                "--node-ip-address=192.168.0.10",
+                "--port=6379",
+                '--resources={"dure_node_11111111111141118111111111111111":1}',
+                "--min-worker-port=20000",
+                "--max-worker-port=21000",
+            ),
+        )
+
+    def test_strict_api_is_head_only_and_uses_fixed_v0_non_spmd_mode(self):
+        plan, _, _ = strict_pipeline_fixture()
+        assignment = plan.assignments[0]
+        name = f"dure-api-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        runner = FakeRunner(
+            responses={inspect: CommandResult(inspect, 1, stderr="not found")}
+        )
+
+        result = ContainerRuntime(runner).start_api(
+            plan, assignment, replace=False
+        )
+
+        self.assertTrue(result.ok, result.detail)
+        run = runner.calls[-1]
+        for expected in (
+            "RAY_ADDRESS=192.168.0.10:6379",
+            "VLLM_HOST_IP=192.168.0.10",
+            "VLLM_USE_V1=0",
+            "VLLM_USE_RAY_SPMD_WORKER=0",
+            "VLLM_RAY_PER_WORKER_GPUS=1.0",
+            "VLLM_RAY_BUNDLE_INDICES=",
+            "VLLM_USE_RAY_COMPILED_DAG=0",
+            "dure.backend=VLLM_RAY_PP_V1",
+            "dure.pipeline-rank=0",
+            "dure.runtime-rank=0",
+            "dure.component=vllm-api",
+            "dure.runtime-contract="
+            + strict_runtime_contract_digest(plan, assignment, "vllm-api"),
+        ):
+            self.assertIn(expected, run)
+        image = run.index(plan.image)
+        self.assertEqual(run[image + 1], "serve")
+        self.assertEqual(
+            run[run.index("--served-model-name") + 1], "qwen-test-awq"
+        )
+        self.assertEqual(run[run.index("--host") + 1], "127.0.0.1")
+        self.assertEqual(run[run.index("--port") + 1], "8000")
+
+        worker_result = ContainerRuntime(FakeRunner()).start_api(
+            plan, plan.assignments[1], replace=False
+        )
+        self.assertTrue(worker_result.ok)
+        self.assertFalse(worker_result.blocking)
+
+    def test_strict_name_collision_with_missing_or_swapped_rank_is_never_replaced(self):
+        plan, _, worker = strict_pipeline_fixture()
+        assignment = plan.assignments[1]
+        name = f"dure-ray-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        runner = FakeRunner(
+            responses={
+                inspect: (
+                    0,
+                    self.strict_identity(
+                        "foreign-rank",
+                        "exited",
+                        plan.deployment_id,
+                        plan.generation,
+                        assignment.node_id,
+                        plan.execution_backend,
+                        assignment.pipeline_rank,
+                        0,
+                        "ray-node",
+                        strict_runtime_contract_digest(
+                            plan, assignment, RAY_COMPONENT
+                        ),
+                    ),
+                    "",
+                )
+            }
+        )
+
+        result = ContainerRuntime(runner).start_ray(
+            worker, plan, assignment, replace=True
+        )
+
+        self.assertFalse(result.ok)
+        self.assertFalse(any(call[:2] == ("docker", "rm") for call in runner.calls))
+        self.assertFalse(any(call[:3] == ("docker", "run", "-d") for call in runner.calls))
+
+    def test_strict_running_container_with_wrong_runtime_contract_is_not_reused(self):
+        plan, _, worker = strict_pipeline_fixture()
+        assignment = plan.assignments[1]
+        name = f"dure-ray-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        runner = FakeRunner(
+            responses={
+                inspect: (
+                    0,
+                    self.strict_identity(
+                        "drifted",
+                        "running",
+                        plan.deployment_id,
+                        plan.generation,
+                        assignment.node_id,
+                        plan.execution_backend,
+                        assignment.pipeline_rank,
+                        assignment.expected_runtime_rank,
+                        "ray-node",
+                        "sha256:" + "0" * 64,
+                    ),
+                    "",
+                )
+            }
+        )
+
+        result = ContainerRuntime(runner).start_ray(
+            worker, plan, assignment, replace=True
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("mismatched Dure identity", result.detail)
+        self.assertFalse(any(call[:2] == ("docker", "rm") for call in runner.calls))
+        self.assertFalse(any(call[:3] == ("docker", "run", "-d") for call in runner.calls))
+
+    def test_strict_stop_requires_exact_rank_and_component_labels(self):
+        plan, _, worker = strict_pipeline_fixture()
+        assignment = plan.assignments[1]
+        listed = (
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            f"label=dure.deployment={plan.deployment_id}",
+            "--filter",
+            f"label=dure.generation={plan.generation}",
+        )
+        inspected = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            "abc",
+        )
+        runner = FakeRunner(
+            responses={
+                listed: (0, "abc", ""),
+                inspected: (
+                    0,
+                    self.strict_identity(
+                        "abc",
+                        "running",
+                        plan.deployment_id,
+                        plan.generation,
+                        assignment.node_id,
+                        plan.execution_backend,
+                        assignment.pipeline_rank,
+                        assignment.expected_runtime_rank,
+                        "ray-node",
+                        strict_runtime_contract_digest(
+                            plan, assignment, RAY_COMPONENT
+                        ),
+                    ),
+                    "",
+                ),
+                ("docker", "stop", "--time", "30", "abc"): (0, "abc", ""),
+            }
+        )
+
+        check = ContainerRuntime(runner).stop_deployment(
+            plan.deployment_id,
+            generation=plan.generation,
+            node_id=assignment.node_id,
+            plan=plan,
+            assignment=assignment,
+        )
+
+        self.assertTrue(check.ok, check.detail)
+        restarting_responses = copy.deepcopy(runner.responses)
+        restarting_responses[inspected] = (
+            0,
+            self.strict_identity(
+                "abc",
+                "restarting",
+                plan.deployment_id,
+                plan.generation,
+                assignment.node_id,
+                plan.execution_backend,
+                assignment.pipeline_rank,
+                assignment.expected_runtime_rank,
+                "ray-node",
+                strict_runtime_contract_digest(plan, assignment, RAY_COMPONENT),
+            ),
+            "",
+        )
+        restarting = FakeRunner(responses=restarting_responses)
+        restarting_check = ContainerRuntime(restarting).stop_deployment(
+            plan.deployment_id,
+            generation=plan.generation,
+            node_id=assignment.node_id,
+            plan=plan,
+            assignment=assignment,
+        )
+        self.assertTrue(restarting_check.ok, restarting_check.detail)
+        self.assertIn(
+            ("docker", "stop", "--time", "30", "abc"), restarting.calls
+        )
+
+        damaged_contract_responses = copy.deepcopy(runner.responses)
+        damaged_contract_responses[inspected] = (
+            0,
+            self.strict_identity(
+                "abc",
+                "running",
+                plan.deployment_id,
+                plan.generation,
+                assignment.node_id,
+                plan.execution_backend,
+                assignment.pipeline_rank,
+                assignment.expected_runtime_rank,
+                "ray-node",
+                "damaged",
+            ),
+            "",
+        )
+        damaged_contract = FakeRunner(responses=damaged_contract_responses)
+        damaged_contract_check = ContainerRuntime(damaged_contract).stop_deployment(
+            plan.deployment_id,
+            generation=plan.generation,
+            node_id=assignment.node_id,
+            plan=plan,
+            assignment=assignment,
+        )
+        self.assertTrue(damaged_contract_check.ok, damaged_contract_check.detail)
+        self.assertIn(
+            ("docker", "stop", "--time", "30", "abc"),
+            damaged_contract.calls,
+        )
+
+        swapped = copy.deepcopy(runner.responses)
+        swapped[inspected] = (
+            0,
+            self.strict_identity(
+                "abc",
+                "running",
+                plan.deployment_id,
+                plan.generation,
+                assignment.node_id,
+                plan.execution_backend,
+                assignment.pipeline_rank,
+                0,
+                "ray-node",
+                strict_runtime_contract_digest(plan, assignment, RAY_COMPONENT),
+            ),
+            "",
+        )
+        rejecting = FakeRunner(responses=swapped)
+        rejected = ContainerRuntime(rejecting).stop_deployment(
+            plan.deployment_id,
+            generation=plan.generation,
+            node_id=assignment.node_id,
+            plan=plan,
+            assignment=assignment,
+        )
+        self.assertFalse(rejected.ok)
+        self.assertFalse(any(call[:2] == ("docker", "stop") for call in rejecting.calls))
+
+    def test_strict_invalid_contract_is_rejected_before_docker(self):
+        plan, _, worker = strict_pipeline_fixture()
+        plan.runtime_vllm_version = "0.9.1"
+        runner = FakeRunner()
+
+        result = ContainerRuntime(runner).start_ray(
+            worker, plan, plan.assignments[1], replace=False
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(runner.calls, [])
+
+    def test_strict_node_drift_is_rejected_before_docker(self):
+        plan, _, worker = strict_pipeline_fixture()
+        second_gpu = copy.deepcopy(worker.gpus[0])
+        second_gpu.index = 1
+        second_gpu.uuid = "GPU-second"
+        worker.gpus.append(second_gpu)
+        runner = FakeRunner()
+
+        result = ContainerRuntime(runner).start_ray(
+            worker, plan, plan.assignments[1], replace=False
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("exactly one selected healthy GPU", result.detail)
+        self.assertEqual(runner.calls, [])
+
+    def test_strict_cache_marker_must_match_manifest_addressed_path(self):
+        plan, _, worker = strict_pipeline_fixture()
+        worker.installed_models[0].manifest_digest = "sha256:" + "d" * 64
+        runner = FakeRunner()
+
+        result = ContainerRuntime(runner).start_ray(
+            worker, plan, plan.assignments[1], replace=False
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("verified FULL_SNAPSHOT model cache", result.detail)
+        self.assertEqual(runner.calls, [])
 
     def test_foreign_name_collision_is_never_removed_or_started(self):
         node = profile("camp-7", address="192.168.0.228")
