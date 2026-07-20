@@ -4,6 +4,12 @@ import unittest
 from pathlib import Path
 
 from dure.command import CommandResult
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_VERIFICATION_VERSION,
+    build_model_cache_marker,
+)
 from dure.models import NodeProfile
 from dure.probe import NodeProbe
 
@@ -131,6 +137,18 @@ class ProbeTests(unittest.TestCase):
             by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].revision, "a" * 40
         )
         self.assertEqual(by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].size_mib, 10240)
+        self.assertEqual(
+            by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].manifest_digest,
+            "sha256:" + "b" * 64,
+        )
+        self.assertEqual(
+            by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].cache_kind,
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        )
+        self.assertEqual(
+            by_id["Qwen/Qwen2.5-14B-Instruct-AWQ"].verification_version,
+            MODEL_CACHE_VERIFICATION_VERSION,
+        )
         self.assertFalse(by_id["partial-model"].complete)
         self.assertEqual(len(result.workloads), 1)
         self.assertEqual(result.workloads[0].deployment_id, "deploy-1")
@@ -145,6 +163,75 @@ class ProbeTests(unittest.TestCase):
 
         self.assertEqual(restored.installed_models, [])
         self.assertEqual(restored.workloads, [])
+
+    def test_v2_full_snapshot_and_stage_markers_are_distinct(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            for name, repository, cache_kind in (
+                ("full", "Example/Full-AWQ", MODEL_CACHE_KIND_FULL_SNAPSHOT),
+                ("stage", "Example/Stage-AWQ", MODEL_CACHE_KIND_STAGE),
+            ):
+                model_path = model_root / name
+                model_path.mkdir(parents=True)
+                (model_path / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "_name_or_path": repository,
+                            "quantization_config": {"quant_method": "awq"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (model_path / ".dure-model.json").write_text(
+                    json.dumps(
+                        build_model_cache_marker(
+                            repository=repository,
+                            revision="a" * 40,
+                            manifest_digest="sha256:" + "b" * 64,
+                            quantization="awq",
+                            cache_kind=cache_kind,
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+
+            result = NodeProbe(FakeRunner(), model_roots=[model_root]).collect()
+
+        by_id = {item.model_id: item for item in result.installed_models}
+        self.assertEqual(
+            by_id["Example/Full-AWQ"].cache_kind,
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        )
+        self.assertEqual(
+            by_id["Example/Stage-AWQ"].cache_kind,
+            MODEL_CACHE_KIND_STAGE,
+        )
+        for item in by_id.values():
+            self.assertEqual(item.manifest_digest, "sha256:" + "b" * 64)
+            self.assertEqual(
+                item.verification_version, MODEL_CACHE_VERIFICATION_VERSION
+            )
+
+    def test_old_installed_model_json_defaults_cache_identity_fields(self):
+        value = NodeProbe(FakeRunner()).collect().to_dict()
+        value["installed_models"] = [
+            {
+                "source": "dure",
+                "model_id": "Example/Legacy-AWQ",
+                "path": "/var/lib/dure/models/legacy",
+                "revision": "a" * 40,
+                "quantization": "awq",
+                "size_mib": 1024,
+                "complete": True,
+            }
+        ]
+
+        restored = NodeProfile.from_dict(value)
+
+        model = restored.installed_models[0]
+        self.assertIsNone(model.manifest_digest)
+        self.assertIsNone(model.cache_kind)
+        self.assertIsNone(model.verification_version)
 
 
 if __name__ == "__main__":

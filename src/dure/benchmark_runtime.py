@@ -10,12 +10,16 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .command import Runner, SubprocessRunner
-from .models import InstalledModelProfile, NodeProfile
-from .probe import (
-    DEFAULT_MODEL_ROOTS,
-    DURE_MODEL_METADATA_FILE,
-    DURE_MODEL_METADATA_SCHEMA,
+from .model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_MARKER_FILE,
+    MODEL_CACHE_MARKER_MAX_BYTES,
+    MODEL_CACHE_VERIFICATION_VERSION,
+    ModelCacheMarkerError,
+    decode_model_cache_marker,
 )
+from .models import InstalledModelProfile, NodeProfile
+from .probe import DEFAULT_MODEL_ROOTS
 from .task import (
     BENCHMARK_DURATION_SECONDS,
     BENCHMARK_REQUEST_COUNT,
@@ -167,7 +171,10 @@ def _validated_model_path(
         or not cached_model.complete
         or cached_model.model_id != payload.model_repository
         or cached_model.revision != payload.artifact_revision
+        or cached_model.manifest_digest != payload.artifact_manifest_digest
         or cached_model.quantization != payload.quantization
+        or cached_model.cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT
+        or cached_model.verification_version != MODEL_CACHE_VERIFICATION_VERSION
         or not cached_model.path
     ):
         raise BenchmarkRuntimeError(
@@ -210,39 +217,29 @@ def _validated_model_path(
 def _validated_cache_metadata(
     model_path: Path, payload: BenchmarkTaskPayload
 ) -> None:
-    metadata_path = model_path / DURE_MODEL_METADATA_FILE
+    metadata_path = model_path / MODEL_CACHE_MARKER_FILE
     try:
-        if metadata_path.stat().st_size > 64 * 1024:
+        if metadata_path.stat().st_size > MODEL_CACHE_MARKER_MAX_BYTES:
             raise BenchmarkRuntimeError(
                 "benchmark cache metadata is too large",
                 code="BENCHMARK_ARTIFACT_UNAVAILABLE",
             )
-
-        def unique_object(pairs):
-            value = {}
-            for key, item in pairs:
-                if key in value:
-                    raise ValueError("duplicate JSON key")
-                value[key] = item
-            return value
-
-        metadata = json.loads(
-            metadata_path.read_text(encoding="utf-8"),
-            object_pairs_hook=unique_object,
+        metadata = decode_model_cache_marker(
+            metadata_path.read_text(encoding="utf-8")
         )
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ModelCacheMarkerError) as exc:
         raise BenchmarkRuntimeError(
             "benchmark cache metadata is invalid",
             code="BENCHMARK_ARTIFACT_UNAVAILABLE",
         ) from exc
-    expected = {
-        "schema": DURE_MODEL_METADATA_SCHEMA,
-        "repository": payload.model_repository,
-        "revision": payload.artifact_revision,
-        "manifest_digest": payload.artifact_manifest_digest,
-        "quantization": payload.quantization,
-    }
-    if type(metadata) is not dict or metadata != expected:
+    if (
+        metadata.repository != payload.model_repository
+        or metadata.revision != payload.artifact_revision
+        or metadata.manifest_digest != payload.artifact_manifest_digest
+        or metadata.quantization != payload.quantization
+        or metadata.cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT
+        or metadata.verification_version != MODEL_CACHE_VERIFICATION_VERSION
+    ):
         raise BenchmarkRuntimeError(
             "benchmark cache metadata does not match the prepared artifact",
             code="BENCHMARK_ARTIFACT_UNAVAILABLE",

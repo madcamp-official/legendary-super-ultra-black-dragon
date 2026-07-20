@@ -18,6 +18,11 @@ from dure.agent import (
 from dure.benchmark_runtime import SafeBenchmarkRuntime
 from dure.command import CommandResult
 from dure.http import APIError
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_VERIFICATION_VERSION,
+)
 from dure.models import CheckResult, InstalledModelProfile
 from dure.planner import build_plan
 from dure.runtime import DEPLOYMENT_IDENTITY_FORMAT
@@ -157,6 +162,9 @@ def benchmark_profile():
             quantization="awq",
             size_mib=8192,
             complete=True,
+            manifest_digest="sha256:" + "b" * 64,
+            cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            verification_version=MODEL_CACHE_VERIFICATION_VERSION,
         )
     ]
     return node_profile
@@ -890,6 +898,25 @@ class AgentTaskExecutorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly one complete local cache"):
                 executor.execute(
                     {"type": "BENCHMARK", "payload": benchmark_payload(hub_cache)}
+                )
+
+        wrong_digest = benchmark_profile()
+        wrong_digest.installed_models[0].manifest_digest = "sha256:" + "f" * 64
+        with patch("dure.probe.NodeProbe.collect", return_value=wrong_digest):
+            with self.assertRaisesRegex(ValueError, "exactly one complete local cache"):
+                executor.execute(
+                    {
+                        "type": "BENCHMARK",
+                        "payload": benchmark_payload(wrong_digest),
+                    }
+                )
+
+        stage_cache = benchmark_profile()
+        stage_cache.installed_models[0].cache_kind = MODEL_CACHE_KIND_STAGE
+        with patch("dure.probe.NodeProbe.collect", return_value=stage_cache):
+            with self.assertRaisesRegex(ValueError, "FULL_SNAPSHOT"):
+                executor.execute(
+                    {"type": "BENCHMARK", "payload": benchmark_payload(stage_cache)}
                 )
 
         self.assertEqual(safe_executor.calls, [])
