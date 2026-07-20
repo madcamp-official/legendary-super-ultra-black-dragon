@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if ! getent passwd dure >/dev/null; then
+    adduser --system --group --home /var/lib/dure --no-create-home dure
+fi
+install -d -m 0750 -o dure -g dure /var/lib/dure
+install -d -m 0750 -o root -g root /etc/dure
+
+#DEBHELPER#

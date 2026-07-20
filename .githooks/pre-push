@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+python3 -m unittest discover -q
+
+temporary_dir=$(mktemp -d)
+trap 'find "$temporary_dir" -depth -delete 2>/dev/null || true' EXIT INT TERM
+
+python3 -m pip wheel . --no-deps --no-build-isolation --wheel-dir "$temporary_dir/wheel"
+DURE_DATABASE_URL="sqlite:///$temporary_dir/migration.db" dure-server --migrate
+
+project_version=$(python3 -c 'from dure import __version__; print(__version__)')
+metadata_version=$(awk -F'"' '/^version = / { print $2; exit }' pyproject.toml)
+debian_version=$(dpkg-parsechangelog -S Version | sed 's/-[^-]*$//')
+
+if [ "$project_version" != "$metadata_version" ] || [ "$project_version" != "$debian_version" ]; then
+    echo "Version mismatch: runtime=$project_version metadata=$metadata_version debian=$debian_version" >&2
+    exit 1
+fi

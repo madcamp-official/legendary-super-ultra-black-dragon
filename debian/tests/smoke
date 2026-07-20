@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+dure --version
+dure doctor --json >/dev/null
+

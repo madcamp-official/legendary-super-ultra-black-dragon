@@ -1,0 +1,39 @@
+dure (0.3.4) stable; urgency=medium
+
+  * Identify Dure HTTP requests so Cloudflare does not reject Python urllib's default signature.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 05:24:00 +0000
+
+dure (0.3.3) stable; urgency=medium
+
+  * Add central hardware, installed-model, and LLM workload inventory.
+  * Add read-only Codex-assisted admin capacity diagnosis.
+  * Point new node joins at the public HTTPS control-plane endpoint.
+  * Verify the packaged client configuration never enables insecure HTTP.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 05:15:00 +0000
+
+dure (0.3.2) stable; urgency=medium
+
+  * Make root-required join tests portable to unprivileged CI runners.
+
+ -- Dure contributors <maintainers@example.invalid>  Sun, 19 Jul 2026 05:35:00 +0000
+
+dure (0.3.1) stable; urgency=medium
+
+  * Split the dependency-free node package from optional control-plane dependencies.
+  * Run full server tests separately from Debian core package tests.
+
+ -- Dure contributors <maintainers@example.invalid>  Sun, 19 Jul 2026 05:30:00 +0000
+
+dure (0.3.0) stable; urgency=medium
+
+  * Add tokenless node join with central approval.
+
+ -- Dure contributors <maintainers@example.invalid>  Sat, 18 Jul 2026 13:30:00 +0000
+
+dure (0.1.0) unstable; urgency=medium
+
+  * Initial MVP release.
+
+ -- Dure contributors <maintainers@example.invalid>  Sat, 18 Jul 2026 11:55:00 +0000

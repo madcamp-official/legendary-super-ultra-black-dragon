@@ -1,0 +1,15 @@
+Source: dure
+Section: admin
+Priority: optional
+Maintainer: Dure contributors <maintainers@example.invalid>
+Build-Depends: debhelper-compat (= 13), dh-python, python3-all, python3-setuptools
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: dure
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.10)
+Description: resource-aware community LLM node bootstrapper
+ Dure inventories Linux nodes, joins them to a trusted controller, plans model
+ placement, provisions Ray/vLLM containers, and verifies readiness. The central
+ server is installed separately with the Python server extra.

@@ -1,0 +1,108 @@
+name: Publish signed APT repository
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "dure-apt-pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apt-utils debhelper dh-python dpkg-dev gnupg python3-all python3-pip python3-setuptools
+
+      - name: Run full Python test suite
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e '.[test]'
+          python3 -m unittest discover -v
+
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          package_version=$(dpkg-parsechangelog -S Version)
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
+
+      - name: Build and test Debian package
+        id: package
+        run: |
+          package_path=$(scripts/build-deb.sh)
+          echo "path=$package_path" >> "$GITHUB_OUTPUT"
+
+      - name: Install Debian node package
+        run: |
+          sudo apt-get install -y "${{ steps.package.outputs.path }}"
+          /usr/bin/dure --version
+          /usr/bin/dure doctor --json >/dev/null
+
+      - name: Test signed APT repository
+        run: scripts/test-apt-repo.sh "${{ steps.package.outputs.path }}"
+
+      - name: Import APT signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          test -n "$APT_GPG_PRIVATE_KEY"
+          printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          key_id=$(gpg --batch --with-colons --list-secret-keys | \
+            awk -F: '$1 == "sec" && !found { print $5; found=1 }')
+          test -n "$key_id"
+          echo "DURE_APT_GPG_KEY_ID=$key_id" >> "$GITHUB_ENV"
+
+      - name: Build signed APT repository
+        run: |
+          mkdir public
+          scripts/build-apt-repo.sh \
+            "${{ steps.package.outputs.path }}" public stable main "$DURE_APT_GPG_KEY_ID"
+          repository_name=${GITHUB_REPOSITORY#*/}
+          repository_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${repository_name}"
+          scripts/render-installer.sh "$repository_url" public/install.sh
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Publish GitHub release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "${{ steps.package.outputs.path }}" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "${{ steps.package.outputs.path }}" \
+              --generate-notes \
+              --title "Dure $GITHUB_REF_NAME"
+          fi

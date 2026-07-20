@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+git diff --cached --check
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if printf '%s\n' "$staged" | grep -Eq '(^|/)(\.env($|\.)|agent\.json$|server\.env$)|\.(deb|whl)$'; then
+    echo 'Refusing to commit a secret/config or generated package artifact.' >&2
+    exit 1
+fi
+
+if git diff --cached | grep -Eq '^\+(<<<<<<<|=======|>>>>>>>)'; then
+    echo 'Refusing to commit unresolved merge markers.' >&2
+    exit 1
+fi
+
+python3 -m compileall -q src tests
