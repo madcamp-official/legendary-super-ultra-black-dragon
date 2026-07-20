@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from datetime import timedelta
 from functools import partial
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,6 +48,7 @@ from .service import (
     RegistryConflictError,
     transition_model_release,
 )
+from .recommendation import recommend_deployment
 
 
 class StrictBody(BaseModel):
@@ -146,6 +148,12 @@ class PlacementProfileCreate(StrictBody):
 
 class ModelReleaseTransition(StrictBody):
     status: str
+
+
+class DeploymentRecommendationCreate(StrictBody):
+    node_ids: list[str] = Field(default_factory=list, max_length=256)
+    all_online: bool = False
+    objective: Literal["quality-first"] = "quality-first"
 
 
 def _bearer(authorization: str | None) -> str:
@@ -480,6 +488,19 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"release": _model_release_dict(session, release)}
+
+    @app.post(
+        "/v1/admin/deployment-recommendations",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_recommendation_create(
+        body: DeploymentRecommendationCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return recommend_deployment(session, **body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
     @app.post("/v1/admin/deployments", dependencies=[Depends(admin_auth)])
     def deployment_create(body: DeploymentCreate, session: Session = Depends(get_session)):

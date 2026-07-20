@@ -181,7 +181,7 @@ def _inventory_nodes(
         rows = [
             (node, record)
             for node, record in rows
-            if node_status(node.last_seen, now) == "online"
+            if node.approved and node_status(node.last_seen, now) == "online"
         ]
 
     missing_profiles = sorted(node.id for node, record in rows if record is None)
@@ -217,11 +217,11 @@ def recommend_deployment(
     *,
     node_ids: list[str],
     all_online: bool,
-    objective: str = "quality",
+    objective: str = "quality-first",
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return a deterministic recommendation without persisting or dispatching anything."""
-    if objective != "quality":
+    if objective != "quality-first":
         raise ValueError("unsupported recommendation objective")
     evaluated_at = now or utcnow()
     inventory = _inventory_nodes(
