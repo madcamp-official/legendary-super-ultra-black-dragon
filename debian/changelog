@@ -1,3 +1,10 @@
+dure (0.3.7) UNRELEASED; urgency=medium
+
+  * 모델, 고정 리비전, OCI 다이제스트와 배치 프로필을 중앙 레지스트리에 영속화합니다.
+  * 관리자 권한, 상태 전이, 중복 및 충돌을 안전하게 거부하는 API와 회귀 테스트를 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:10:00 +0900
+
 dure (0.3.4) stable; urgency=medium
 
   * Identify Dure HTTP requests so Cloudflare does not reject Python urllib's default signature.
