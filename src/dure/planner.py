@@ -71,12 +71,12 @@ def build_plan(
         raise ValueError(f"duplicate node profile(s): {', '.join(duplicates)}")
 
     healthy: list[tuple[NodeProfile, int]] = []
-    for profile in sorted(profiles, key=lambda item: item.node_id):
+    for profile in profiles:
         node_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
         if node_gpus:
             # The MVP launches one Ray container per node. Prefer the largest GPU
             # until multi-GPU-per-node assignments are implemented explicitly.
-            gpu = max(node_gpus, key=lambda item: (item.memory_mib, -item.index))
+            gpu = max(node_gpus, key=lambda item: item.memory_mib)
             healthy.append((profile, gpu.index))
 
     if not healthy:
@@ -85,15 +85,16 @@ def build_plan(
     if model_id == "auto":
         recommendation = recommend_model(
             [
-                InventoryNode(profile=profile, network_verified=True)
+                InventoryNode.local(profile)
                 for profile, _gpu_index in healthy
-            ]
+            ],
+            allow_unverified_network=True,
         )
         if recommendation.selected_model_id is None:
             return None
         model = MODELS[recommendation.selected_model_id]
-        selected_ids = set(recommendation.selected_node_ids)
-        selected = [item for item in healthy if item[0].node_id in selected_ids]
+        by_node_id = {item[0].node_id: item for item in healthy}
+        selected = [by_node_id[node_id] for node_id in recommendation.selected_node_ids]
     else:
         if model_id not in MODELS:
             raise ValueError(f"unknown model: {model_id}")

@@ -17,6 +17,8 @@ class PlacementProfile:
     min_disk_free_mib: int
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
+    required_engine: str = "docker"
+    min_compute_capability: str | None = "7.5"
     requires_engine_ready: bool = True
     requires_nvidia_runtime: bool = True
     requires_network_evidence: bool = False
@@ -27,6 +29,7 @@ class CatalogEntry:
     model: ModelSpec
     placement: PlacementProfile
     quality_rank: int
+    artifact_revision: str | None = None
 
 
 @dataclass(frozen=True)

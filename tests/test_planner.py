@@ -1,5 +1,6 @@
 import unittest
 
+from dure.models import DeploymentPlan
 from dure.planner import build_plan, classify_node, recommend_local_model
 
 from .helpers import profile
@@ -74,6 +75,20 @@ class PlannerTests(unittest.TestCase):
             [item.node_id for item in forward.assignments],
             [item.node_id for item in reverse.assignments],
         )
+
+    def test_explicit_model_preserves_profile_order_and_plan_json(self):
+        nodes = [profile("node-c"), profile("node-a"), profile("node-b")]
+
+        plan = build_plan(nodes, model_id="qwen2.5-72b-awq")
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.ray_head_node_id, "node-c")
+        self.assertEqual(
+            [item.node_id for item in plan.assignments],
+            ["node-c", "node-a", "node-b"],
+        )
+        self.assertEqual(DeploymentPlan.from_dict(plan.to_dict()).to_dict(), plan.to_dict())
 
 
 if __name__ == "__main__":
