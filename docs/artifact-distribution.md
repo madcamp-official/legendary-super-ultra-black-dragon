@@ -1,6 +1,6 @@
 # 모델 아티팩트 매니페스트와 배포 계약
 
-> 상태: **`FULL_SNAPSHOT` 배포 경로 구현, `STAGE` 생성·등록 구현**. 중앙 제어면의 불변 정규화 매니페스트 레지스트리, 노드 콘텐츠 주소 캐시와 명시적 deployment 준비 API·CLI, `PREPARE_MODEL → PREPARE_IMAGE` Agent 작업과 배포 소비 게이트가 구현되었습니다. 제한된 vLLM 계약의 rank별 `STAGE` builder와 variant 검증 레지스트리도 제공하지만, Agent 다운로드·캐시 활성화와 추천·준비·실행의 `STAGE` 소비는 아직 지원하지 않습니다.
+> 상태: **`FULL_SNAPSHOT` 배포 경로와 `VLLM_RAY_PP_V1` 소비 구현, `STAGE` 생성·등록 구현**. 중앙 제어면의 불변 정규화 매니페스트 레지스트리, 노드 콘텐츠 주소 캐시와 명시적 deployment 준비 API·CLI, `PREPARE_MODEL → PREPARE_IMAGE` Agent 작업과 배포 소비 게이트가 구현되었습니다. 0.3.18의 2·3노드 엄격한 Ray backend도 각 노드의 검증된 `FULL_SNAPSHOT`을 소비합니다. 제한된 vLLM 계약의 rank별 `STAGE` builder와 variant 검증 레지스트리도 제공하지만, Agent 다운로드·캐시 활성화와 추천·준비·실행의 `STAGE` 소비는 아직 지원하지 않습니다.
 
 ## 목적
 
@@ -56,7 +56,7 @@ vLLM의 sharded-state 파일명 rank는 pipeline rank가 아니라 tensor-parall
 
 등록은 모든 rank를 하나의 논리 단위로 처리합니다. 누락·중복·범위 밖 rank, source/runtime/topology 불일치와 같은 고정 입력에서 달라진 stage 출력은 거부합니다. 성공한 등록은 `DRAFT`이며 실제 GPU에서 export와 load를 모두 검증한 최신 `GPU_EXPORT_LOAD/PASSED` 증적만 `VALIDATED` 승격을 허용합니다. 전제 조건 부족을 나타내는 `NOT_RUN`, synthetic 검사와 `FAILED`는 승격 근거가 아닙니다. 새 validation run 증적은 `DRAFT`에서만 추가합니다. 이미 등록한 동일 run의 정확한 재전송은 상태 전환 뒤에도 기존 결과를 반환하지만, `VALIDATED`와 `REVOKED`에 새 run을 추가하는 요청은 거부합니다. 검증된 variant의 신뢰가 깨졌다면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 닫고, 수정된 계약은 새 `DRAFT` variant에서 검증합니다. 번들 acceptance harness는 `PP=1`만 native load하므로 PP>1은 모든 rank의 실제 load·attestation을 수행한 별도 신뢰 검증이 없으면 승격하지 않습니다.
 
-variant 등록·증적 기록·상태 전이는 중앙 DB만 바꾸며 Agent task, 모델 다운로드, 이미지 pull, 추천·배포 세대 생성과 기존 컨테이너 변경을 만들지 않습니다. 현재 중앙 준비기는 `FULL_SNAPSHOT`만 허용합니다. 자세한 빌더·검증·실패 경계는 [stage artifact 문서](stage-artifacts.md)를 따릅니다.
+variant 등록·증적 기록·상태 전이는 중앙 DB만 바꾸며 Agent task, 모델 다운로드, 이미지 pull, 추천·배포 세대 생성과 기존 컨테이너 변경을 만들지 않습니다. 현재 중앙 준비기와 `VLLM_RAY_PP_V1` 런타임은 `FULL_SNAPSHOT`만 허용합니다. strict runtime의 rank 결합은 stage 매니페스트가 아니라 서버 UUID, 사설 주소와 전체 캐시 identity에 결합됩니다. 자세한 빌더·검증·실패 경계는 [stage artifact 문서](stage-artifacts.md)를 따릅니다.
 
 vLLM·PyTorch·safetensors·CUDA 계열 heavy dependency는 기본 Debian 패키지에 포함하지 않습니다. 별도의 digest 고정 OCI builder 환경에서만 설치하고 운영 Agent나 중앙 서버를 변환 작업자로 사용하지 않습니다.
 
@@ -245,7 +245,7 @@ Agent 준비기는 노드 로컬 설정으로 생성한 검증된 `TrustedHTTPSO
 - attempt journal은 매니페스트별 append-only 감사 이력이 아니라 마지막 상태 한 건을 원자적으로 교체하는 로컬 진단값입니다.
 - 현재 HTTPS 전송기는 인증 token, cookie 또는 사용자 지정 header를 지원하지 않습니다. 별도 인증 정보 없이 네트워크와 TLS 경계에서 접근 가능한 신뢰 origin이 필요합니다.
 - 중앙 준비 상태와 노드별 시도 증적은 제공하지만 자동 경보, 전역 참조 검사와 quarantine는 아직 없습니다.
-- 중앙 준비는 각 노드에 모델 전체 `FULL_SNAPSHOT`을 둡니다. 별도 신뢰 builder와 `STAGE` variant 레지스트리는 있지만 rank별 노드 다운로드·원자적 활성화, P2P 청크 전송과 실제 분산 배포 소비는 아직 없습니다.
+- 중앙 준비는 각 노드에 모델 전체 `FULL_SNAPSHOT`을 두고 현재 `VLLM_RAY_PP_V1`도 이를 사용합니다. 별도 신뢰 builder와 `STAGE` variant 레지스트리는 있지만 rank별 노드 다운로드·원자적 활성화, P2P 청크 전송과 stage-local `sharded_state` 소비는 아직 없습니다.
 
 ## 무결성과 신뢰 경계
 
@@ -264,4 +264,6 @@ SHA-256 다이제스트는 나중에 받은 바이트가 등록된 기대값과 
 
 정규 매니페스트 등록만으로 모델이 특정 노드에 준비됐거나 실행 가능하다고 판단해서는 안 됩니다. `0.3.16`에서는 전용 준비 적용을 완료해 두 단계의 정확한 노드 증적이 모두 성공해야 추천 세대 apply가 이를 소비할 수 있습니다. 추천·수락과 preview는 계속 다운로드나 호스트 변경을 만들지 않으며, `benchmark-runs/prepare`도 모델 바이트가 아니라 DB 실행 문맥만 준비합니다.
 
-후속 범위는 게시자·이미지 서명과 provenance, 감사 가능한 quarantine·참조 검사·eviction, origin 인증 수단, 중앙 자동 경보입니다. `VALIDATED` stage variant를 추천·준비 계획에 결합하고, 각 노드가 자신의 rank 매니페스트만 내려받아 원자적으로 활성화한 뒤 정확한 `sharded_state`로 실행하는 경로도 후속 PR에서 추가합니다. 이 경로가 완성되기 전에는 stage 등록을 분산 설치 완료로 해석하지 않습니다.
+다음 PR은 `VALIDATED` stage variant를 추천·준비 계획에 결합하고, 각 노드가 자신의 rank 매니페스트만 내려받아 원자적으로 활성화한 뒤 정확한 `sharded_state`로 실행하는 경로를 추가할 계획입니다. 그 다음 PR은 probe 기반 캐시 투영과 `READY`·`STALE`·`MISSING`·`CORRUPT`·`QUARANTINED` 상태, 감사 가능한 격리 절차를 추가할 계획입니다. 이 경로가 완성되기 전에는 stage 등록을 분산 설치 완료로, 현재 수동 캐시 이동을 공식 quarantine로 해석하지 않습니다.
+
+그 밖의 후속 범위는 게시자·이미지 서명과 provenance, 전역 참조 검사·eviction, origin 인증 수단과 중앙 자동 경보입니다.

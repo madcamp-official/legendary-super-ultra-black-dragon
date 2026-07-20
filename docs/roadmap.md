@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
 기준일: 2026-07-21
-현재 누적 개발 브랜치: `version/0.3.17` (vLLM 단계 아티팩트 레지스트리와 신뢰 빌더, 공식 병합 전 Draft)
+현재 누적 개발 브랜치: `version/0.3.18` (`VLLM_RAY_PP_V1` 결정론적 rank 결합과 실행 전 증적, 공식 병합 전 Draft)
 
 ## 방향과 원칙
 
@@ -30,10 +30,13 @@ v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR
 - `version/0.3.15`: 신뢰 HTTPS 다운로드, 청크 CAS, 재개 가능한 파일 조립과 원자적 `FULL_SNAPSHOT` 캐시 활성화
 - `version/0.3.16`: 명시적 중앙 준비 operation·API·CLI, 폐쇄형 `PREPARE_MODEL`·`PREPARE_IMAGE`, digest-pinned OCI pull과 노드별 시도 증적
 - `version/0.3.17`: 제한된 vLLM 0.9.0 계약의 rank별 stage 빌더, 불변 variant 레지스트리와 실제 GPU 검증 승격 게이트
-- 다음 PR: 결정론적 다중 노드 pipeline rank 결합과 실행 전 rank attestation
-- 그 이후: rank별 `STAGE` 준비·로더 통합과 probe 기반 캐시 수명주기
+- `version/0.3.18`: vLLM 0.9.0 V0 Ray에 고정된 `VLLM_RAY_PP_V1`, 서버 UUID·RFC1918 주소 기반 pipeline rank 결합, 엄격한 컨테이너 identity와 source-pinned 실행 증적
+- 다음 PR: rank별 `STAGE` 준비·원자적 활성화와 stage-local `sharded_state` 로더 통합
+- 그 다음 PR: probe 기반 캐시 투영, 준비·배포 소비 게이트와 명시적 `QUARANTINED` 수명주기
 
-현재 누적 `version/0.3.17` 범위는 기존 추천·수락·준비·배포 경계를 유지하면서, 검증된 `FULL_SNAPSHOT`을 제한된 vLLM 0.9.0 계약으로 pipeline rank별 파일에 내보내는 신뢰된 오프라인 빌더와 중앙 variant 레지스트리를 추가합니다. 모든 rank의 정규 매니페스트를 원자적으로 등록하고 실제 GPU `GPU_EXPORT_LOAD/PASSED` 증적이 있는 `DRAFT`만 `VALIDATED`로 승격할 수 있습니다. 기본 번들 수용 검사는 `PP=1`만 실제 load하며, `PP>1`은 후속 rank 결합·loader 검증 전까지 `DRAFT`로 유지합니다. 등록·증적·상태 전이는 추천, Agent task, 다운로드, Docker 실행이나 기존 배포 변경을 만들지 않습니다.
+현재 누적 `version/0.3.18` 범위는 기존 추천·수락·준비·배포 경계와 legacy 계획 JSON 호환성을 유지하면서, 중앙 추천의 2·3노드 세대에 폐쇄형 `VLLM_RAY_PP_V1`을 추가합니다. 런타임은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, 노드별 정상 GPU 한 장과 각 노드의 검증된 `FULL_SNAPSHOT`을 요구합니다. 서버 UUID를 identity로 사용하고 head를 rank 0으로 고정하며 worker는 고유 RFC1918 IPv4 문자열 순으로 결합합니다. GCS 6379, worker 20000-21000, loopback API 8000과 backend·rank·component 컨테이너 레이블도 고정합니다.
+
+`pipeline-rank-contract`는 vLLM 버전, Ray 노드·GPU, Dure UUID custom resource와 API 시작 뒤 worker actor topology를 확인하고 고정된 vLLM 0.9.0 소스 정렬 규칙에서 binding을 도출합니다. Ray가 vLLM 내부 rank를 공개 필드로 직접 보고한 증거는 아닙니다. 실제 2·3노드 harness는 기본적으로 `NOT_RUN`·77이며 명시적 opt-in과 고정 설정·GPU·모델·runtime 전제가 모두 있어야 분산 load와 최소 추론을 시작합니다. harness는 UUID resource를 대조하지만 설정의 이미지 digest는 선언값이므로 신뢰된 wrapper의 별도 이미지 대조가 필요합니다. 이 Draft 범위는 실제 GPU 수용 검사 결과가 첨부되기 전 장기 안정성이나 이기종 driver 호환성을 증명하지 않습니다.
 
 아티팩트 매니페스트는 중앙 DB에 정규 파일·청크 관계를 저장하고, 노드 라이브러리는 노드 로컬 신뢰 origin에서 해당 청크를 받아 `FULL_SNAPSHOT` 캐시로 materialize합니다. 중단 다운로드와 조립을 재개하고, CAS·파일·전체 트리·양자화 식별자를 다시 검사한 뒤 marker-last와 no-replace rename으로 활성화합니다. 중앙 준비 API·CLI와 `PREPARE_MODEL`·`PREPARE_IMAGE` Agent 작업은 preview와 명시적 적용을 분리하며, 실패 노드의 현재 단계만 재시도합니다. 별도 오프라인 빌더는 source 매니페스트와 전체 파일 SHA-256을 export 직전에 다시 검증하고 `stages/<pp-rank>`로 격리한 vLLM-native sharded state를 만듭니다. 다만 probe와 조정되는 독립 `READY` 캐시 수명주기, rank별 `STAGE`의 노드 다운로드·활성화와 분산 로더는 아직 없으며, 추천·수락·GPU 추가만으로 자동 준비를 시작하지 않습니다. 이 누적 브랜치는 공식 `main`에 병합되기 전까지 Draft 개발 상태입니다.
 
@@ -73,7 +76,7 @@ v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR
 
 목표: GPU가 추가되었을 때 프로필 입력 순서에 의존하지 않고 검증된 후보 중 SLO를 만족하는 최고 품질 모델을 추천하며, 운영자의 명시적 수락으로만 적용 전 세대를 만든다.
 
-현재 상태: 결정론적 선택기, 중앙 모델 레지스트리, 구조화된 증적과 승격 게이트, 폐쇄형 단일 GPU 벤치마크, 추천 스냅샷과 명시적 수락, 세대별 적용·검증·롤백은 구현되었습니다. 네트워크·NCCL 자동 증적, 전체 작업 부하 매트릭스와 24시간 복구 검증이 남아 있어 다중 노드 완료 기준은 아직 충족하지 않았습니다.
+현재 상태: 결정론적 선택기, 중앙 모델 레지스트리, 구조화된 증적과 승격 게이트, 폐쇄형 단일 GPU 벤치마크, 추천 스냅샷과 명시적 수락, 세대별 적용·검증·롤백, `FULL_SNAPSHOT` 기반 2·3노드 `VLLM_RAY_PP_V1` rank 결합은 구현되었습니다. 실제 GPU harness의 `PASSED`, 네트워크·NCCL 자동 증적, rank별 stage loader, 전체 작업 부하 매트릭스와 24시간 복구 검증이 남아 있어 다중 노드 완료 기준은 아직 충족하지 않았습니다.
 
 우선순위 작업:
 
@@ -99,6 +102,8 @@ v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR
 - 롤백 준비는 task를 만들지 않고, 명시적 적용은 검증된 직접 직전 세대와 동일 전체 토폴로지만 복구한다.
 - 실패 노드 재시도와 늦은 task 완료가 시도 번호로 분리되고 같은 계보의 활성 변경은 하나뿐이다.
 - 3×24GB의 정상 사설망에서는 기존 72B 기준선과 호환되는 추천을 만들 수 있다.
+- 다중 노드 세대는 서버 UUID·고유 사설 IPv4와 정확한 vLLM 0.9.0 계약에 결합되고, rank·노드·actor 불일치 시 host 변경 또는 다음 단계를 차단한다.
+- preflight 실패는 기존 세대를 변경하지 않고, 실행 중 실패는 자동 driver 변경·자동 failover 없이 노드 격리, 명시적 재시도 또는 직전 검증 세대 롤백으로 복구한다.
 - 새 문서, 단위·통합 테스트, GPU 수용 검사 아티팩트가 정책과 일치한다.
 
 ### v0.4 — 노드 보안과 사설 네트워크
@@ -201,9 +206,10 @@ v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR
 - 7B/14B/32B 단일 GPU와 72B 파이프라인의 비용·지연 비교
 - 로그·메트릭·추적 정보의 프롬프트·자격 증명 유출 검사
 - 작업 재전달, 중앙 제어면 재시작과 DB 복구 시 멱등성 검사
+- vLLM 0.9.0의 source-pinned rank 계약과 실제 2·3노드 worker 배치의 일치 검사
 
 모든 기능 변경은 단위·통합 테스트, 휠, Alembic, Debian 간이 검사를 통과해야 한다. GPU와
-네트워크 관련 수용 검사는 별도의 실제 환경 결과를 릴리스 기록에 첨부한다.
+네트워크 관련 수용 검사는 별도의 실제 환경 결과를 릴리스 기록에 첨부한다. 전제 조건이 없어 실행하지 못한 `NOT_RUN`·77은 통과 결과로 바꾸지 않는다.
 
 ## 진행·중단 기준
 
