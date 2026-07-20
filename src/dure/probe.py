@@ -19,11 +19,14 @@ from .models import (
 )
 
 
+DURE_MODEL_ROOT = Path("/var/lib/dure/models")
 DEFAULT_MODEL_ROOTS = (
-    Path("/var/lib/dure/models"),
+    DURE_MODEL_ROOT,
     Path.home() / ".cache" / "huggingface" / "hub",
 )
 MAX_DISCOVERED_MODELS = 100
+DURE_MODEL_METADATA_FILE = ".dure-model.json"
+DURE_MODEL_METADATA_SCHEMA = "dure-model-cache-v1"
 LLM_RUNTIME_MARKERS = {
     "vllm": "vllm",
     "ollama": "ollama",
@@ -159,6 +162,44 @@ class NodeProbe:
             return str(method) if method else None
         return None
 
+    @staticmethod
+    def _dure_model_metadata(candidate: Path) -> dict[str, str]:
+        path = candidate / DURE_MODEL_METADATA_FILE
+        try:
+            if path.stat().st_size > 64 * 1024:
+                return {}
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        expected = {
+            "schema",
+            "repository",
+            "revision",
+            "manifest_digest",
+            "quantization",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            return {}
+        if value.get("schema") != DURE_MODEL_METADATA_SCHEMA:
+            return {}
+        if not isinstance(value.get("repository"), str) or re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value["repository"]
+        ) is None:
+            return {}
+        if not isinstance(value.get("revision"), str) or re.fullmatch(
+            r"[0-9a-f]{40,64}", value["revision"]
+        ) is None:
+            return {}
+        if not isinstance(value.get("manifest_digest"), str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", value["manifest_digest"]
+        ) is None:
+            return {}
+        if not isinstance(value.get("quantization"), str) or re.fullmatch(
+            r"[a-z0-9][a-z0-9._-]{1,39}", value["quantization"]
+        ) is None:
+            return {}
+        return value
+
     def _probe_dure_models(self, root: Path) -> list[InstalledModelProfile]:
         try:
             candidates = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name)
@@ -168,18 +209,35 @@ class NodeProbe:
         for candidate in candidates[:MAX_DISCOVERED_MODELS]:
             config_path = candidate / "config.json"
             config = self._model_config(config_path) if config_path.is_file() else {}
+            metadata = self._dure_model_metadata(candidate)
+            configured_quantization = self._quantization(config)
+            if (
+                metadata
+                and configured_quantization
+                and metadata["quantization"] != configured_quantization
+            ):
+                metadata = {}
             configured_name = config.get("_name_or_path")
             model_id = (
-                str(configured_name)
-                if configured_name and not str(configured_name).startswith("/")
-                else candidate.name
+                metadata["repository"]
+                if metadata
+                else (
+                    str(configured_name)
+                    if configured_name and not str(configured_name).startswith("/")
+                    else candidate.name
+                )
             )
             models.append(
                 InstalledModelProfile(
                     source="dure",
                     model_id=model_id,
                     path=str(candidate),
-                    quantization=self._quantization(config),
+                    revision=metadata.get("revision") if metadata else None,
+                    quantization=(
+                        metadata["quantization"]
+                        if metadata
+                        else configured_quantization
+                    ),
                     size_mib=self._model_size_mib(candidate),
                     complete=config_path.is_file(),
                 )
