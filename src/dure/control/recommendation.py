@@ -12,13 +12,26 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from dure.catalog import CatalogEntry, ModelCatalog, PlacementProfile
+from dure.catalog import (
+    CatalogEntry,
+    ModelCatalog,
+    NetworkEvidenceBinding,
+    PlacementProfile,
+)
 from dure.models import DeploymentPlan, ModelSpec, NodeAssignment, NodeProfile
 from dure.selector import InventoryNode, recommend_model
-from dure.task import TaskStatus, TaskType
+from dure.task import (
+    TaskStatus,
+    TaskType,
+    benchmark_inventory_fingerprint,
+)
+
+from .benchmark import BENCHMARK_POLICY_VERSION, BENCHMARK_SUITE_ID
 
 from .models import (
     AuditEvent,
+    BenchmarkEvidence,
+    BenchmarkRun,
     Deployment,
     DeploymentOperation,
     DeploymentRecommendationRecord,
@@ -34,8 +47,9 @@ from .models import (
 from .service import aware, node_status
 
 
-POLICY_VERSION = "central-quality-within-slo-v1"
+POLICY_VERSION = "central-quality-within-slo-v2"
 PROFILE_MAX_AGE = timedelta(seconds=90)
+NETWORK_EVIDENCE_MAX_AGE = timedelta(hours=24)
 GENERATION_NAMESPACE = uuid.UUID("74ebf646-2d77-4fcf-8524-1777a274eb93")
 PRIVATE_IPV4_NETWORKS = tuple(
     ipaddress.ip_network(value)
@@ -146,8 +160,152 @@ def _inventory_snapshot_fingerprint(snapshot: list[dict[str, Any]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _exact_node_set(value: Any, *, node_count: int) -> tuple[str, ...] | None:
+    if (
+        not isinstance(value, list)
+        or len(value) != node_count
+        or any(not isinstance(item, str) for item in value)
+        or len(value) != len(set(value))
+    ):
+        return None
+    normalized = tuple(sorted(value))
+    if list(normalized) != value:
+        return None
+    return normalized
+
+
+def _network_measurements_qualify(
+    evidence: BenchmarkEvidence,
+    placement: PlacementProfileRecord,
+) -> bool:
+    bandwidth = evidence.network_bandwidth_mbps
+    rtt = evidence.network_rtt_ms
+    packet_loss = evidence.packet_loss_pct
+    if bandwidth is None or rtt is None or packet_loss is None:
+        return False
+    if (
+        placement.min_bandwidth_mbps is not None
+        and bandwidth < placement.min_bandwidth_mbps
+    ):
+        return False
+    if placement.max_rtt_ms is not None and rtt > placement.max_rtt_ms:
+        return False
+    if (
+        placement.max_packet_loss_pct is not None
+        and packet_loss > placement.max_packet_loss_pct
+    ):
+        return False
+    return not placement.requires_nccl or evidence.nccl_all_reduce_ok is True
+
+
+def _network_evidence_bindings(
+    session: Session,
+    *,
+    release: ModelRelease,
+    artifact: ModelArtifact,
+    runtime: RuntimeRelease,
+    placement: PlacementProfileRecord,
+    inventory: list[InventoryNode],
+    now: datetime,
+) -> tuple[NetworkEvidenceBinding, ...]:
+    requires_network = placement.requires_network_evidence or placement.node_count > 1
+    if not requires_network:
+        return ()
+
+    inventory_by_id = {node.node_id: node for node in inventory}
+    evidence_rows = list(
+        session.scalars(
+            select(BenchmarkEvidence)
+            .where(
+                BenchmarkEvidence.release_id == release.id,
+                BenchmarkEvidence.placement_id == placement.id,
+            )
+            .order_by(
+                BenchmarkEvidence.registration_sequence.desc(),
+                BenchmarkEvidence.id.desc(),
+            )
+        )
+    )
+    unresolved_runs = list(
+        session.scalars(
+            select(BenchmarkRun)
+            .where(
+                BenchmarkRun.release_id == release.id,
+                BenchmarkRun.placement_id == placement.id,
+                BenchmarkRun.status.in_(("PREPARED", "QUEUED", "FAILED")),
+            )
+            .order_by(BenchmarkRun.updated_at.desc(), BenchmarkRun.id.desc())
+        )
+    )
+
+    latest_run_by_nodes: dict[tuple[str, ...], BenchmarkRun] = {}
+    for run in unresolved_runs:
+        node_set = _exact_node_set(run.node_ids, node_count=placement.node_count)
+        if node_set is not None and node_set not in latest_run_by_nodes:
+            latest_run_by_nodes[node_set] = run
+
+    bindings: list[NetworkEvidenceBinding] = []
+    seen_node_sets: set[tuple[str, ...]] = set()
+    for evidence in evidence_rows:
+        node_set = _exact_node_set(
+            evidence.node_ids,
+            node_count=placement.node_count,
+        )
+        if node_set is None or node_set in seen_node_sets:
+            continue
+        # The first row is authoritative for this exact set even when it failed.
+        seen_node_sets.add(node_set)
+        if any(
+            node_id not in inventory_by_id
+            or inventory_by_id[node_id].profile is None
+            for node_id in node_set
+        ):
+            continue
+        registered_at = aware(evidence.created_at)
+        age = now - registered_at
+        if age < timedelta(0) or age > NETWORK_EVIDENCE_MAX_AGE:
+            continue
+        later_run = latest_run_by_nodes.get(node_set)
+        if later_run is not None and aware(later_run.updated_at) > registered_at:
+            continue
+        if (
+            evidence.status != "PASSED"
+            or evidence.failure_codes
+            or evidence.suite_id != BENCHMARK_SUITE_ID
+            or evidence.policy_version != BENCHMARK_POLICY_VERSION
+            or evidence.artifact_revision != artifact.revision
+            or evidence.artifact_manifest_digest != artifact.manifest_digest
+            or evidence.runtime_image != runtime.image
+            or not _network_measurements_qualify(evidence, placement)
+        ):
+            continue
+        profiles = [
+            (node_id, inventory_by_id[node_id].profile)
+            for node_id in node_set
+        ]
+        if evidence.inventory_fingerprint != benchmark_inventory_fingerprint(profiles):
+            continue
+        bindings.append(
+            NetworkEvidenceBinding(
+                evidence_id=evidence.id,
+                evidence_digest=evidence.evidence_digest,
+                node_ids=node_set,
+                registered_at=registered_at.isoformat(),
+            )
+        )
+    return tuple(
+        sorted(
+            bindings,
+            key=lambda item: (item.node_ids, item.evidence_digest, item.evidence_id),
+        )
+    )
+
+
 def _active_catalog(
     session: Session,
+    *,
+    inventory: list[InventoryNode],
+    now: datetime,
 ) -> tuple[ModelCatalog, dict[str, dict[str, Any]]]:
     rows = session.execute(
         select(ModelRelease, ModelArtifact, RuntimeRelease, PlacementProfileRecord)
@@ -171,6 +329,15 @@ def _active_catalog(
     snapshot: list[dict[str, Any]] = []
     for release, artifact, runtime, placement in rows:
         candidate_id = f"{release.id}:{placement.id}"
+        network_evidence = _network_evidence_bindings(
+            session,
+            release=release,
+            artifact=artifact,
+            runtime=runtime,
+            placement=placement,
+            inventory=inventory,
+            now=now,
+        )
         context = {
             "candidate_id": candidate_id,
             "model_id": artifact.model_id,
@@ -227,6 +394,15 @@ def _active_catalog(
                     "min_vram_headroom_pct": placement.min_vram_headroom_pct,
                     "min_throughput_tps": placement.min_throughput_tps,
                 },
+                "network_evidence": [
+                    {
+                        "evidence_id": item.evidence_id,
+                        "evidence_digest": item.evidence_digest,
+                        "node_ids": list(item.node_ids),
+                        "registered_at": item.registered_at,
+                    }
+                    for item in network_evidence
+                ],
             }
         )
         entries.append(
@@ -255,6 +431,7 @@ def _active_catalog(
                 artifact_revision=artifact.revision,
                 candidate_id=candidate_id,
                 gpu_architectures=tuple(sorted(runtime.gpu_architectures)),
+                network_evidence=network_evidence,
             )
         )
 
@@ -352,7 +529,11 @@ def evaluate_deployment_recommendation(
             all_online=all_online,
             now=evaluated_at,
         )
-        catalog, contexts = _active_catalog(session)
+        catalog, contexts = _active_catalog(
+            session,
+            inventory=inventory,
+            now=evaluated_at,
+        )
     result = recommend_model(inventory, catalog=catalog)
     inventory_snapshot = canonical_inventory_snapshot(inventory)
     if _inventory_snapshot_fingerprint(inventory_snapshot) != result.inventory_fingerprint:
@@ -361,16 +542,26 @@ def evaluate_deployment_recommendation(
             code="INVENTORY_FINGERPRINT_INCONSISTENT",
         )
 
-    candidates = [
-        {
+    candidates = []
+    for evaluation in result.evaluations:
+        candidate = {
             **contexts[evaluation.candidate_id],
             "quality_rank": evaluation.quality_rank,
             "feasible": evaluation.feasible,
             "node_ids": list(evaluation.node_ids),
             "rejections": [item.to_dict() for item in evaluation.rejections],
         }
-        for evaluation in result.evaluations
-    ]
+        if evaluation.network_evidence_id is not None:
+            candidate.update(
+                {
+                    "network_evidence_id": evaluation.network_evidence_id,
+                    "network_evidence_digest": evaluation.network_evidence_digest,
+                    "network_evidence_registered_at": (
+                        evaluation.network_evidence_registered_at
+                    ),
+                }
+            )
+        candidates.append(candidate)
     selected = next(
         (
             candidate
