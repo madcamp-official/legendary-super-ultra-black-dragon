@@ -135,13 +135,41 @@ class ControlAPITests(unittest.TestCase):
             self.client.post("/v1/admin/model-artifacts", json=artifact_body).status_code,
             401,
         )
-        unsafe = dict(artifact_body, command="id")
-        self.assertEqual(
-            self.client.post(
-                "/v1/admin/model-artifacts", headers=self.admin, json=unsafe
-            ).status_code,
-            422,
+        for key, value in (
+            ("command", "id"),
+            ("docker_args", ["--privileged"]),
+            ("env", {"TOKEN": "secret"}),
+            ("mounts", ["/etc:/host"]),
+            ("host_path", "/etc"),
+        ):
+            with self.subTest(key=key):
+                unsafe = dict(artifact_body, **{key: value})
+                self.assertEqual(
+                    self.client.post(
+                        "/v1/admin/model-artifacts", headers=self.admin, json=unsafe
+                    ).status_code,
+                    422,
+                )
+        created = self.client.post(
+            "/v1/admin/model-artifacts", headers=self.admin, json=artifact_body
         )
+        self.assertEqual(created.status_code, 200)
+        duplicate = self.client.post(
+            "/v1/admin/model-artifacts", headers=self.admin, json=artifact_body
+        )
+        self.assertEqual(duplicate.status_code, 409)
+        unsafe_runtime = self.client.post(
+            "/v1/admin/runtime-releases",
+            headers=self.admin,
+            json={
+                "version": "unsafe",
+                "image": "--privileged@sha256:" + "c" * 64,
+                "vllm_version": "0.9.0",
+                "cuda_version": "12.8",
+                "gpu_architectures": ["ampere"],
+            },
+        )
+        self.assertEqual(unsafe_runtime.status_code, 400)
 
     def test_model_registry_api_creates_and_transitions_release(self):
         artifact = self.client.post(

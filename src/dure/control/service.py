@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from dure.models import DeploymentPlan, NodeProfile
@@ -39,6 +40,10 @@ MODEL_RELEASE_TRANSITIONS = {
 QUANTIZATIONS = {"awq", "gptq", "fp8", "fp16", "bf16", "int8"}
 GPU_ARCHITECTURES = {"ampere", "ada", "hopper", "blackwell"}
 TOPOLOGIES = {"single-gpu", "pipeline"}
+
+
+class RegistryConflictError(ValueError):
+    pass
 
 
 def secret_hash(value: str) -> str:
@@ -86,6 +91,20 @@ def create_model_artifact(
         raise ValueError("model sizes and layer count must be positive")
     if not license_id.strip() or len(license_id) > 100:
         raise ValueError("license_id is required")
+    existing = session.scalar(
+        select(ModelArtifact.id).where(
+            or_(
+                ModelArtifact.manifest_digest == manifest_digest,
+                (
+                    (ModelArtifact.repository == repository)
+                    & (ModelArtifact.revision == revision)
+                    & (ModelArtifact.quantization == quantization)
+                ),
+            )
+        )
+    )
+    if existing is not None:
+        raise RegistryConflictError("model artifact already exists")
     record = ModelArtifact(
         model_id=model_id,
         repository=repository,
@@ -98,7 +117,11 @@ def create_model_artifact(
         license_id=license_id,
     )
     session.add(record)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise RegistryConflictError("model artifact already exists") from exc
     audit(session, "admin", "model_artifact.create", record.id, "success")
     session.commit()
     return record
@@ -113,7 +136,12 @@ def create_runtime_release(
     cuda_version: str,
     gpu_architectures: list[str],
 ) -> RuntimeRelease:
-    if re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image) is None:
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}", image)
+        is None
+        or "/../" in image
+        or "//" in image
+    ):
         raise ValueError("runtime image must be OCI digest-pinned")
     if not all(isinstance(item, str) for item in gpu_architectures):
         raise ValueError("unsupported GPU architecture")
@@ -122,6 +150,8 @@ def create_runtime_release(
         raise ValueError("unsupported GPU architecture")
     if not version.strip() or not vllm_version.strip() or not cuda_version.strip():
         raise ValueError("runtime version fields are required")
+    if session.scalar(select(RuntimeRelease.id).where(RuntimeRelease.image == image)) is not None:
+        raise RegistryConflictError("runtime release already exists")
     record = RuntimeRelease(
         version=version,
         image=image,
@@ -130,7 +160,11 @@ def create_runtime_release(
         gpu_architectures=normalized_architectures,
     )
     session.add(record)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise RegistryConflictError("runtime release already exists") from exc
     audit(session, "admin", "runtime_release.create", record.id, "success")
     session.commit()
     return record
@@ -145,6 +179,12 @@ def create_model_release(
         raise ValueError("unknown runtime release")
     if quality_rank <= 0:
         raise ValueError("quality_rank must be positive")
+    if session.scalar(
+        select(ModelRelease.id).where(
+            ModelRelease.artifact_id == artifact_id, ModelRelease.runtime_id == runtime_id
+        )
+    ) is not None:
+        raise RegistryConflictError("model release already exists")
     record = ModelRelease(
         artifact_id=artifact_id,
         runtime_id=runtime_id,
@@ -152,7 +192,11 @@ def create_model_release(
         status="DRAFT",
     )
     session.add(record)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise RegistryConflictError("model release already exists") from exc
     audit(session, "admin", "model_release.create", record.id, "success")
     session.commit()
     return record
@@ -181,7 +225,9 @@ def add_placement_profile(
     min_vram_headroom_pct: float,
     min_throughput_tps: float,
 ) -> PlacementProfileRecord:
-    release = session.get(ModelRelease, release_id)
+    release = session.scalar(
+        select(ModelRelease).where(ModelRelease.id == release_id).with_for_update()
+    )
     if release is None:
         raise ValueError("unknown model release")
     if release.status != "DRAFT":
@@ -220,6 +266,13 @@ def add_placement_profile(
         raise ValueError("success and VRAM thresholds are out of range")
     if min_throughput_tps <= 0:
         raise ValueError("throughput SLO must be positive")
+    if session.scalar(
+        select(PlacementProfileRecord.id).where(
+            PlacementProfileRecord.release_id == release_id,
+            PlacementProfileRecord.profile_id == profile_id,
+        )
+    ) is not None:
+        raise RegistryConflictError("placement profile already exists")
     record = PlacementProfileRecord(
         release_id=release_id,
         profile_id=profile_id,
@@ -242,7 +295,11 @@ def add_placement_profile(
         min_throughput_tps=min_throughput_tps,
     )
     session.add(record)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise RegistryConflictError("placement profile already exists") from exc
     audit(session, "admin", "placement_profile.create", record.id, "success")
     session.commit()
     return record

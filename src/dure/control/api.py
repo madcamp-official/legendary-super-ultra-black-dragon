@@ -44,6 +44,7 @@ from .service import (
     save_deployment,
     save_heartbeat,
     add_placement_profile,
+    RegistryConflictError,
     transition_model_release,
 )
 
@@ -404,6 +405,8 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     ):
         try:
             record = create_model_artifact(session, **body.model_dump())
+        except RegistryConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"artifact": _artifact_dict(record)}
@@ -414,6 +417,8 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     ):
         try:
             record = create_runtime_release(session, **body.model_dump())
+        except RegistryConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"runtime": _runtime_release_dict(record)}
@@ -424,6 +429,8 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     ):
         try:
             record = create_model_release(session, **body.model_dump())
+        except RegistryConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"release": _model_release_dict(session, record)}
@@ -453,6 +460,8 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             record = add_placement_profile(
                 session, release_id=release_id, **body.model_dump()
             )
+        except RegistryConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"placement": _placement_dict(record)}
