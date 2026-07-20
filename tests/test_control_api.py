@@ -10,6 +10,7 @@ except ImportError:  # pragma: no cover
     TestClient = None
 
 from dure.control.api import create_app
+from dure.control.models import Node
 from dure.planner import build_plan
 from tests.helpers import profile
 
@@ -36,12 +37,26 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(claimed.status_code, 200)
         node_id = claimed.json()["node_id"]
         agent_headers = {"Authorization": f"Bearer {claimed.json()['credential']}"}
-        heartbeat = self.client.post("/v1/agent/heartbeat", headers=agent_headers, json={"state": {"phase": "READY", "role": "gpu-worker"}})
+        heartbeat = self.client.post(
+            "/v1/agent/heartbeat",
+            headers=agent_headers,
+            json={
+                "state": {"phase": "READY", "role": "gpu-worker"},
+                "agent_version": "0.3.12",
+            },
+        )
         self.assertEqual(heartbeat.status_code, 200)
         nodes = self.client.get("/v1/admin/nodes", headers=self.admin).json()["nodes"]
         self.assertEqual(nodes[0]["id"], node_id)
+        self.assertEqual(nodes[0]["agent_version"], "0.3.12")
         self.assertEqual(nodes[0]["phase"], "READY")
         self.assertEqual(nodes[0]["connectivity"], "online")
+        invalid_version = self.client.post(
+            "/v1/agent/heartbeat",
+            headers=agent_headers,
+            json={"state": {}, "agent_version": "development"},
+        )
+        self.assertEqual(invalid_version.status_code, 422)
         self.assertEqual(self.client.post(f"/v1/admin/nodes/{node_id}/revoke", headers=self.admin).status_code, 200)
         self.assertEqual(self.client.post("/v1/agent/heartbeat", headers=agent_headers, json={"state": {}}).status_code, 401)
 
@@ -91,6 +106,7 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(approved.status_code, 200)
         nodes = self.client.get("/v1/admin/nodes", headers=self.admin).json()["nodes"]
         self.assertTrue(nodes[0]["approved"])
+        self.assertEqual(nodes[0]["agent_version"], "0.3.0")
 
     def test_deployment_bulk_task_claim_and_complete(self):
         enrollment = self.client.post("/v1/admin/enrollments", headers=self.admin, json={}).json()
@@ -110,6 +126,14 @@ class ControlAPITests(unittest.TestCase):
         })
         self.assertEqual(queued.status_code, 200)
         self.assertIn("missing", queued.json()["errors"])
+        with self.client.app.state.session_factory() as session:
+            node = session.get(Node, node_id)
+            node.desired_state = None
+            session.commit()
+        node_view = self.client.get(
+            f"/v1/admin/nodes/{node_id}", headers=self.admin
+        ).json()["node"]
+        self.assertEqual(node_view["desired_state"], "APPLY_DEPLOYMENT")
         task = self.client.post("/v1/agent/tasks/claim", headers=agent_headers).json()["task"]
         self.assertEqual(task["type"], "APPLY_DEPLOYMENT")
         completed = self.client.post(
@@ -118,6 +142,10 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(completed.status_code, 200)
         detail = self.client.get(f"/v1/admin/tasks/{task['id']}", headers=self.admin).json()["task"]
         self.assertEqual(detail["status"], "SUCCEEDED")
+        node_view = self.client.get(
+            f"/v1/admin/nodes/{node_id}", headers=self.admin
+        ).json()["node"]
+        self.assertIsNone(node_view["desired_state"])
 
     def test_model_registry_requires_admin_and_rejects_extra_execution_fields(self):
         artifact_body = {

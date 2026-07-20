@@ -1,6 +1,6 @@
 # 모델 선택 정책
 
-> 상태: **부분 구현**. 버전이 있는 Qwen2.5 정적 카탈로그와 결정론적 선택기, 중앙 모델 레지스트리, 벤치마크 증적 저장·`ACTIVE` 승격 게이트, 폐쇄형 단일 GPU 벤치마크 실행, 추천 스냅샷 저장과 명시적 수락을 통한 배포 세대 생성은 구현되었습니다. 세대별 영속 작업 상태·검증 완료 기록과 명시적 롤백은 아직 구현되지 않았습니다.
+> 상태: **부분 구현**. 버전이 있는 Qwen2.5 정적 카탈로그와 결정론적 선택기, 중앙 모델 레지스트리, 벤치마크 증적 저장·`ACTIVE` 승격 게이트, 폐쇄형 단일 GPU 벤치마크 실행, 추천 스냅샷 저장과 명시적 수락, 배포 세대별 적용·검증 상태와 명시적 직전 세대 롤백은 구현되었습니다. 다중 노드 네트워크·NCCL 자동 증적과 24시간 복구 검증은 아직 구현되지 않았습니다.
 
 ## 목표
 
@@ -113,7 +113,34 @@ dure admin apply <deployment-id> --nodes <node-id> ...
 
 `accept`는 저장된 선택 모드로 현재 추천을 다시 계산합니다. 콘텐츠 ID, 카탈로그·정책 버전, 인벤토리 지문과 정규화 스냅샷, 선택 릴리스·배치·노드가 하나라도 달라졌거나 실행 가능한 선택 후보가 없으면 `409`로 거부합니다. 성공하면 OCI 다이제스트·모델 리비전·중앙 노드 UUID를 고정한 `CREATED` 배포 세대만 저장합니다. 중앙 세대의 모델 경로는 probe가 조사할 수 있는 단일 디렉터리인 `/var/lib/dure/models/<model-id>--<revision>` 형식으로 고정해 같은 모델 ID의 다른 리비전을 혼동하지 않습니다. `accept_model_download`와 `pull_image`는 항상 거짓이며 작업·벤치마크 실행·다운로드·Docker 변경은 만들지 않습니다.
 
-첫 수락은 generation 1의 새 계보를 만듭니다. `--previous-generation`을 지정하면 그 세대의 계보를 이어 generation을 하나 증가시키며, 지정한 세대가 해당 계보의 최신 세대가 아니면 분기 생성을 거부합니다. 같은 추천과 같은 이전 세대를 반복 수락하면 기존 세대를 반환하고 감사 이벤트를 중복 생성하지 않습니다. 현재 계획 형식이 tensor rank를 표현하지 못하므로 단일 GPU와 기존 pipeline-parallel 표현 범위 밖의 배치는 수락 단계에서 실패 안전 방식으로 거부합니다.
+첫 수락은 generation 1의 새 계보를 만듭니다. `--previous-generation`을 지정하면 그 세대의 계보를 이어 generation을 하나 증가시키며, 지정한 세대가 해당 계보의 최신 세대가 아니거나 `ROLLED_BACK` 상태이거나 활성 operation·변경 task가 있으면 분기 생성을 거부합니다. 같은 추천과 같은 이전 세대를 반복 수락하면 기존 세대를 반환하고 감사 이벤트를 중복 생성하지 않습니다. 롤백으로 `ROLLED_BACK`이 된 최신 세대는 과거 계보를 이어 갈 이전 세대로 사용할 수 없으므로, 롤백 뒤 새 추천을 수락할 때는 이전 세대를 생략하고 새 계보를 시작해야 합니다. 현재 계획 형식이 tensor rank를 표현하지 못하므로 단일 GPU와 기존 pipeline-parallel 표현 범위 밖의 배치는 수락 단계에서 실패 안전 방식으로 거부합니다.
+
+## 세대 상태 조회와 롤백
+
+명시적 `apply`와 `verify`는 세대별 operation, 노드 상태와 task 시도 번호를 기록합니다. operation은 `PREPARED`, `QUEUED`, `RUNNING`, `SUCCEEDED`, `PARTIAL_FAILED`, `FAILED`를 사용하고 노드별 단계는 `PENDING`, `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELED`를 사용합니다. 현재 operation 단계와 시도 번호에 맞지 않는 늦은 task 보고는 상태를 변경하지 않습니다.
+
+```bash
+dure admin deployment show <deployment-id>
+dure admin deployment generations <deployment-id>
+
+# 준비만 하며 task는 만들지 않습니다.
+dure admin deployment rollback <latest-deployment-id> \
+  --nodes <node-a> <node-b> --serve
+
+# 같은 입력에 --apply를 추가해야 실제 롤백을 시작합니다.
+dure admin deployment rollback <latest-deployment-id> \
+  --nodes <node-a> <node-b> --serve --apply
+```
+
+관리자 API는 `GET /v1/admin/deployments/{deployment_id}`, `GET /v1/admin/deployments/{deployment_id}/generations`, `POST /v1/admin/deployments/{source_id}/rollback`을 제공합니다. 롤백 본문은 1개 이상 64개 이하의 정규 UUID `node_ids`와 기본값이 `false`인 엄격한 불리언 `apply`, `serve`만 받습니다. 대상 세대, 계획, 다운로드나 pull 입력은 받지 않으며 서버가 저장된 계보에서 대상을 결정합니다.
+
+`verified_at`은 계획의 전체 배정 노드를 대상으로 한 검증이 모두 성공하고 각 노드의 Agent가 0.3.12 이상일 때만 기록됩니다. 일부 노드나 다중 노드 배포에서 전체 배정 집합을 충족하지 않는 Ray head 전용 API 검증은 롤백 증거가 아닙니다. 롤백은 계보의 최신 소스에서 그 소스가 직접 가리키는 상태가 `VERIFIED`이고 `verified_at`을 보유한 직전 세대로만 가능하고, 두 세대의 전체 배정과 토폴로지가 정확히 같아야 합니다. 요청 노드 집합도 전체 배정과 정확히 같아야 하며 모든 노드는 승인됨·온라인이고 Agent 0.3.12 이상이어야 합니다. 양쪽 이미지가 OCI 다이제스트로 고정되지 않았으면 거부합니다.
+
+기본 요청은 `PREPARED` operation만 저장합니다. `apply=true` 뒤에만 `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET` 순서로 모든 노드를 처리하며, `serve=true`이면 Ray head 한 대에서 `START_API → VERIFY_API`를 이어서 수행합니다. 한 단계의 모든 노드가 성공해야 다음 단계로 넘어갑니다. 실패 뒤 같은 입력에 `apply=true`를 다시 보내면 현재 단계의 실패 노드만 증가한 시도 번호로 재시도합니다.
+
+일반 apply에서 `serve=true`를 사용할 때도 전체 배정 노드가 필요합니다. 모든 노드의 Ray 준비가 끝난 뒤에만 head 전용 API 시작·검증 단계가 생성됩니다. 전체 verify 결과는 단계별 필수 검사 이름이 빠지거나 중복되면 증거로 인정하지 않으며, 같은 노드를 공유하는 다른 계보의 활성 operation도 거부합니다.
+
+롤백은 모델 다운로드나 이미지 내려받기를 하지 않습니다. 대상 캐시와 다이제스트 이미지를 미리 준비해야 합니다. 같은 GPU에서 소스 컨테이너를 중지하고 대상 세대를 다시 만드는 방식이므로 중단이 발생할 수 있으며 블루·그린 배포가 아닙니다. 이 세대 검증은 네트워크·NCCL 시험이나 24시간 복구 검증을 대신하지 않습니다.
 
 ## 안전 경계
 
@@ -128,6 +155,9 @@ dure admin apply <deployment-id> --nodes <node-id> ...
 - 오래된 추천, 변경된 인벤토리·카탈로그·선택 결과는 수락할 수 없습니다.
 - 이전 세대를 지정한 수락은 해당 계보의 최신 세대만 이어 갈 수 있습니다.
 - 모델 캐시 경로는 모델 ID만이 아니라 리비전 또는 매니페스트 다이제스트를 포함해야 합니다.
+- 롤백 준비는 task나 호스트 변경을 만들지 않고, `apply=true`가 있어야만 적용을 시작합니다.
+- 롤백 대상은 클라이언트가 고르지 않으며 서버가 최신 소스의 검증된 직전 세대로 제한합니다.
+- 새 컨테이너는 정확한 배포·세대·노드 레이블을 사용하고, 불일치하는 컨테이너는 중지·제거·재사용하지 않습니다.
 
 ## 완료 기준
 
@@ -137,5 +167,8 @@ dure admin apply <deployment-id> --nodes <node-id> ...
 - **구현됨:** 추천 생성만으로 배포 구성, 작업, 다운로드, Docker 실행이 발생하지 않습니다.
 - **구현됨:** 추천을 불변 스냅샷으로 조회하고, 유효성을 재검사한 명시적 수락으로만 적용 전 배포 세대를 만듭니다.
 - **구현됨:** 같은 수락은 멱등적이며, 변경된 인벤토리와 최신이 아닌 이전 세대는 거부합니다.
+- **구현됨:** 적용·검증 operation과 노드·시도 상태를 조회하고 전체 노드 검증만 롤백 증거로 기록합니다.
+- **구현됨:** 준비와 명시적 적용을 분리하고 직전 검증 세대·동일 토폴로지·전체 안전 노드만 롤백합니다.
 - **구현됨:** 기존 계획 JSON과 명시적 `--model` 동작이 유지됩니다.
 - 신규 모델은 벤치마크·보안·아티팩트 검증을 통과한 뒤에만 `ACTIVE`가 됩니다.
+- 다중 노드 네트워크·NCCL 자동 증적과 24시간 복구 수용 검사는 별도 실제 환경에서 완료해야 합니다.

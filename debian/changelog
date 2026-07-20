@@ -1,3 +1,11 @@
+dure (0.3.12) UNRELEASED; urgency=medium
+
+  * 배포 세대별 적용·검증 상태와 실패 노드 재시도 추적을 추가합니다.
+  * 검증된 직전 세대로만 복구하는 명시적 단계형 롤백을 추가합니다.
+  * 컨테이너 조작 전에 배포·세대·노드 식별자를 다시 검증합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 23:30:00 +0900
+
 dure (0.3.11) UNRELEASED; urgency=medium
 
   * 결정론적 추천과 정규화 인벤토리를 불변 스냅샷으로 저장합니다.

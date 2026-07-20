@@ -296,5 +296,114 @@ class RecommendationCLITests(unittest.TestCase):
         )
 
 
+class DeploymentGenerationCLITests(unittest.TestCase):
+    def setUp(self):
+        FakeJSONClient.calls = []
+        FakeJSONClient.response = {"deployment": {"id": "generation-2"}}
+
+    def run_cli(self, arguments: list[str]) -> tuple[int, str]:
+        output = io.StringIO()
+        with patch(
+            "dure.agent.resolve_join_settings",
+            return_value=("https://packaged", False),
+        ), patch("dure.http.JSONClient", FakeJSONClient), redirect_stdout(output):
+            result = main(arguments)
+        return result, output.getvalue()
+
+    def command(self, *arguments: str) -> list[str]:
+        return [
+            "admin",
+            "--server",
+            "https://control.example",
+            "--token",
+            "admin-token",
+            "deployment",
+            *arguments,
+        ]
+
+    def test_show_uses_generation_detail_endpoint(self):
+        result, output = self.run_cli(self.command("show", "generation-2"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            FakeJSONClient.calls,
+            [
+                (
+                    "https://control.example",
+                    "admin-token",
+                    "GET",
+                    "/v1/admin/deployments/generation-2",
+                    None,
+                )
+            ],
+        )
+        self.assertEqual(
+            output,
+            json.dumps(FakeJSONClient.response, indent=2, sort_keys=True) + "\n",
+        )
+
+    def test_generations_uses_lineage_endpoint(self):
+        FakeJSONClient.response = {"generations": [{"id": "generation-1"}]}
+
+        result, output = self.run_cli(
+            self.command("generations", "generation-2")
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            FakeJSONClient.calls[0][2:],
+            (
+                "GET",
+                "/v1/admin/deployments/generation-2/generations",
+                None,
+            ),
+        )
+        self.assertEqual(json.loads(output), FakeJSONClient.response)
+
+    def test_rollback_prepares_by_default_and_applies_only_when_explicit(self):
+        FakeJSONClient.response = {
+            "operation": {"id": "operation-1", "status": "PREPARED"},
+            "tasks": [],
+            "changed": True,
+        }
+        common = self.command(
+            "rollback",
+            "generation-2",
+            "--nodes",
+            "node-b",
+            "node-a",
+            "node-b",
+        )
+
+        result, _ = self.run_cli(common)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            FakeJSONClient.calls[-1][2:],
+            (
+                "POST",
+                "/v1/admin/deployments/generation-2/rollback",
+                {
+                    "node_ids": ["node-b", "node-a"],
+                    "apply": False,
+                    "serve": False,
+                },
+            ),
+        )
+
+        FakeJSONClient.calls = []
+        result, _ = self.run_cli([*common, "--apply", "--serve"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            FakeJSONClient.calls[-1][4],
+            {
+                "node_ids": ["node-b", "node-a"],
+                "apply": True,
+                "serve": True,
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

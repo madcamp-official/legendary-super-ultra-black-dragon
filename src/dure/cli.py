@@ -107,6 +107,29 @@ def _parser() -> argparse.ArgumentParser:
         default="quality-first",
         help="Recommendation policy objective",
     )
+    deployment_show = deployment_sub.add_parser(
+        "show", help="Show one deployment generation and its operations"
+    )
+    deployment_show.add_argument("deployment_id")
+    deployment_generations = deployment_sub.add_parser(
+        "generations", help="List every generation in a deployment lineage"
+    )
+    deployment_generations.add_argument("deployment_id")
+    deployment_rollback = deployment_sub.add_parser(
+        "rollback", help="Prepare or explicitly apply a rollback to the previous generation"
+    )
+    deployment_rollback.add_argument("deployment_id")
+    deployment_rollback.add_argument("--nodes", nargs="+", required=True)
+    deployment_rollback.add_argument(
+        "--apply",
+        action="store_true",
+        help="Queue the rollback after all server-side safety checks pass",
+    )
+    deployment_rollback.add_argument(
+        "--serve",
+        action="store_true",
+        help="Start and verify the API after the previous generation is restored",
+    )
     recommendation = admin_sub.add_parser(
         "recommendation", help="Inspect or accept a stored deployment recommendation"
     )
@@ -387,6 +410,31 @@ def _admin(args: argparse.Namespace) -> int:
                     "node_ids": node_ids,
                     "all_online": args.all_online,
                     "objective": args.objective,
+                },
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.deployment_command == "show":
+            value = client.request(
+                "GET", f"/v1/admin/deployments/{args.deployment_id}"
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.deployment_command == "generations":
+            value = client.request(
+                "GET",
+                f"/v1/admin/deployments/{args.deployment_id}/generations",
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.deployment_command == "rollback":
+            value = client.request(
+                "POST",
+                f"/v1/admin/deployments/{args.deployment_id}/rollback",
+                {
+                    "node_ids": list(dict.fromkeys(args.nodes)),
+                    "apply": args.apply,
+                    "serve": args.serve,
                 },
             )
             print(json.dumps(value, indent=2, sort_keys=True))

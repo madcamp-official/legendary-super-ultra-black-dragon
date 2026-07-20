@@ -121,7 +121,141 @@ class Deployment(Base):
     accept_model_download: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     pull_image: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     status: Mapped[str] = mapped_column(String(40), default="CREATED", nullable=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DeploymentOperation(Base):
+    __tablename__ = "deployment_operations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_deployment_operation_id_length",
+        ),
+        CheckConstraint(
+            "length(request_digest) = 71 AND request_digest LIKE 'sha256:%'",
+            name="ck_deployment_operation_request_digest_sha256",
+        ),
+        CheckConstraint(
+            "kind IN ('APPLY', 'VERIFY', 'ROLLBACK')",
+            name="ck_deployment_operation_kind",
+        ),
+        CheckConstraint(
+            "status IN ('PREPARED', 'QUEUED', 'RUNNING', 'SUCCEEDED', "
+            "'PARTIAL_FAILED', 'FAILED')",
+            name="ck_deployment_operation_status",
+        ),
+        CheckConstraint(
+            "phase IN ('APPLY', 'VERIFY', 'STOP_SOURCE', 'START_TARGET', "
+            "'VERIFY_TARGET', 'START_API', 'VERIFY_API', 'COMPLETE')",
+            name="ck_deployment_operation_phase",
+        ),
+        CheckConstraint(
+            "(kind = 'ROLLBACK' AND rollback_target_id IS NOT NULL) OR "
+            "(kind IN ('APPLY', 'VERIFY') AND rollback_target_id IS NULL)",
+            name="ck_deployment_operation_rollback_target",
+        ),
+        UniqueConstraint(
+            "request_digest",
+            name="uq_deployment_operations_request_digest",
+        ),
+        UniqueConstraint(
+            "active_lineage_id",
+            name="uq_deployment_operations_active_lineage_id",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    request_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    lineage_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    deployment_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "deployments.id",
+            name="fk_deployment_operations_deployment_id",
+        ),
+        nullable=False,
+    )
+    rollback_target_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "deployments.id",
+            name="fk_deployment_operations_rollback_target_id",
+        )
+    )
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    phase: Mapped[str] = mapped_column(String(20), nullable=False)
+    node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    serve: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    api: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    active_lineage_id: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DeploymentOperationNode(Base):
+    __tablename__ = "deployment_operation_nodes"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_deployment_operation_node_id_length",
+        ),
+        CheckConstraint(
+            "phase IN ('APPLY', 'VERIFY', 'STOP_SOURCE', 'START_TARGET', "
+            "'VERIFY_TARGET', 'START_API', 'VERIFY_API', 'COMPLETE')",
+            name="ck_deployment_operation_node_phase",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'QUEUED', 'RUNNING', 'SUCCEEDED', "
+            "'FAILED', 'CANCELED')",
+            name="ck_deployment_operation_node_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_deployment_operation_node_attempt_nonnegative",
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR "
+            "(length(failure_code) > 0 AND length(failure_code) <= 64)",
+            name="ck_deployment_operation_node_failure_code",
+        ),
+        UniqueConstraint(
+            "operation_id",
+            "node_id",
+            "phase",
+            name="uq_deployment_operation_nodes_operation_node_phase",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    operation_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "deployment_operations.id",
+            ondelete="CASCADE",
+            name="fk_deployment_operation_nodes_operation_id",
+        ),
+        nullable=False,
+    )
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "nodes.id",
+            name="fk_deployment_operation_nodes_node_id",
+        ),
+        nullable=False,
+    )
+    phase: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ModelArtifact(Base):
@@ -373,12 +507,35 @@ class BenchmarkEvidence(Base):
 
 class Task(Base):
     __tablename__ = "tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "(operation_node_id IS NULL AND operation_attempt IS NULL) OR "
+            "(operation_node_id IS NOT NULL AND operation_attempt IS NOT NULL)",
+            name="ck_tasks_operation_binding",
+        ),
+        CheckConstraint(
+            "operation_attempt IS NULL OR operation_attempt >= 1",
+            name="ck_tasks_operation_attempt_positive",
+        ),
+        UniqueConstraint(
+            "operation_node_id",
+            "operation_attempt",
+            name="uq_tasks_operation_node_attempt",
+        ),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     bulk_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id"), nullable=False, index=True)
     type: Mapped[str] = mapped_column(String(40), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default=TaskStatus.QUEUED.value, nullable=False)
     deployment_id: Mapped[str | None] = mapped_column(ForeignKey("deployments.id"))
+    operation_node_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "deployment_operation_nodes.id",
+            name="fk_tasks_operation_node_id",
+        )
+    )
+    operation_attempt: Mapped[int | None] = mapped_column(Integer)
     payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

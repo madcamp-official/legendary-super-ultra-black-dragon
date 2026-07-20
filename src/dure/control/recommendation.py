@@ -15,10 +15,12 @@ from sqlalchemy.orm import Session
 from dure.catalog import CatalogEntry, ModelCatalog, PlacementProfile
 from dure.models import DeploymentPlan, ModelSpec, NodeAssignment, NodeProfile
 from dure.selector import InventoryNode, recommend_model
+from dure.task import TaskStatus, TaskType
 
 from .models import (
     AuditEvent,
     Deployment,
+    DeploymentOperation,
     DeploymentRecommendationRecord,
     ModelArtifact,
     ModelRelease,
@@ -26,6 +28,7 @@ from .models import (
     NodeProfileRecord,
     PlacementProfileRecord,
     RuntimeRelease,
+    Task,
     utcnow,
 )
 from .service import aware, node_status
@@ -764,18 +767,82 @@ def _previous_generation(
 ) -> tuple[Deployment | None, str | None, int]:
     if previous_generation_id is None:
         return None, None, 1
-    previous = session.scalar(
-        select(Deployment)
-        .where(Deployment.id == previous_generation_id)
-        .with_for_update()
-    )
-    if previous is None:
+    candidate = session.get(Deployment, previous_generation_id)
+    if candidate is None:
         raise RecommendationNotFoundError(
             "previous deployment generation not found",
             code="PREVIOUS_GENERATION_NOT_FOUND",
             details={"previous_generation_id": previous_generation_id},
         )
-    lineage_id = previous.lineage_id or previous.id
+    lineage_id = candidate.lineage_id or candidate.id
+    root = session.scalar(
+        select(Deployment)
+        .where(Deployment.id == lineage_id)
+        .with_for_update()
+    )
+    if root is None or (root.lineage_id or root.id) != lineage_id:
+        raise RecommendationGenerationConflictError(
+            "previous generation lineage root is invalid",
+            code="PREVIOUS_GENERATION_LINEAGE_INVALID",
+            details={"previous_generation_id": previous_generation_id},
+        )
+    previous = (
+        root
+        if root.id == previous_generation_id
+        else session.scalar(
+            select(Deployment)
+            .where(Deployment.id == previous_generation_id)
+            .with_for_update()
+        )
+    )
+    if previous is None or (previous.lineage_id or previous.id) != lineage_id:
+        raise RecommendationGenerationConflictError(
+            "previous generation changed while its lineage was locked",
+            code="PREVIOUS_GENERATION_LINEAGE_INVALID",
+            details={"previous_generation_id": previous_generation_id},
+        )
+    if previous.status == "ROLLED_BACK":
+        raise RecommendationGenerationConflictError(
+            "a rolled-back generation cannot continue its old lineage",
+            code="PREVIOUS_GENERATION_ROLLED_BACK",
+            details={"previous_generation_id": previous_generation_id},
+        )
+    active_operation = session.scalar(
+        select(DeploymentOperation)
+        .where(DeploymentOperation.active_lineage_id == lineage_id)
+    )
+    if active_operation is not None:
+        raise RecommendationGenerationConflictError(
+            "deployment lineage has an active operation",
+            code="DEPLOYMENT_OPERATION_ACTIVE",
+            details={"operation_id": active_operation.id},
+        )
+    active_task_id = session.scalar(
+        select(Task.id)
+        .join(Deployment, Deployment.id == Task.deployment_id)
+        .where(
+            Deployment.lineage_id == lineage_id,
+            Task.type.in_(
+                {
+                    TaskType.APPLY_DEPLOYMENT.value,
+                    TaskType.START_DEPLOYMENT.value,
+                    TaskType.STOP_DEPLOYMENT.value,
+                    TaskType.RESTART_DEPLOYMENT.value,
+                }
+            ),
+            Task.status.in_(
+                {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+            ),
+        )
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    )
+    if active_task_id is not None:
+        raise RecommendationGenerationConflictError(
+            "deployment lineage has a queued or running mutation",
+            code="DEPLOYMENT_MUTATION_ACTIVE",
+            details={"task_id": active_task_id},
+        )
     latest = session.scalar(
         select(Deployment)
         .where(Deployment.lineage_id == lineage_id)

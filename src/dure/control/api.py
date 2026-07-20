@@ -7,7 +7,14 @@ from functools import partial
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    ValidationError,
+    model_validator,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -28,7 +35,6 @@ from .benchmark import (
 )
 from .models import (
     BenchmarkEvidence,
-    Deployment,
     ModelArtifact,
     ModelRelease,
     Node,
@@ -79,6 +85,14 @@ from .recommendation import (
     recommend_deployment,
     show_deployment_recommendation,
 )
+from .rollout import (
+    DeploymentRolloutError,
+    DeploymentRolloutNotFoundError,
+    deployment_generation_detail,
+    deployment_lineage_generations,
+    deployment_operation_detail,
+    prepare_or_apply_rollback,
+)
 
 
 class StrictBody(BaseModel):
@@ -106,6 +120,11 @@ class Heartbeat(BaseModel):
     state: dict
     profile: dict | None = None
     running_task_id: str | None = None
+    agent_version: str | None = Field(
+        default=None,
+        pattern=r"^\d+\.\d+\.\d+(?:\+[0-9A-Za-z.-]+)?$",
+        max_length=64,
+    )
 
 
 class DeploymentCreate(BaseModel):
@@ -115,7 +134,9 @@ class DeploymentCreate(BaseModel):
 
 
 class TasksCreate(BaseModel):
-    node_ids: list[str] = Field(min_length=1)
+    model_config = ConfigDict(extra="forbid")
+
+    node_ids: list[str] = Field(min_length=1, max_length=64)
     type: TaskType
     deployment_id: str | None = None
     options: dict = Field(default_factory=dict)
@@ -202,6 +223,12 @@ class DeploymentRecommendationCreate(StrictBody):
 
 class DeploymentRecommendationAccept(StrictBody):
     previous_generation_id: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class DeploymentRollback(StrictBody):
+    node_ids: list[str] = Field(min_length=1, max_length=64)
+    apply: StrictBool = False
+    serve: StrictBool = False
 
 
 class BenchmarkContextRequest(StrictBody):
@@ -361,6 +388,14 @@ def _benchmark_run_error_detail(exc: BenchmarkRunError) -> dict:
     }
 
 
+def _rollout_error_detail(exc: DeploymentRolloutError) -> dict:
+    return {
+        "code": exc.code,
+        "message": str(exc),
+        "details": exc.details,
+    }
+
+
 def _task_dict(task: Task) -> dict:
     return {
         "id": task.id,
@@ -369,6 +404,8 @@ def _task_dict(task: Task) -> dict:
         "type": task.type,
         "status": task.status,
         "deployment_id": task.deployment_id,
+        "operation_node_id": task.operation_node_id,
+        "operation_attempt": task.operation_attempt,
         "payload": task.payload,
         "attempts": task.attempts,
         "lease_until": task.lease_until,
@@ -377,7 +414,37 @@ def _task_dict(task: Task) -> dict:
     }
 
 
-def _node_dict(node: Node, profile: NodeProfileRecord | None = None) -> dict:
+_DESIRED_STATE_UNSET = object()
+
+
+def _active_desired_states(
+    session: Session, node_ids: list[str]
+) -> dict[str, str]:
+    if not node_ids:
+        return {}
+    selected: dict[str, tuple[str, str]] = {}
+    for task in session.scalars(
+        select(Task)
+        .where(
+            Task.node_id.in_(node_ids),
+            Task.status.in_({"QUEUED", "RUNNING"}),
+        )
+        .order_by(Task.created_at, Task.id)
+    ):
+        current = selected.get(task.node_id)
+        if current is None or (
+            current[0] != "RUNNING" and task.status == "RUNNING"
+        ):
+            selected[task.node_id] = (task.status, task.type)
+    return {node_id: value[1] for node_id, value in selected.items()}
+
+
+def _node_dict(
+    node: Node,
+    profile: NodeProfileRecord | None = None,
+    *,
+    desired_state: str | None | object = _DESIRED_STATE_UNSET,
+) -> dict:
     value = {
         "id": node.id,
         "display_name": node.display_name,
@@ -389,7 +456,11 @@ def _node_dict(node: Node, profile: NodeProfileRecord | None = None) -> dict:
         "phase": node.observed_phase,
         "role": node.observed_role,
         "deployment_id": node.observed_deployment_id,
-        "desired_state": node.desired_state,
+        "desired_state": (
+            node.desired_state
+            if desired_state is _DESIRED_STATE_UNSET
+            else desired_state
+        ),
     }
     if profile is not None:
         value["profile"] = profile.profile
@@ -525,14 +596,25 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
 
     @app.post("/v1/agent/heartbeat")
     def heartbeat(body: Heartbeat, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
-        save_heartbeat(session, node, body.state, body.profile)
+        save_heartbeat(
+            session,
+            node,
+            body.state,
+            body.profile,
+            agent_version=body.agent_version,
+        )
         return {"ok": True, "approved": node.approved}
 
     @app.post("/v1/agent/tasks/claim")
     def agent_claim(node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         if not node.approved:
             return {"task": None, "status": "pending"}
-        task = claim_task(session, node.id)
+        try:
+            task = claim_task(session, node.id)
+        except DeploymentRolloutError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
+            ) from exc
         return {"task": _task_dict(task) if task else None}
 
     @app.post("/v1/agent/tasks/{task_id}/heartbeat")
@@ -612,9 +694,17 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
 
     @app.get("/v1/admin/nodes", dependencies=[Depends(admin_auth)])
     def nodes(session: Session = Depends(get_session)):
+        records = list(session.scalars(select(Node).order_by(Node.display_name)))
+        desired = _active_desired_states(
+            session, [node.id for node in records]
+        )
         return {
             "nodes": [
-                _node_dict(node) for node in session.scalars(select(Node).order_by(Node.display_name))
+                _node_dict(
+                    node,
+                    desired_state=desired.get(node.id, node.desired_state),
+                )
+                for node in records
             ]
         }
 
@@ -623,11 +713,19 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         profiles = {
             profile.node_id: profile for profile in session.scalars(select(NodeProfileRecord))
         }
+        records = list(session.scalars(select(Node).order_by(Node.display_name)))
+        desired = _active_desired_states(
+            session, [node.id for node in records]
+        )
         return {
             "generated_at": utcnow(),
             "nodes": [
-                _node_dict(node, profiles.get(node.id))
-                for node in session.scalars(select(Node).order_by(Node.display_name))
+                _node_dict(
+                    node,
+                    profiles.get(node.id),
+                    desired_state=desired.get(node.id, node.desired_state),
+                )
+                for node in records
             ],
         }
 
@@ -637,7 +735,12 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if node is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
         profile = session.get(NodeProfileRecord, node_id)
-        value = _node_dict(node, profile)
+        desired = _active_desired_states(session, [node_id])
+        value = _node_dict(
+            node,
+            profile,
+            desired_state=desired.get(node_id, node.desired_state),
+        )
         if profile is None:
             value["profile"] = None
             value["profile_updated_at"] = None
@@ -965,10 +1068,60 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
 
     @app.get("/v1/admin/deployments/{deployment_id}", dependencies=[Depends(admin_auth)])
     def deployment_detail(deployment_id: str, session: Session = Depends(get_session)):
-        deployment = session.get(Deployment, deployment_id)
-        if deployment is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
-        return {"deployment": {"id": deployment.id, "generation": deployment.generation, "status": deployment.status, "plan": deployment.plan}}
+        try:
+            deployment = deployment_generation_detail(session, deployment_id)
+        except DeploymentRolloutNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _rollout_error_detail(exc)
+            ) from exc
+        return {"deployment": deployment}
+
+    @app.get(
+        "/v1/admin/deployments/{deployment_id}/generations",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_generations(
+        deployment_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            generations = deployment_lineage_generations(session, deployment_id)
+        except DeploymentRolloutNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _rollout_error_detail(exc)
+            ) from exc
+        return {"generations": generations}
+
+    @app.post(
+        "/v1/admin/deployments/{source_id}/rollback",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_rollback(
+        source_id: str,
+        body: DeploymentRollback,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            operation, tasks, changed = prepare_or_apply_rollback(
+                session,
+                source_id,
+                body.node_ids,
+                apply=body.apply,
+                serve=body.serve,
+            )
+        except DeploymentRolloutNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _rollout_error_detail(exc)
+            ) from exc
+        except DeploymentRolloutError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
+            ) from exc
+        return {
+            "operation": deployment_operation_detail(session, operation),
+            "tasks": [_task_dict(task) for task in tasks],
+            "changed": changed,
+        }
 
     @app.post("/v1/admin/tasks", dependencies=[Depends(admin_auth)])
     def tasks_create(body: TasksCreate, session: Session = Depends(get_session)):
@@ -980,6 +1133,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 deployment_id=body.deployment_id,
                 options=body.options,
             )
+        except DeploymentRolloutError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"bulk_id": bulk_id, "tasks": [_task_dict(item) for item in tasks], "errors": errors}
@@ -1003,7 +1160,7 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if not cancel_task(session, task):
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                "only queued tasks or expired running BENCHMARK tasks can be canceled",
+                "only queued tasks or expired running BENCHMARK/operation tasks can be canceled",
             )
         return {"ok": True}
 

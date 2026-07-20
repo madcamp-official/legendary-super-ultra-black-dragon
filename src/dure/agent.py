@@ -455,6 +455,67 @@ class TaskExecutor:
         profile.node_id = self.node_id
         return profile
 
+    def _deployment_task(self, task: dict, kind: TaskType):
+        payload = task.get("payload")
+        if type(payload) is not dict:
+            raise ValueError("deployment task payload must be an object")
+        option_fields = {
+            TaskType.APPLY_DEPLOYMENT: {
+                "serve",
+                "accept_model_download",
+                "pull_image",
+            },
+            TaskType.START_DEPLOYMENT: {
+                "serve",
+                "accept_model_download",
+                "pull_image",
+            },
+            TaskType.STOP_DEPLOYMENT: {
+                "accept_model_download",
+                "pull_image",
+            },
+            TaskType.RESTART_DEPLOYMENT: {
+                "serve",
+                "accept_model_download",
+                "pull_image",
+            },
+            TaskType.VERIFY: {
+                "api",
+                "accept_model_download",
+                "pull_image",
+            },
+        }[kind]
+        allowed = {"plan", "generation", *option_fields}
+        unexpected = sorted(set(payload) - allowed)
+        if unexpected:
+            raise ValueError("deployment task payload contains unexpected fields")
+        if "plan" not in payload or "generation" not in payload:
+            raise ValueError("deployment task requires a plan and generation")
+        if any(
+            field in payload and type(payload[field]) is not bool
+            for field in option_fields
+        ):
+            raise ValueError("deployment task options must be strict booleans")
+        if type(payload["generation"]) is not int:
+            raise ValueError("deployment generation must be an integer")
+        if type(payload["plan"]) is not dict:
+            raise ValueError("deployment plan must be an object")
+        plan = DeploymentPlan.from_dict(payload["plan"])
+        deployment_id = task.get("deployment_id")
+        if (
+            type(deployment_id) is not str
+            or deployment_id != plan.deployment_id
+        ):
+            raise ValueError("task deployment identity does not match its plan")
+        if payload["generation"] != plan.generation:
+            raise ValueError("deployment generation mismatch")
+        assignment = plan.assignment_for(self.node_id)
+        if assignment is None:
+            raise ValueError("node is not assigned to deployment")
+        if "@sha256:" not in plan.image:
+            raise ValueError("central deployment image is not digest-pinned")
+        return payload, plan, assignment
+
     def execute(self, task: dict) -> dict:
         try:
             kind = TaskType(task["type"])
@@ -506,31 +567,27 @@ class TaskExecutor:
             cached_model = _exact_cached_model(profile, benchmark)
             result = self.benchmark_executor(benchmark, profile, cached_model)
             return _validated_benchmark_result(benchmark, result)
-        plan = None
-        if kind != TaskType.PROBE:
-            if kind == TaskType.VERIFY and "plan" not in payload:
-                raise ValueError("VERIFY requires a deployment plan")
-            if "plan" in payload:
-                plan = DeploymentPlan.from_dict(payload["plan"])
-                assignment = plan.assignment_for(self.node_id)
-                if assignment is None:
-                    raise ValueError("node is not assigned to deployment")
-                if payload.get("generation") != plan.generation:
-                    raise ValueError("deployment generation mismatch")
-                if "@sha256:" not in plan.image:
-                    raise ValueError("central deployment image is not digest-pinned")
+        payload, plan, assignment = self._deployment_task(task, kind)
         profile = self._profile()
         if kind == TaskType.VERIFY:
-            verifier = ReadinessVerifier(self.runner, profile.runtime.engine or "docker")
+            verifier = ReadinessVerifier(
+                self.runner,
+                profile.runtime.engine or "docker",
+                node_id=self.node_id,
+            )
             checks = [verifier.host_gpu(profile), verifier.container_gpu(plan), verifier.ray_cluster(plan)]
-            if payload.get("api"):
-                checks.append(verifier.api())
+            if payload.get("api") and assignment.role == "ray-head":
+                checks.append(verifier.api(plan=plan))
             if not all(item.ok for item in checks):
                 raise RuntimeError("; ".join(item.detail for item in checks if not item.ok))
             return {"checks": [item.to_dict() for item in checks], "ok": True}
         runtime = ContainerRuntime(self.runner, profile.runtime.engine or "docker")
         if kind == TaskType.STOP_DEPLOYMENT:
-            check = runtime.stop_deployment(plan.deployment_id)
+            check = runtime.stop_deployment(
+                plan.deployment_id,
+                generation=plan.generation,
+                node_id=self.node_id,
+            )
             if not check.ok:
                 raise RuntimeError(check.detail)
             store = StateStore(self.state_path or DEFAULT_STATE)
@@ -540,7 +597,11 @@ class TaskExecutor:
             store.save(state)
             return {"checks": [check.to_dict()]}
         if kind == TaskType.RESTART_DEPLOYMENT:
-            stopped = runtime.stop_deployment(plan.deployment_id)
+            stopped = runtime.stop_deployment(
+                plan.deployment_id,
+                generation=plan.generation,
+                node_id=self.node_id,
+            )
             if not stopped.ok:
                 raise RuntimeError(stopped.detail)
         apply_download = kind == TaskType.APPLY_DEPLOYMENT
@@ -601,7 +662,11 @@ class Agent:
 
     def once(self) -> bool:
         state = StateStore(self.state_path).load().to_dict()
-        self.client.request("POST", "/v1/agent/heartbeat", {"state": state})
+        self.client.request(
+            "POST",
+            "/v1/agent/heartbeat",
+            {"state": state, "agent_version": __version__},
+        )
         task = self.client.request("POST", "/v1/agent/tasks/claim").get("task")
         if task is None:
             return False

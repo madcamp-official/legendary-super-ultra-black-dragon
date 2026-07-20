@@ -16,11 +16,14 @@ from dure.control.models import (
     BenchmarkEvidence,
     BenchmarkRun,
     Deployment,
+    DeploymentOperation,
+    DeploymentOperationNode,
     DeploymentRecommendationRecord,
     ModelArtifact,
     ModelRelease,
     PlacementProfileRecord,
     RuntimeRelease,
+    Task,
     utcnow,
 )
 from dure.control.service import (
@@ -42,6 +45,8 @@ REGISTRY_TABLES = {
 HEAD_TABLES = REGISTRY_TABLES | {
     "benchmark_evidence",
     "benchmark_runs",
+    "deployment_operation_nodes",
+    "deployment_operations",
     "deployment_recommendations",
 }
 BENCHMARK_INDEXES = {
@@ -78,6 +83,29 @@ DEPLOYMENT_GENERATION_UNIQUES = {
     ("lineage_id", "generation"),
     ("previous_generation_id",),
     ("source_recommendation_id",),
+}
+DEPLOYMENT_OPERATION_CHECKS = {
+    "ck_deployment_operation_id_length",
+    "ck_deployment_operation_kind",
+    "ck_deployment_operation_phase",
+    "ck_deployment_operation_request_digest_sha256",
+    "ck_deployment_operation_rollback_target",
+    "ck_deployment_operation_status",
+}
+DEPLOYMENT_OPERATION_UNIQUES = {
+    ("active_lineage_id",),
+    ("request_digest",),
+}
+DEPLOYMENT_OPERATION_NODE_CHECKS = {
+    "ck_deployment_operation_node_attempt_nonnegative",
+    "ck_deployment_operation_node_failure_code",
+    "ck_deployment_operation_node_id_length",
+    "ck_deployment_operation_node_phase",
+    "ck_deployment_operation_node_status",
+}
+TASK_OPERATION_CHECKS = {
+    "ck_tasks_operation_attempt_positive",
+    "ck_tasks_operation_binding",
 }
 
 
@@ -126,6 +154,14 @@ def true_0004_database(url: str) -> Config:
     migration_config = config(url)
     command.upgrade(migration_config, "head")
     command.downgrade(migration_config, "0004")
+    return migration_config
+
+
+def true_0005_database(url: str) -> Config:
+    """Materialize revision 0005 despite 0001's current-metadata bootstrap."""
+    migration_config = config(url)
+    command.upgrade(migration_config, "head")
+    command.downgrade(migration_config, "0005")
     return migration_config
 
 
@@ -310,12 +346,14 @@ class MigrationTests(unittest.TestCase):
                 "lineage_id",
                 "previous_generation_id",
                 "source_recommendation_id",
+                "verified_at",
             }
             <= set(deployment_columns)
         )
         self.assertFalse(deployment_columns["lineage_id"]["nullable"])
         self.assertTrue(deployment_columns["previous_generation_id"]["nullable"])
         self.assertTrue(deployment_columns["source_recommendation_id"]["nullable"])
+        self.assertTrue(deployment_columns["verified_at"]["nullable"])
         self.assertEqual(
             DEPLOYMENT_GENERATION_UNIQUES,
             {
@@ -338,14 +376,195 @@ class MigrationTests(unittest.TestCase):
             deployment_foreign_keys[("source_recommendation_id",)],
             ("deployment_recommendations", ("id",)),
         )
+
+        operation_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("deployment_operations")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "request_digest",
+                "lineage_id",
+                "deployment_id",
+                "rollback_target_id",
+                "kind",
+                "status",
+                "phase",
+                "node_ids",
+                "serve",
+                "api",
+                "active_lineage_id",
+                "created_at",
+                "updated_at",
+                "completed_at",
+            },
+            set(operation_columns),
+        )
+        for name in (
+            "id",
+            "request_digest",
+            "lineage_id",
+            "deployment_id",
+            "kind",
+            "status",
+            "phase",
+            "node_ids",
+            "serve",
+            "api",
+            "created_at",
+            "updated_at",
+        ):
+            self.assertFalse(operation_columns[name]["nullable"], name)
+        for name in ("rollback_target_id", "active_lineage_id", "completed_at"):
+            self.assertTrue(operation_columns[name]["nullable"], name)
+        operation_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspector.get_check_constraints(
+                "deployment_operations"
+            )
+        }
+        self.assertEqual(DEPLOYMENT_OPERATION_CHECKS, set(operation_checks))
+        for phase in ("START_API", "VERIFY_API"):
+            self.assertIn(
+                phase,
+                operation_checks["ck_deployment_operation_phase"],
+            )
+        self.assertEqual(
+            DEPLOYMENT_OPERATION_UNIQUES,
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "deployment_operations"
+                )
+            },
+        )
+        operation_foreign_keys = {
+            tuple(item["constrained_columns"]): (
+                item["referred_table"],
+                tuple(item["referred_columns"]),
+            )
+            for item in inspector.get_foreign_keys("deployment_operations")
+        }
+        self.assertEqual(
+            operation_foreign_keys,
+            {
+                ("deployment_id",): ("deployments", ("id",)),
+                ("rollback_target_id",): ("deployments", ("id",)),
+            },
+        )
+
+        operation_node_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("deployment_operation_nodes")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "operation_id",
+                "node_id",
+                "phase",
+                "status",
+                "attempt_count",
+                "failure_code",
+                "created_at",
+                "updated_at",
+                "completed_at",
+            },
+            set(operation_node_columns),
+        )
+        for name in (
+            "id",
+            "operation_id",
+            "node_id",
+            "phase",
+            "status",
+            "attempt_count",
+            "created_at",
+            "updated_at",
+        ):
+            self.assertFalse(operation_node_columns[name]["nullable"], name)
+        for name in ("failure_code", "completed_at"):
+            self.assertTrue(operation_node_columns[name]["nullable"], name)
+        operation_node_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspector.get_check_constraints(
+                "deployment_operation_nodes"
+            )
+        }
+        self.assertEqual(
+            DEPLOYMENT_OPERATION_NODE_CHECKS,
+            set(operation_node_checks),
+        )
+        for phase in ("START_API", "VERIFY_API"):
+            self.assertIn(
+                phase,
+                operation_node_checks[
+                    "ck_deployment_operation_node_phase"
+                ],
+            )
+        self.assertEqual(
+            {("operation_id", "node_id", "phase")},
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "deployment_operation_nodes"
+                )
+            },
+        )
+        operation_node_foreign_keys = {
+            tuple(item["constrained_columns"]): (
+                item["referred_table"],
+                tuple(item["referred_columns"]),
+            )
+            for item in inspector.get_foreign_keys(
+                "deployment_operation_nodes"
+            )
+        }
+        self.assertEqual(
+            operation_node_foreign_keys,
+            {
+                ("operation_id",): ("deployment_operations", ("id",)),
+                ("node_id",): ("nodes", ("id",)),
+            },
+        )
+
+        task_columns = {
+            item["name"]: item for item in inspector.get_columns("tasks")
+        }
+        self.assertTrue(
+            {"operation_node_id", "operation_attempt"} <= set(task_columns)
+        )
+        self.assertTrue(task_columns["operation_node_id"]["nullable"])
+        self.assertTrue(task_columns["operation_attempt"]["nullable"])
+        task_checks = {
+            item["name"] for item in inspector.get_check_constraints("tasks")
+        }
+        self.assertTrue(TASK_OPERATION_CHECKS <= task_checks)
+        task_uniques = {
+            tuple(item["column_names"])
+            for item in inspector.get_unique_constraints("tasks")
+        }
+        self.assertIn(("operation_node_id", "operation_attempt"), task_uniques)
+        task_foreign_keys = {
+            tuple(item["constrained_columns"]): (
+                item["referred_table"],
+                tuple(item["referred_columns"]),
+            )
+            for item in inspector.get_foreign_keys("tasks")
+        }
+        self.assertEqual(
+            task_foreign_keys[("operation_node_id",)],
+            ("deployment_operation_nodes", ("id",)),
+        )
         engine.dispose()
 
-    def test_migration_history_has_single_0005_head(self):
+    def test_migration_history_has_single_0006_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0005"])
+            self.assertEqual(heads, ["0006"])
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -361,6 +580,8 @@ class MigrationTests(unittest.TestCase):
             engine = make_engine(url)
             Base.metadata.create_all(engine)
             for table in (
+                DeploymentOperationNode.__table__,
+                DeploymentOperation.__table__,
                 BenchmarkRun.__table__,
                 BenchmarkEvidence.__table__,
                 DeploymentRecommendationRecord.__table__,
@@ -583,6 +804,358 @@ class MigrationTests(unittest.TestCase):
                 self.assertIsNone(restored.source_recommendation_id)
                 self.assertEqual(restored.generation, 0)
                 self.assertEqual(restored.plan, legacy_plan)
+                self.assertIsNone(restored.verified_at)
+            engine.dispose()
+
+    def test_true_0005_database_upgrades_and_preserves_deployment_and_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'operations-upgrade.db'}"
+            migration_config = true_0005_database(url)
+            engine = make_engine(url)
+            inspector = inspect(engine)
+            self.assertNotIn("deployment_operations", inspector.get_table_names())
+            self.assertNotIn(
+                "verified_at",
+                {item["name"] for item in inspector.get_columns("deployments")},
+            )
+            self.assertFalse(
+                {"operation_node_id", "operation_attempt"}
+                & {item["name"] for item in inspector.get_columns("tasks")}
+            )
+            node_id = str(uuid.uuid4())
+            deployment_id = "legacy-generation-zero"
+            task_id = str(uuid.uuid4())
+            frozen_plan = {
+                "deployment_id": deployment_id,
+                "generation": 0,
+                "model": {"model_id": "legacy-model"},
+            }
+            nodes = Table("nodes", MetaData(), autoload_with=engine)
+            deployments = Table("deployments", MetaData(), autoload_with=engine)
+            tasks = Table("tasks", MetaData(), autoload_with=engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    nodes.insert().values(
+                        id=node_id,
+                        install_id="install-operations-upgrade",
+                        display_name="operations-upgrade",
+                        hostname="operations-upgrade",
+                        agent_version="0.3.11",
+                        approved=True,
+                        created_at=utcnow(),
+                    )
+                )
+                connection.execute(
+                    deployments.insert().values(
+                        id=deployment_id,
+                        lineage_id=deployment_id,
+                        previous_generation_id=None,
+                        source_recommendation_id=None,
+                        generation=0,
+                        plan=frozen_plan,
+                        accept_model_download=False,
+                        pull_image=False,
+                        status="CREATED",
+                        created_at=utcnow(),
+                    )
+                )
+                connection.execute(
+                    tasks.insert().values(
+                        id=task_id,
+                        bulk_id=str(uuid.uuid4()),
+                        node_id=node_id,
+                        type="APPLY_DEPLOYMENT",
+                        status="SUCCEEDED",
+                        deployment_id=deployment_id,
+                        payload={"legacy": True},
+                        attempts=1,
+                        result={"ok": True},
+                        created_at=utcnow(),
+                        updated_at=utcnow(),
+                    )
+                )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                restored_deployment = session.get(Deployment, deployment_id)
+                restored_task = session.get(Task, task_id)
+                self.assertEqual(restored_deployment.generation, 0)
+                self.assertEqual(restored_deployment.plan, frozen_plan)
+                self.assertIsNone(restored_deployment.verified_at)
+                self.assertEqual(restored_task.payload, {"legacy": True})
+                self.assertEqual(restored_task.status, "SUCCEEDED")
+                self.assertIsNone(restored_task.operation_node_id)
+                self.assertIsNone(restored_task.operation_attempt)
+                self.assertEqual(
+                    session.scalar(
+                        select(func.count()).select_from(DeploymentOperation)
+                    ),
+                    0,
+                )
+            engine.dispose()
+
+    def test_0006_downgrade_and_reupgrade_preserve_base_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'operations-round-trip.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            deployment_id = "operation-round-trip"
+            frozen_plan = {
+                "deployment_id": deployment_id,
+                "generation": 1,
+                "model": {"model_id": "round-trip-model"},
+                "image": "registry.example/runtime@sha256:" + "a" * 64,
+            }
+            with factory() as session:
+                node = _node(session, "operation-round-trip")
+                deployment = Deployment(
+                    id=deployment_id,
+                    lineage_id=deployment_id,
+                    generation=1,
+                    plan=frozen_plan,
+                    accept_model_download=False,
+                    pull_image=False,
+                    status="CREATED",
+                )
+                session.add(deployment)
+                session.flush()
+                operation = DeploymentOperation(
+                    request_digest="sha256:" + "b" * 64,
+                    lineage_id=deployment_id,
+                    deployment_id=deployment_id,
+                    kind="APPLY",
+                    status="SUCCEEDED",
+                    phase="COMPLETE",
+                    node_ids=[node.id],
+                    serve=False,
+                    api=False,
+                    completed_at=utcnow(),
+                )
+                session.add(operation)
+                session.flush()
+                operation_node = DeploymentOperationNode(
+                    operation_id=operation.id,
+                    node_id=node.id,
+                    phase="APPLY",
+                    status="SUCCEEDED",
+                    attempt_count=1,
+                    completed_at=utcnow(),
+                )
+                session.add(operation_node)
+                session.flush()
+                task = Task(
+                    bulk_id=str(uuid.uuid4()),
+                    node_id=node.id,
+                    type="APPLY_DEPLOYMENT",
+                    status="SUCCEEDED",
+                    deployment_id=deployment_id,
+                    operation_node_id=operation_node.id,
+                    operation_attempt=1,
+                    payload={"plan": frozen_plan},
+                    attempts=1,
+                    result={"ok": True},
+                )
+                session.add(task)
+                session.commit()
+                node_id = node.id
+                operation_id = operation.id
+                task_id = task.id
+            engine.dispose()
+
+            command.downgrade(migration_config, "0005")
+
+            engine = make_engine(url)
+            inspector = inspect(engine)
+            self.assertNotIn("deployment_operations", inspector.get_table_names())
+            self.assertNotIn(
+                "deployment_operation_nodes", inspector.get_table_names()
+            )
+            self.assertNotIn(
+                "verified_at",
+                {item["name"] for item in inspector.get_columns("deployments")},
+            )
+            self.assertFalse(
+                {"operation_node_id", "operation_attempt"}
+                & {item["name"] for item in inspector.get_columns("tasks")}
+            )
+            deployments = Table("deployments", MetaData(), autoload_with=engine)
+            tasks = Table("tasks", MetaData(), autoload_with=engine)
+            with engine.connect() as connection:
+                preserved_deployment = connection.execute(
+                    select(
+                        deployments.c.id,
+                        deployments.c.generation,
+                        deployments.c.plan,
+                        deployments.c.status,
+                    ).where(deployments.c.id == deployment_id)
+                ).one()
+                preserved_task = connection.execute(
+                    select(
+                        tasks.c.id,
+                        tasks.c.node_id,
+                        tasks.c.deployment_id,
+                        tasks.c.status,
+                        tasks.c.payload,
+                    ).where(tasks.c.id == task_id)
+                ).one()
+            self.assertEqual(
+                tuple(preserved_deployment),
+                (deployment_id, 1, frozen_plan, "CREATED"),
+            )
+            self.assertEqual(
+                tuple(preserved_task),
+                (
+                    task_id,
+                    node_id,
+                    deployment_id,
+                    "SUCCEEDED",
+                    {"plan": frozen_plan},
+                ),
+            )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                restored_deployment = session.get(Deployment, deployment_id)
+                restored_task = session.get(Task, task_id)
+                self.assertEqual(restored_deployment.plan, frozen_plan)
+                self.assertIsNone(restored_deployment.verified_at)
+                self.assertEqual(restored_task.payload, {"plan": frozen_plan})
+                self.assertIsNone(restored_task.operation_node_id)
+                self.assertIsNone(restored_task.operation_attempt)
+                self.assertIsNone(session.get(DeploymentOperation, operation_id))
+            engine.dispose()
+
+    def test_0006_downgrade_rejects_prepared_inactive_operation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'active-operation.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            deployment_id = "active-operation"
+            with factory() as session:
+                session.add(
+                    Deployment(
+                        id=deployment_id,
+                        lineage_id=deployment_id,
+                        generation=1,
+                        plan={"deployment_id": deployment_id, "generation": 1},
+                        accept_model_download=False,
+                        pull_image=False,
+                        status="CREATED",
+                    )
+                )
+                session.flush()
+                session.add(
+                    DeploymentOperation(
+                        request_digest="sha256:" + "c" * 64,
+                        lineage_id=deployment_id,
+                        deployment_id=deployment_id,
+                        kind="APPLY",
+                        status="PREPARED",
+                        phase="APPLY",
+                        node_ids=[],
+                        serve=False,
+                        api=False,
+                        active_lineage_id=None,
+                    )
+                )
+                session.commit()
+            engine.dispose()
+
+            with self.assertRaisesRegex(RuntimeError, "operations are active"):
+                command.downgrade(migration_config, "0005")
+
+            engine = make_engine(url)
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.scalar(text("SELECT version_num FROM alembic_version")),
+                    "0006",
+                )
+            self.assertIn("deployment_operations", inspect(engine).get_table_names())
+            engine.dispose()
+
+    def test_0006_downgrade_rejects_linked_queued_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'active-operation-task.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            deployment_id = "active-operation-task"
+            with factory() as session:
+                node = _node(session, "active-operation-task")
+                session.add(
+                    Deployment(
+                        id=deployment_id,
+                        lineage_id=deployment_id,
+                        generation=1,
+                        plan={"deployment_id": deployment_id, "generation": 1},
+                        accept_model_download=False,
+                        pull_image=False,
+                        status="CREATED",
+                    )
+                )
+                session.flush()
+                operation = DeploymentOperation(
+                    request_digest="sha256:" + "d" * 64,
+                    lineage_id=deployment_id,
+                    deployment_id=deployment_id,
+                    kind="APPLY",
+                    status="FAILED",
+                    phase="COMPLETE",
+                    node_ids=[node.id],
+                    serve=False,
+                    api=False,
+                    completed_at=utcnow(),
+                )
+                session.add(operation)
+                session.flush()
+                operation_node = DeploymentOperationNode(
+                    operation_id=operation.id,
+                    node_id=node.id,
+                    phase="APPLY",
+                    status="QUEUED",
+                    attempt_count=1,
+                )
+                session.add(operation_node)
+                session.flush()
+                session.add(
+                    Task(
+                        bulk_id=str(uuid.uuid4()),
+                        node_id=node.id,
+                        type="APPLY_DEPLOYMENT",
+                        status="QUEUED",
+                        deployment_id=deployment_id,
+                        operation_node_id=operation_node.id,
+                        operation_attempt=1,
+                        payload={"plan": {"deployment_id": deployment_id}},
+                    )
+                )
+                session.commit()
+            engine.dispose()
+
+            with self.assertRaisesRegex(RuntimeError, "operation tasks are active"):
+                command.downgrade(migration_config, "0005")
+
+            engine = make_engine(url)
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.scalar(text("SELECT version_num FROM alembic_version")),
+                    "0006",
+                )
             engine.dispose()
 
     def test_0005_downgrade_and_reupgrade_preserve_deployment_plan(self):
