@@ -71,7 +71,14 @@ from .service import (
     complete_benchmark_task,
     transition_model_release,
 )
-from .recommendation import RecommendationNodeNotFoundError, recommend_deployment
+from .recommendation import (
+    RecommendationError,
+    RecommendationNodeNotFoundError,
+    RecommendationNotFoundError,
+    accept_deployment_recommendation,
+    recommend_deployment,
+    show_deployment_recommendation,
+)
 
 
 class StrictBody(BaseModel):
@@ -191,6 +198,10 @@ class DeploymentRecommendationCreate(StrictBody):
             except (AttributeError, ValueError) as exc:
                 raise ValueError("node_ids must be canonical UUIDs") from exc
         return self
+
+
+class DeploymentRecommendationAccept(StrictBody):
+    previous_generation_id: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class BenchmarkContextRequest(StrictBody):
@@ -751,8 +762,49 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             return recommend_deployment(session, **body.model_dump())
         except RecommendationNodeNotFoundError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except RecommendationError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, exc.to_detail()) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    @app.get(
+        "/v1/admin/deployment-recommendations/{recommendation_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_recommendation_get(
+        recommendation_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return show_deployment_recommendation(session, recommendation_id)
+        except RecommendationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except RecommendationError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, exc.to_detail()) from exc
+
+    @app.post(
+        "/v1/admin/deployment-recommendations/{recommendation_id}/accept",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_recommendation_accept(
+        recommendation_id: str,
+        body: DeploymentRecommendationAccept,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return accept_deployment_recommendation(
+                session,
+                recommendation_id,
+                previous_generation_id=body.previous_generation_id,
+            )
+        except RecommendationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except RecommendationError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, exc.to_detail()) from exc
 
     @app.post("/v1/admin/benchmark-context", dependencies=[Depends(admin_auth)])
     def benchmark_context_get(

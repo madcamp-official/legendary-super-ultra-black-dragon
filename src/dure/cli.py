@@ -107,6 +107,25 @@ def _parser() -> argparse.ArgumentParser:
         default="quality-first",
         help="Recommendation policy objective",
     )
+    recommendation = admin_sub.add_parser(
+        "recommendation", help="Inspect or accept a stored deployment recommendation"
+    )
+    recommendation_sub = recommendation.add_subparsers(
+        dest="recommendation_command", required=True
+    )
+    recommendation_show = recommendation_sub.add_parser(
+        "show", help="Show a stored deployment recommendation"
+    )
+    recommendation_show.add_argument("recommendation_id")
+    recommendation_accept = recommendation_sub.add_parser(
+        "accept", help="Create an immutable deployment generation"
+    )
+    recommendation_accept.add_argument("recommendation_id")
+    recommendation_accept.add_argument(
+        "--previous-generation",
+        dest="previous_generation_id",
+        help="Link the new generation to an existing deployment generation",
+    )
     for command in ("apply", "start", "stop", "restart"):
         operation = admin_sub.add_parser(command)
         operation.add_argument("deployment_id")
@@ -340,6 +359,17 @@ def _admin(args: argparse.Namespace) -> int:
         value = client.request("POST", "/v1/admin/enrollments", {"expires_in_seconds": _duration_seconds(args.expires_in)})
         print(value["token"])
         print(f"Expires: {value['expires_at']}", file=sys.stderr)
+        return 0
+    if args.admin_command == "recommendation":
+        path = f"/v1/admin/deployment-recommendations/{args.recommendation_id}"
+        if args.recommendation_command == "show":
+            value = client.request("GET", path)
+        else:
+            payload = {}
+            if args.previous_generation_id is not None:
+                payload["previous_generation_id"] = args.previous_generation_id
+            value = client.request("POST", f"{path}/accept", payload)
+        print(json.dumps(value, indent=2, sort_keys=True))
         return 0
     if args.admin_command == "deployment":
         if args.deployment_command == "recommend":
