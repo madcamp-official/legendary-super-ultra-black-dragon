@@ -1,3 +1,11 @@
+dure (0.3.19) UNRELEASED; urgency=medium
+
+  * 검증된 stage variant의 pipeline rank별 다운로드와 원자적 캐시 활성화를 추가합니다.
+  * vLLM sharded_state 로더, 복합 캐시 identity와 실행 직전 무결성 검사를 추가합니다.
+  * 명시적 재시도·롤백과 실제 다중 노드 GPU 수용 검사 절차를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 07:15:40 +0900
+
 dure (0.3.18) UNRELEASED; urgency=medium
 
   * vLLM 0.9.0 Ray pipeline의 결정론적 노드 UUID·rank 결합을 추가합니다.

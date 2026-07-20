@@ -29,7 +29,7 @@ class CorePackageTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "0.3.18")
+        self.assertEqual(result.stdout.strip(), "0.3.19")
 
     def test_packaged_control_plane_uses_production_https(self):
         values = {}
