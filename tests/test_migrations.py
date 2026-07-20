@@ -7,6 +7,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, Table, func, inspect, select, text
 
 from dure.control.db import Base, make_engine, make_session_factory
@@ -14,6 +15,8 @@ from dure.control.benchmark import register_benchmark_evidence
 from dure.control.models import (
     BenchmarkEvidence,
     BenchmarkRun,
+    Deployment,
+    DeploymentRecommendationRecord,
     ModelArtifact,
     ModelRelease,
     PlacementProfileRecord,
@@ -36,7 +39,11 @@ REGISTRY_TABLES = {
     "model_releases",
     "placement_profiles",
 }
-HEAD_TABLES = REGISTRY_TABLES | {"benchmark_evidence", "benchmark_runs"}
+HEAD_TABLES = REGISTRY_TABLES | {
+    "benchmark_evidence",
+    "benchmark_runs",
+    "deployment_recommendations",
+}
 BENCHMARK_INDEXES = {
     "ix_benchmark_evidence_release_id",
     "ix_benchmark_evidence_placement_id",
@@ -61,6 +68,16 @@ BENCHMARK_RUN_CHECKS = {
     "ck_benchmark_run_inventory_fingerprint",
     "ck_benchmark_run_request_digest",
     "ck_benchmark_run_failure_code",
+}
+RECOMMENDATION_INDEXES = {"ix_deployment_recommendations_created_at"}
+RECOMMENDATION_CHECKS = {
+    "ck_deployment_recommendation_id_sha256",
+    "ck_deployment_recommendation_selection_mode",
+}
+DEPLOYMENT_GENERATION_UNIQUES = {
+    ("lineage_id", "generation"),
+    ("previous_generation_id",),
+    ("source_recommendation_id",),
 }
 
 
@@ -101,6 +118,14 @@ def true_0003_database(url: str) -> Config:
             )
     engine.dispose()
     command.upgrade(migration_config, "0003")
+    return migration_config
+
+
+def true_0004_database(url: str) -> Config:
+    """Use the 0005 downgrade to materialize the released 0004 schema exactly."""
+    migration_config = config(url)
+    command.upgrade(migration_config, "head")
+    command.downgrade(migration_config, "0004")
     return migration_config
 
 
@@ -239,7 +264,88 @@ class MigrationTests(unittest.TestCase):
             {"promotion_evidence_ids", "promotion_evidence_digest"}
             <= release_columns
         )
+        recommendation_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("deployment_recommendations")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "objective",
+                "selection_mode",
+                "requested_node_ids",
+                "catalog_version",
+                "policy_version",
+                "inventory_fingerprint",
+                "recommendation_snapshot",
+                "inventory_snapshot",
+                "created_at",
+            },
+            set(recommendation_columns),
+        )
+        self.assertTrue(
+            all(not column["nullable"] for column in recommendation_columns.values())
+        )
+        self.assertEqual(
+            RECOMMENDATION_INDEXES,
+            {
+                item["name"]
+                for item in inspector.get_indexes("deployment_recommendations")
+            },
+        )
+        self.assertEqual(
+            RECOMMENDATION_CHECKS,
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "deployment_recommendations"
+                )
+            },
+        )
+        deployment_columns = {
+            item["name"]: item for item in inspector.get_columns("deployments")
+        }
+        self.assertTrue(
+            {
+                "lineage_id",
+                "previous_generation_id",
+                "source_recommendation_id",
+            }
+            <= set(deployment_columns)
+        )
+        self.assertFalse(deployment_columns["lineage_id"]["nullable"])
+        self.assertTrue(deployment_columns["previous_generation_id"]["nullable"])
+        self.assertTrue(deployment_columns["source_recommendation_id"]["nullable"])
+        self.assertEqual(
+            DEPLOYMENT_GENERATION_UNIQUES,
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints("deployments")
+            },
+        )
+        deployment_foreign_keys = {
+            tuple(item["constrained_columns"]): (
+                item["referred_table"],
+                tuple(item["referred_columns"]),
+            )
+            for item in inspector.get_foreign_keys("deployments")
+        }
+        self.assertEqual(
+            deployment_foreign_keys[("previous_generation_id",)],
+            ("deployments", ("id",)),
+        )
+        self.assertEqual(
+            deployment_foreign_keys[("source_recommendation_id",)],
+            ("deployment_recommendations", ("id",)),
+        )
         engine.dispose()
+
+    def test_migration_history_has_single_0005_head(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'heads.db'}"
+            heads = ScriptDirectory.from_config(config(url)).get_heads()
+
+            self.assertEqual(heads, ["0005"])
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -257,6 +363,7 @@ class MigrationTests(unittest.TestCase):
             for table in (
                 BenchmarkRun.__table__,
                 BenchmarkEvidence.__table__,
+                DeploymentRecommendationRecord.__table__,
                 PlacementProfileRecord.__table__,
                 ModelRelease.__table__,
                 RuntimeRelease.__table__,
@@ -418,6 +525,171 @@ class MigrationTests(unittest.TestCase):
                 self.assertIsNone(preserved.benchmark_run_id)
                 self.assertEqual(
                     session.scalar(select(func.count()).select_from(BenchmarkRun)),
+                    0,
+                )
+            engine.dispose()
+
+    def test_true_0004_database_upgrades_and_backfills_legacy_deployment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'recommendation-upgrade.db'}"
+            migration_config = true_0004_database(url)
+            engine = make_engine(url)
+            inspector = inspect(engine)
+            self.assertNotIn(
+                "deployment_recommendations",
+                inspector.get_table_names(),
+            )
+            self.assertFalse(
+                {
+                    "lineage_id",
+                    "previous_generation_id",
+                    "source_recommendation_id",
+                }
+                & {
+                    item["name"]
+                    for item in inspector.get_columns("deployments")
+                }
+            )
+            legacy = Table("deployments", MetaData(), autoload_with=engine)
+            legacy_plan = {
+                "deployment_id": "legacy-deployment",
+                "generation": 0,
+                "model": {"model_id": "legacy-model"},
+            }
+            with engine.begin() as connection:
+                connection.execute(
+                    legacy.insert().values(
+                        id="legacy-deployment",
+                        generation=0,
+                        plan=legacy_plan,
+                        accept_model_download=False,
+                        pull_image=False,
+                        status="CREATED",
+                        created_at=utcnow(),
+                    )
+                )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                restored = session.get(Deployment, "legacy-deployment")
+                self.assertIsNotNone(restored)
+                self.assertEqual(restored.lineage_id, restored.id)
+                self.assertIsNone(restored.previous_generation_id)
+                self.assertIsNone(restored.source_recommendation_id)
+                self.assertEqual(restored.generation, 0)
+                self.assertEqual(restored.plan, legacy_plan)
+            engine.dispose()
+
+    def test_0005_downgrade_and_reupgrade_preserve_deployment_plan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'recommendation-round-trip.db'}"
+            migration_config = true_0004_database(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            recommendation_id = "sha256:" + "a" * 64
+            deployment_id = "accepted-generation-1"
+            frozen_plan = {
+                "deployment_id": deployment_id,
+                "generation": 1,
+                "model": {"model_id": "accepted-model"},
+                "image": "registry.example/runtime@sha256:" + "b" * 64,
+            }
+            with factory() as session:
+                session.add(
+                    DeploymentRecommendationRecord(
+                        id=recommendation_id,
+                        objective="quality-first",
+                        selection_mode="explicit_nodes",
+                        requested_node_ids=[],
+                        catalog_version="sha256:" + "c" * 64,
+                        policy_version="central-quality-within-slo-v1",
+                        inventory_fingerprint="sha256:" + "d" * 64,
+                        recommendation_snapshot={"id": recommendation_id},
+                        inventory_snapshot=[],
+                    )
+                )
+                session.add(
+                    Deployment(
+                        id=deployment_id,
+                        lineage_id=deployment_id,
+                        previous_generation_id=None,
+                        source_recommendation_id=recommendation_id,
+                        generation=1,
+                        plan=frozen_plan,
+                        accept_model_download=False,
+                        pull_image=False,
+                        status="CREATED",
+                    )
+                )
+                session.commit()
+            engine.dispose()
+
+            command.downgrade(migration_config, "0004")
+
+            engine = make_engine(url)
+            inspector = inspect(engine)
+            self.assertNotIn(
+                "deployment_recommendations",
+                inspector.get_table_names(),
+            )
+            self.assertFalse(
+                {
+                    "lineage_id",
+                    "previous_generation_id",
+                    "source_recommendation_id",
+                }
+                & {
+                    item["name"]
+                    for item in inspector.get_columns("deployments")
+                }
+            )
+            legacy = Table("deployments", MetaData(), autoload_with=engine)
+            with engine.connect() as connection:
+                preserved = connection.execute(
+                    select(
+                        legacy.c.id,
+                        legacy.c.generation,
+                        legacy.c.plan,
+                        legacy.c.accept_model_download,
+                        legacy.c.pull_image,
+                        legacy.c.status,
+                    ).where(legacy.c.id == deployment_id)
+                ).one()
+            self.assertEqual(
+                tuple(preserved),
+                (
+                    deployment_id,
+                    1,
+                    frozen_plan,
+                    False,
+                    False,
+                    "CREATED",
+                ),
+            )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                restored = session.get(Deployment, deployment_id)
+                self.assertEqual(restored.lineage_id, deployment_id)
+                self.assertIsNone(restored.previous_generation_id)
+                self.assertIsNone(restored.source_recommendation_id)
+                self.assertEqual(restored.plan, frozen_plan)
+                self.assertEqual(
+                    session.scalar(
+                        select(func.count()).select_from(
+                            DeploymentRecommendationRecord
+                        )
+                    ),
                     0,
                 )
             engine.dispose()
