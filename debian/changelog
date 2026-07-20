@@ -1,3 +1,11 @@
+dure (0.3.16) UNRELEASED; urgency=medium
+
+  * 추천 배포 세대의 모델과 이미지를 명시적으로 준비하는 중앙 작업을 추가합니다.
+  * 노드별 준비 증적, 실패 단계 재시도와 늦은 결과 펜싱을 추가합니다.
+  * 검증된 정확한 캐시와 다이제스트 이미지가 없는 추천 배포 적용을 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 03:42:05 +0900
+
 dure (0.3.15) UNRELEASED; urgency=medium
 
   * 신뢰 HTTPS 원본과 SHA-256 콘텐츠 주소 청크 저장소를 추가합니다.
