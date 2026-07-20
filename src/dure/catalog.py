@@ -30,6 +30,36 @@ class NetworkEvidenceBinding:
     evidence_digest: str
     node_ids: tuple[str, ...]
     registered_at: str
+    rank_node_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StageRankDelivery:
+    rank: int
+    pipeline_rank: int
+    tensor_rank: int
+    manifest_digest: str
+    tensor_key_count: int
+    tensor_keys_digest: str
+    weight_size_bytes: int
+    total_size_bytes: int
+    file_count: int
+
+
+@dataclass(frozen=True)
+class StageArtifactDelivery:
+    artifact_set_digest: str
+    contract_identity_digest: str
+    source_manifest_digest: str
+    runtime_image: str
+    vllm_version: str
+    exporter_build_digest: str
+    architecture: str
+    quantization: str
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    loader_format: str
+    ranks: tuple[StageRankDelivery, ...]
 
 
 @dataclass(frozen=True)
@@ -41,6 +71,8 @@ class CatalogEntry:
     candidate_id: str | None = None
     gpu_architectures: tuple[str, ...] = ()
     network_evidence: tuple[NetworkEvidenceBinding, ...] = ()
+    stage_artifact: StageArtifactDelivery | None = None
+    full_snapshot_size_bytes: int | None = None
 
 
 @dataclass(frozen=True)

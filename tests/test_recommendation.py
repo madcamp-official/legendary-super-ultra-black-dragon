@@ -42,10 +42,18 @@ from dure.control.recommendation import recommend_deployment
 from dure.control.service import (
     add_placement_profile,
     aware,
+    canonical_artifact_manifest_digest,
     create_model_artifact,
     create_model_release,
     create_runtime_release,
+    register_artifact_manifest,
     transition_model_release,
+)
+from dure.control.stage_artifacts import (
+    register_stage_artifact_evidence,
+    register_stage_artifact_variant,
+    stage_artifact_variant_dict,
+    transition_stage_artifact_variant,
 )
 
 from .helpers import profile
@@ -83,11 +91,83 @@ def _hex(seed: str, length: int) -> str:
     return (value * ((length // len(value)) + 1))[:length]
 
 
+def _digest(character: str) -> str:
+    return "sha256:" + character * 64
+
+
+def _source_manifest(*, weight_size_bytes: int = 8) -> dict:
+    return {
+        "schema_version": 1,
+        "files": [
+            {
+                "path": "model.safetensors",
+                "kind": "REGULAR",
+                "size_bytes": weight_size_bytes,
+                "sha256": _digest("a"),
+                "chunks": [
+                    {
+                        "ordinal": 0,
+                        "offset_bytes": 0,
+                        "length_bytes": weight_size_bytes,
+                        "sha256": _digest("a"),
+                    }
+                ],
+            },
+            {
+                "path": "config.json",
+                "kind": "REGULAR",
+                "size_bytes": 2,
+                "sha256": _digest("b"),
+                "chunks": [
+                    {
+                        "ordinal": 0,
+                        "offset_bytes": 0,
+                        "length_bytes": 2,
+                        "sha256": _digest("b"),
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _stage_manifest(rank: int, *, weight_size_bytes: int = 4) -> dict:
+    weight_character = "0123456789abcdef"[rank]
+    files = [
+        ("model-rank-0-part-0.safetensors", weight_size_bytes, weight_character),
+        ("config.json", 2, "b"),
+        ("tokenizer.json", 3, "c"),
+        ("tokenizer_config.json", 4, "d"),
+        ("dure-stage.json", 5, "e"),
+    ]
+    return {
+        "schema_version": 1,
+        "files": [
+            {
+                "path": path,
+                "kind": "REGULAR",
+                "size_bytes": size_bytes,
+                "sha256": _digest(character),
+                "chunks": [
+                    {
+                        "ordinal": 0,
+                        "offset_bytes": 0,
+                        "length_bytes": size_bytes,
+                        "sha256": _digest(character),
+                    }
+                ],
+            }
+            for path, size_bytes, character in files
+        ],
+    }
+
+
 def _add_node(
     session,
     name: str,
     *,
     now,
+    agent_version: str = "0.3.20",
     approved: bool = True,
     last_seen_age: int = 0,
     profile_age: int = 0,
@@ -98,7 +178,7 @@ def _add_node(
         install_id=f"install-{name}",
         display_name=name,
         hostname=name,
-        agent_version="0.3.8",
+        agent_version=agent_version,
         approved=approved,
         last_seen=now - timedelta(seconds=last_seen_age),
     )
@@ -139,19 +219,31 @@ def _add_release(
     placement_overrides: dict | None = None,
     evidence_nodes: list[Node] | None = None,
     evidence_created_at: datetime | None = None,
+    source_manifest: dict | None = None,
 ):
+    manifest_digest = (
+        canonical_artifact_manifest_digest(source_manifest)
+        if source_manifest is not None
+        else "sha256:" + _hex(f"manifest-{key}", 64)
+    )
     artifact = create_model_artifact(
         session,
         model_id=model_id,
         repository=f"TestOrg/{key}-AWQ",
         revision=_hex(f"revision-{key}", 40),
-        manifest_digest="sha256:" + _hex(f"manifest-{key}", 64),
+        manifest_digest=manifest_digest,
         quantization="awq",
         size_mib=8192,
         default_max_model_len=8192,
         layer_count=32,
         license_id="apache-2.0",
     )
+    if source_manifest is not None:
+        register_artifact_manifest(
+            session,
+            artifact_id=artifact.id,
+            manifest=source_manifest,
+        )
     architectures = gpu_architectures or ["ampere"]
     runtime = create_runtime_release(
         session,
@@ -244,6 +336,74 @@ def _add_release(
     if status == "REVOKED":
         transition_model_release(session, release.id, "REVOKED")
     return release, placement
+
+
+def _register_validated_stage_variant(
+    session,
+    *,
+    release: ModelRelease,
+    placement: PlacementProfileRecord,
+    exporter_character: str = "6",
+    weight_size_bytes: int = 4,
+) -> dict:
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    runtime = session.get(RuntimeRelease, release.runtime_id)
+    assert artifact is not None
+    assert runtime is not None
+    stages = []
+    for rank in range(placement.pipeline_parallel_size):
+        manifest = _stage_manifest(rank, weight_size_bytes=weight_size_bytes + rank)
+        stages.append(
+            {
+                "pipeline_rank": rank,
+                "tensor_rank": 0,
+                "manifest_digest": canonical_artifact_manifest_digest(manifest),
+                "tensor_key_count": 10 + rank,
+                "tensor_keys_digest": _digest("0123456789abcdef"[rank + 8]),
+                "weight_size_bytes": weight_size_bytes + rank,
+                "manifest": manifest,
+            }
+        )
+    variant, _ = register_stage_artifact_variant(
+        session,
+        source_manifest_digest=artifact.manifest_digest,
+        runtime_image=runtime.image,
+        vllm_version=runtime.vllm_version,
+        exporter_build_digest=_digest(exporter_character),
+        architecture="Qwen2ForCausalLM",
+        quantization=artifact.quantization,
+        tensor_parallel_size=placement.tensor_parallel_size,
+        pipeline_parallel_size=placement.pipeline_parallel_size,
+        loader_format="VLLM_SHARDED_STATE_V1",
+        stages=stages,
+    )
+    register_stage_artifact_evidence(
+        session,
+        variant.artifact_set_digest,
+        schema_version=1,
+        variant_identity_digest=variant.artifact_set_digest,
+        validation_run_id=str(uuid.uuid4()),
+        kind="GPU_EXPORT_LOAD",
+        status="PASSED",
+        validator_version="validator-1",
+        validator_build_digest=_digest("f"),
+        failure_code=None,
+        ranks=[
+            {
+                "pipeline_rank": item["pipeline_rank"],
+                "tensor_rank": item["tensor_rank"],
+                "manifest_digest": item["manifest_digest"],
+                "tensor_keys_digest": item["tensor_keys_digest"],
+                "loaded_tensor_count": item["tensor_key_count"],
+                "loaded_weight_size_bytes": item["weight_size_bytes"],
+            }
+            for item in stages
+        ],
+    )
+    transition_stage_artifact_variant(
+        session, variant.artifact_set_digest, "VALIDATED"
+    )
+    return stage_artifact_variant_dict(session, variant)
 
 
 def _register_network_evidence(
@@ -411,6 +571,20 @@ class RecommendationServiceTests(unittest.TestCase):
                 {item["model_release_id"] for item in recommendation["candidates"]},
                 {lower.id, higher.id},
             )
+            for candidate in recommendation["candidates"]:
+                self.assertEqual(candidate["model_cache_kind"], "FULL_SNAPSHOT")
+                self.assertEqual(
+                    candidate["full_snapshot_total_size_bytes"],
+                    8192 * 1024 * 1024,
+                )
+                self.assertEqual(
+                    candidate["full_snapshot_required_cache_bytes"],
+                    (8192 * 2 + 64) * 1024 * 1024,
+                )
+                self.assertEqual(
+                    candidate["full_snapshot_size_source"],
+                    "MODEL_ARTIFACT_DECLARED_SIZE",
+                )
             self.assertEqual(len({item["candidate_id"] for item in recommendation["candidates"]}), 2)
             self.assertEqual(recommendation["requested_node_ids"], sorted([first.id, second.id]))
             self.assertNotIn("agent-reported-id", recommendation["requested_node_ids"])
@@ -428,6 +602,109 @@ class RecommendationServiceTests(unittest.TestCase):
             ).hexdigest()
             self.assertEqual(recommendation_id, expected_id)
             self.assertEqual(_row_counts(session), before)
+
+    def test_single_full_snapshot_disk_gate_uses_frozen_declared_size(self):
+        with self.factory() as session:
+            node = _add_node(session, "single-disk", now=self.now)
+            record = session.get(NodeProfileRecord, node.id)
+            record.profile = {**record.profile, "disk_free_mib": 16447}
+            record.updated_at = self.now
+            session.commit()
+            _add_release(
+                session,
+                "single-disk",
+                quality_rank=30,
+                evidence_nodes=[node],
+            )
+
+            result = recommend_deployment(
+                session,
+                node_ids=[node.id],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+
+            self.assertIsNone(result["selected"])
+            self.assertEqual(len(result["candidates"]), 1)
+            candidate = result["candidates"][0]
+            self.assertEqual(candidate["model_cache_kind"], "FULL_SNAPSHOT")
+            self.assertEqual(
+                candidate["full_snapshot_total_size_bytes"],
+                8192 * 1024 * 1024,
+            )
+            self.assertEqual(
+                candidate["full_snapshot_required_cache_bytes"],
+                16448 * 1024 * 1024,
+            )
+            self.assertIn(
+                "DISK_SPACE",
+                {item["code"] for item in candidate["rejections"]},
+            )
+
+    def test_single_full_snapshot_rejects_agent_before_preparation_minimum(self):
+        with self.factory() as session:
+            node = _add_node(
+                session,
+                "single-agent-old",
+                now=self.now,
+                agent_version="0.3.15",
+            )
+            _add_release(
+                session,
+                "single-agent-old",
+                quality_rank=30,
+                evidence_nodes=[node],
+            )
+
+            result = recommend_deployment(
+                session,
+                node_ids=[node.id],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+
+            self.assertIsNone(result["selected"])
+            self.assertEqual(len(result["candidates"]), 1)
+            candidate = result["candidates"][0]
+            self.assertFalse(candidate["feasible"])
+            rejection = next(
+                item
+                for item in candidate["rejections"]
+                if item["code"] == "FULL_SNAPSHOT_AGENT_VERSION"
+            )
+            self.assertEqual(rejection["node_ids"], [node.id])
+
+    def test_single_full_snapshot_accepts_preparation_minimum_agent(self):
+        with self.factory() as session:
+            node = _add_node(
+                session,
+                "single-agent-minimum",
+                now=self.now,
+                agent_version="0.3.16",
+            )
+            release, _ = _add_release(
+                session,
+                "single-agent-minimum",
+                quality_rank=30,
+                evidence_nodes=[node],
+            )
+
+            result = recommend_deployment(
+                session,
+                node_ids=[node.id],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+
+            self.assertIsNotNone(result["selected"], result["candidates"])
+            self.assertEqual(result["selected"]["model_release_id"], release.id)
+            self.assertNotIn(
+                "FULL_SNAPSHOT_AGENT_VERSION",
+                {
+                    item["code"]
+                    for item in result["candidates"][0]["rejections"]
+                },
+            )
 
     def test_pending_offline_and_stale_profiles_have_distinct_rejections(self):
         with self.factory() as session:
@@ -482,7 +759,7 @@ class RecommendationServiceTests(unittest.TestCase):
             )["recommendation"]
 
             selected = result["selected"]
-            self.assertIsNotNone(selected)
+            self.assertIsNotNone(selected, result["candidates"])
             assert selected is not None
             self.assertEqual(selected["model_release_id"], release.id)
             self.assertEqual(selected["node_ids"], sorted(item.id for item in nodes))
@@ -495,7 +772,174 @@ class RecommendationServiceTests(unittest.TestCase):
                 selected["network_evidence_registered_at"],
                 aware(evidence.created_at).isoformat(),
             )
-            self.assertEqual(result["policy_version"], "central-quality-within-slo-v3")
+            self.assertEqual(result["policy_version"], "central-quality-within-slo-v4")
+
+    def test_validated_stage_is_selected_with_exact_rank_binding_before_full_disk_gate(self):
+        with self.factory() as session:
+            nodes = [
+                _add_node(session, f"stage-node-{index}", now=self.now)
+                for index in range(3)
+            ]
+            for node in nodes:
+                record = session.get(NodeProfileRecord, node.id)
+                record.profile = {**record.profile, "disk_free_mib": 100}
+                record.updated_at = self.now
+            session.commit()
+            release, placement = _add_release(
+                session,
+                "stage-delivery",
+                quality_rank=72,
+                evidence_nodes=nodes,
+                placement_overrides={
+                    **PIPELINE_OVERRIDES,
+                    "min_disk_free_mib": 64,
+                },
+                source_manifest=_source_manifest(
+                    weight_size_bytes=8 * 1024 * 1024 * 1024
+                ),
+            )
+            variant = _register_validated_stage_variant(
+                session, release=release, placement=placement
+            )
+
+            result = recommend_deployment(
+                session,
+                node_ids=[item.id for item in reversed(nodes)],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+
+            selected = result["selected"]
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual(selected["model_cache_kind"], "STAGE")
+            self.assertEqual(
+                selected["stage_artifact"]["artifact_set_digest"],
+                variant["artifact_set_digest"],
+            )
+            self.assertEqual(
+                selected["stage_artifact"]["loader_format"],
+                "VLLM_SHARDED_STATE_V1",
+            )
+            self.assertEqual(
+                selected["stage_validation_evidence"]["status"], "PASSED"
+            )
+            self.assertEqual(
+                [item["node_id"] for item in selected["stage_node_bindings"]],
+                selected["rank_node_ids"],
+            )
+            self.assertEqual(
+                [item["rank"] for item in selected["stage_node_bindings"]],
+                [0, 1, 2],
+            )
+            self.assertTrue(
+                all(
+                    item["required_cache_bytes"]
+                    == item["total_size_bytes"] * 2 + 64 * 1024 * 1024
+                    for item in selected["stage_node_bindings"]
+                )
+            )
+            immutable_core = dict(result)
+            recommendation_id = immutable_core.pop("id")
+            self.assertEqual(
+                recommendation_id,
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        immutable_core,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            full = next(
+                item
+                for item in result["candidates"]
+                if item["model_cache_kind"] == "FULL_SNAPSHOT"
+            )
+            self.assertFalse(full["feasible"])
+            self.assertIn(
+                "DISK_SPACE", {item["code"] for item in full["rejections"]}
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Task)), 0
+            )
+
+    def test_stage_variant_digest_breaks_ties_and_both_delivery_failures_are_explained(self):
+        with self.factory() as session:
+            nodes = [
+                _add_node(session, f"stage-tie-{index}", now=self.now)
+                for index in range(3)
+            ]
+            for node in nodes:
+                record = session.get(NodeProfileRecord, node.id)
+                record.profile = {**record.profile, "disk_free_mib": 100}
+                record.updated_at = self.now
+            session.commit()
+            release, placement = _add_release(
+                session,
+                "stage-tie",
+                quality_rank=72,
+                evidence_nodes=nodes,
+                placement_overrides={
+                    **PIPELINE_OVERRIDES,
+                    "min_disk_free_mib": 64,
+                },
+                source_manifest=_source_manifest(
+                    weight_size_bytes=8 * 1024 * 1024 * 1024
+                ),
+            )
+            first = _register_validated_stage_variant(
+                session,
+                release=release,
+                placement=placement,
+                exporter_character="6",
+                weight_size_bytes=100 * 1024 * 1024,
+            )
+            second = _register_validated_stage_variant(
+                session,
+                release=release,
+                placement=placement,
+                exporter_character="7",
+                weight_size_bytes=100 * 1024 * 1024,
+            )
+
+            result = recommend_deployment(
+                session,
+                node_ids=[item.id for item in nodes],
+                all_online=False,
+                now=self.now,
+            )["recommendation"]
+
+            self.assertIsNone(result["selected"])
+            stages = [
+                item
+                for item in result["candidates"]
+                if item.get("model_cache_kind") == "STAGE"
+            ]
+            self.assertEqual(
+                [item["stage_artifact"]["artifact_set_digest"] for item in stages],
+                sorted(
+                    [first["artifact_set_digest"], second["artifact_set_digest"]]
+                ),
+            )
+            self.assertTrue(
+                all(
+                    "STAGE_DISK_SPACE"
+                    in {rejection["code"] for rejection in item["rejections"]}
+                    for item in stages
+                ),
+                stages,
+            )
+            full = next(
+                item
+                for item in result["candidates"]
+                if item.get("model_cache_kind") == "FULL_SNAPSHOT"
+            )
+            self.assertIn(
+                "DISK_SPACE", {item["code"] for item in full["rejections"]}
+            )
 
     def test_multinode_evidence_for_a_different_node_set_is_rejected(self):
         with self.factory() as session:

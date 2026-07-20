@@ -1,7 +1,13 @@
 import unittest
 from dataclasses import replace
 
-from dure.catalog import ModelCatalog, NetworkEvidenceBinding, STATIC_CATALOG
+from dure.catalog import (
+    ModelCatalog,
+    NetworkEvidenceBinding,
+    STATIC_CATALOG,
+    StageArtifactDelivery,
+    StageRankDelivery,
+)
 from dure.models import GPUProfile, InstalledModelProfile
 from dure.selector import InventoryNode, recommend_model
 
@@ -32,7 +38,153 @@ def network_evidence(evidence_id, *node_ids):
     )
 
 
+def stage_delivery(character: str, *, rank_size_bytes: int = 1024) -> StageArtifactDelivery:
+    return StageArtifactDelivery(
+        artifact_set_digest="sha256:" + character * 64,
+        contract_identity_digest="sha256:" + "c" * 64,
+        source_manifest_digest="sha256:" + "d" * 64,
+        runtime_image="registry.example/vllm@sha256:" + "e" * 64,
+        vllm_version="0.9.0",
+        exporter_build_digest="sha256:" + "f" * 64,
+        architecture="Qwen2ForCausalLM",
+        quantization="awq",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=3,
+        loader_format="VLLM_SHARDED_STATE_V1",
+        ranks=tuple(
+            StageRankDelivery(
+                rank=rank,
+                pipeline_rank=rank,
+                tensor_rank=0,
+                manifest_digest="sha256:" + str(rank + 1) * 64,
+                tensor_key_count=10 + rank,
+                tensor_keys_digest="sha256:" + str(rank + 4) * 64,
+                weight_size_bytes=rank_size_bytes - 1,
+                total_size_bytes=rank_size_bytes,
+                file_count=5,
+            )
+            for rank in range(3)
+        ),
+    )
+
+
 class SelectorTests(unittest.TestCase):
+    def _delivery_catalog(
+        self,
+        *,
+        stage: StageArtifactDelivery,
+    ) -> ModelCatalog:
+        base = STATIC_CATALOG.entry("qwen2.5-72b-awq")
+        evidence = replace(
+            network_evidence("evidence-a", "node-a", "node-b", "node-c"),
+            rank_node_ids=("node-a", "node-c", "node-b"),
+        )
+        full = replace(
+            base,
+            candidate_id="release:placement",
+            network_evidence=(evidence,),
+        )
+        staged = replace(
+            full,
+            candidate_id=f"release:placement:STAGE:{stage.artifact_set_digest}",
+            stage_artifact=stage,
+        )
+        return ModelCatalog("test", "test", (full, staged))
+
+    def test_stage_uses_rank_bytes_before_full_snapshot_disk_gate(self):
+        nodes = []
+        for node_id in ("node-a", "node-b", "node-c"):
+            value = profile(node_id)
+            value.disk_free_mib = 256
+            nodes.append(inventory(value))
+        catalog = self._delivery_catalog(stage=stage_delivery("a"))
+
+        result = recommend_model(nodes, catalog=catalog)
+
+        self.assertIn(":STAGE:", result.selected_candidate_id)
+        self.assertEqual(result.selected_node_ids, ("node-a", "node-b", "node-c"))
+        staged, full = result.evaluations
+        self.assertTrue(staged.feasible)
+        self.assertEqual(staged.rank_node_ids, ("node-a", "node-c", "node-b"))
+        self.assertFalse(full.feasible)
+        self.assertIn("DISK_SPACE", {item.code for item in full.rejections})
+
+    def test_full_snapshot_is_an_independent_fallback_when_stage_disk_fails(self):
+        nodes = []
+        for node_id in ("node-a", "node-b", "node-c"):
+            value = profile(node_id)
+            value.disk_free_mib = 60000
+            nodes.append(inventory(value))
+        huge_rank = 40000 * 1024 * 1024
+        catalog = self._delivery_catalog(
+            stage=stage_delivery("a", rank_size_bytes=huge_rank)
+        )
+
+        result = recommend_model(nodes, catalog=catalog)
+
+        self.assertEqual(result.selected_candidate_id, "release:placement")
+        staged = result.evaluations[0]
+        self.assertFalse(staged.feasible)
+        self.assertIn(
+            "STAGE_DISK_SPACE", {item.code for item in staged.rejections}
+        )
+        self.assertTrue(result.evaluations[1].feasible)
+
+    def test_stage_and_full_failures_remain_separate_and_explained(self):
+        nodes = []
+        for node_id in ("node-a", "node-b", "node-c"):
+            value = profile(node_id)
+            value.disk_free_mib = 100
+            nodes.append(inventory(value))
+        catalog = self._delivery_catalog(
+            stage=stage_delivery("a", rank_size_bytes=100 * 1024 * 1024)
+        )
+
+        result = recommend_model(nodes, catalog=catalog)
+
+        self.assertIsNone(result.selected_candidate_id)
+        self.assertIn(
+            "STAGE_DISK_SPACE",
+            {item.code for item in result.evaluations[0].rejections},
+        )
+        self.assertIn(
+            "DISK_SPACE",
+            {item.code for item in result.evaluations[1].rejections},
+        )
+
+    def test_stage_variant_digest_is_the_deterministic_tie_break(self):
+        nodes = [
+            inventory(profile(node_id))
+            for node_id in ("node-a", "node-b", "node-c")
+        ]
+        first_catalog = self._delivery_catalog(stage=stage_delivery("a"))
+        base_full = next(
+            item for item in first_catalog.entries if item.stage_artifact is None
+        )
+        stage_a = next(
+            item for item in first_catalog.entries if item.stage_artifact is not None
+        )
+        stage_b_value = stage_delivery("b")
+        stage_b = replace(
+            stage_a,
+            candidate_id=(
+                "release:placement:STAGE:" + stage_b_value.artifact_set_digest
+            ),
+            stage_artifact=stage_b_value,
+        )
+
+        forward = recommend_model(
+            nodes,
+            catalog=ModelCatalog("test", "test", (stage_b, base_full, stage_a)),
+        )
+        reverse = recommend_model(
+            list(reversed(nodes)),
+            catalog=ModelCatalog("test", "test", (stage_a, base_full, stage_b)),
+        )
+
+        self.assertEqual(forward.to_dict(), reverse.to_dict())
+        self.assertTrue(forward.selected_candidate_id.endswith("sha256:" + "a" * 64))
+
     def test_inventory_order_does_not_change_recommendation(self):
         nodes = [
             inventory(profile("node-c"), network=True),

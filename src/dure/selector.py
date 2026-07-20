@@ -8,6 +8,10 @@ from .catalog import CatalogEntry, ModelCatalog, NetworkEvidenceBinding, STATIC_
 from .models import GPUProfile, NodeProfile
 
 
+_MIB = 1024 * 1024
+_STAGE_CACHE_RESERVE_BYTES = 64 * _MIB
+
+
 @dataclass(frozen=True)
 class InventoryNode:
     node_id: str
@@ -17,6 +21,7 @@ class InventoryNode:
     profile_fresh: bool
     network_verified: bool
     profile_error: str | None = None
+    agent_version: str | None = None
 
     @classmethod
     def local(cls, profile: NodeProfile, *, network_verified: bool = False) -> "InventoryNode":
@@ -52,6 +57,7 @@ class CandidateEvaluation:
     network_evidence_id: str | None = None
     network_evidence_digest: str | None = None
     network_evidence_registered_at: str | None = None
+    rank_node_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -73,6 +79,8 @@ class CandidateEvaluation:
                     ),
                 }
             )
+        if self.rank_node_ids:
+            result["rank_node_ids"] = list(self.rank_node_ids)
         return result
 
 
@@ -118,6 +126,7 @@ def inventory_fingerprint(nodes: list[InventoryNode]) -> str:
             "profile_fresh": node.profile_fresh,
             "network_verified": node.network_verified,
             "profile_error": node.profile_error,
+            "agent_version": node.agent_version,
             "profile": canonical(node.profile.to_dict()) if node.profile else None,
         }
         for node in sorted(nodes, key=lambda item: item.node_id)
@@ -181,12 +190,24 @@ def _compute_capability_at_least(actual: str | None, minimum: str | None) -> boo
 def _select_exact_network_evidence(
     entry: CatalogEntry,
     available: list[tuple[InventoryNode, GPUProfile]],
-) -> tuple[NetworkEvidenceBinding | None, tuple[str, ...]]:
+) -> tuple[
+    NetworkEvidenceBinding | None,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
     """Choose one complete evidence-bound node set without combining sets."""
     placement = entry.placement
     ranking = {item[0].node_id: index for index, item in enumerate(available)}
+    available_by_id = {item[0].node_id: item[0] for item in available}
     choices: list[
-        tuple[tuple[object, ...], NetworkEvidenceBinding, tuple[str, ...]]
+        tuple[
+            tuple[object, ...],
+            NetworkEvidenceBinding,
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+        ]
     ] = []
     for binding in entry.network_evidence:
         node_ids = tuple(sorted(binding.node_ids))
@@ -194,9 +215,38 @@ def _select_exact_network_evidence(
             continue
         if any(node_id not in ranking for node_id in node_ids):
             continue
+        rank_node_ids = binding.rank_node_ids or node_ids
+        if (
+            len(rank_node_ids) != placement.node_count
+            or len(set(rank_node_ids)) != len(rank_node_ids)
+            or set(rank_node_ids) != set(node_ids)
+        ):
+            rank_node_ids = ()
+        disk_failures: tuple[str, ...] = ()
+        if entry.stage_artifact is not None and rank_node_ids:
+            by_rank = {
+                item.rank: item for item in entry.stage_artifact.ranks
+            }
+            failed: list[str] = []
+            for rank, node_id in enumerate(rank_node_ids):
+                stage = by_rank.get(rank)
+                if stage is None:
+                    failed.append(node_id)
+                    continue
+                required_bytes = (
+                    stage.total_size_bytes * 2 + _STAGE_CACHE_RESERVE_BYTES
+                )
+                profile = available_by_id[node_id].profile
+                if (
+                    profile is None
+                    or profile.disk_free_mib * _MIB < required_bytes
+                ):
+                    failed.append(node_id)
+            disk_failures = tuple(sorted(failed))
         choices.append(
             (
                 (
+                    bool(disk_failures),
                     tuple(sorted(ranking[node_id] for node_id in node_ids)),
                     node_ids,
                     binding.evidence_id,
@@ -205,13 +255,17 @@ def _select_exact_network_evidence(
                 ),
                 binding,
                 node_ids,
+                rank_node_ids,
+                disk_failures,
             )
         )
     if not choices:
-        return None, ()
-    _, binding, node_ids = min(choices, key=lambda item: item[0])
+        return None, (), (), ()
+    _, binding, node_ids, rank_node_ids, disk_failures = min(
+        choices, key=lambda item: item[0]
+    )
     selected = tuple(sorted(node_ids, key=ranking.__getitem__))
-    return binding, selected
+    return binding, selected, rank_node_ids, disk_failures
 
 
 def _evaluate(
@@ -234,6 +288,16 @@ def _evaluate(
     insufficient_disk: list[str] = []
     missing_runtime: list[str] = []
     missing_network: list[str] = []
+    stage_disk_failures: tuple[str, ...] = ()
+    rank_node_ids: tuple[str, ...] = ()
+    full_required_bytes = (
+        max(
+            entry.full_snapshot_size_bytes * 2 + _STAGE_CACHE_RESERVE_BYTES,
+            placement.min_disk_free_mib * _MIB,
+        )
+        if entry.full_snapshot_size_bytes is not None
+        else placement.min_disk_free_mib * _MIB
+    )
 
     for node in sorted(nodes, key=lambda item: item.node_id):
         node_id = node.node_id
@@ -270,7 +334,10 @@ def _evaluate(
         ):
             unsupported_runtime_arch.append(node_id)
             continue
-        if node.profile.disk_free_mib < placement.min_disk_free_mib:
+        if (
+            entry.stage_artifact is None
+            and node.profile.disk_free_mib * _MIB < full_required_bytes
+        ):
             insufficient_disk.append(node_id)
             continue
         runtime = node.profile.runtime
@@ -299,7 +366,12 @@ def _evaluate(
             item[0].node_id for item in network_eligible[: placement.node_count]
         )
     elif entry.network_evidence:
-        selected_evidence, selected = _select_exact_network_evidence(entry, available)
+        (
+            selected_evidence,
+            selected,
+            rank_node_ids,
+            stage_disk_failures,
+        ) = _select_exact_network_evidence(entry, available)
         network_eligible = available if selected_evidence is not None else []
         if selected_evidence is None:
             missing_network.extend(item[0].node_id for item in available)
@@ -367,12 +439,43 @@ def _evaluate(
             )
         )
     if insufficient_disk:
+        full_required_mib = (full_required_bytes + _MIB - 1) // _MIB
         rejections.append(
             Rejection(
                 "DISK_SPACE",
-                f"{placement.min_disk_free_mib} MiB 디스크 여유가 부족한 노드: "
+                f"{full_required_mib} MiB 디스크 여유가 부족한 노드: "
                 f"{', '.join(insufficient_disk)}",
                 tuple(insufficient_disk),
+            )
+        )
+    if stage_disk_failures:
+        by_rank = {
+            node_id: rank for rank, node_id in enumerate(rank_node_ids)
+        }
+        requirements = []
+        stage_ranks = (
+            {item.rank: item for item in entry.stage_artifact.ranks}
+            if entry.stage_artifact is not None
+            else {}
+        )
+        for node_id in stage_disk_failures:
+            rank = by_rank.get(node_id)
+            stage = stage_ranks.get(rank)
+            if rank is not None and stage is not None:
+                required_bytes = (
+                    stage.total_size_bytes * 2 + _STAGE_CACHE_RESERVE_BYTES
+                )
+                requirements.append(
+                    f"{node_id}(rank={rank}, required_bytes={required_bytes})"
+                )
+            else:
+                requirements.append(node_id)
+        rejections.append(
+            Rejection(
+                "STAGE_DISK_SPACE",
+                "rank별 STAGE 캐시 여유 공간이 부족한 노드: "
+                + ", ".join(requirements),
+                stage_disk_failures,
             )
         )
     if missing_runtime:
@@ -383,15 +486,17 @@ def _evaluate(
         rejections.append(
             Rejection("NETWORK_EVIDENCE", f"네트워크/NCCL 증적이 없는 노드: {', '.join(missing_network)}", tuple(missing_network))
         )
-    feasible = len(selected) == placement.node_count
-    if not feasible:
+    feasible = (
+        len(selected) == placement.node_count and not stage_disk_failures
+    )
+    if len(selected) != placement.node_count:
         rejections.append(
             Rejection(
                 "NODE_COUNT",
                 f"적격 노드 {len(network_eligible)}개, 필요 노드 {placement.node_count}개",
             )
         )
-    else:
+    if feasible:
         rejections = []
     return CandidateEvaluation(
         candidate_id=entry.candidate_id
@@ -411,6 +516,7 @@ def _evaluate(
         network_evidence_registered_at=(
             selected_evidence.registered_at if selected_evidence is not None else None
         ),
+        rank_node_ids=rank_node_ids,
     )
 
 
@@ -436,6 +542,12 @@ def recommend_model(
         key=lambda entry: (
             -entry.quality_rank,
             entry.model.model_id,
+            0 if entry.stage_artifact is not None else 1,
+            (
+                entry.stage_artifact.artifact_set_digest
+                if entry.stage_artifact is not None
+                else ""
+            ),
             entry.candidate_id or "",
             entry.placement.profile_id,
         )

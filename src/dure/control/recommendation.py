@@ -18,8 +18,13 @@ from dure.catalog import (
     ModelCatalog,
     NetworkEvidenceBinding,
     PlacementProfile,
+    StageArtifactDelivery,
+    StageRankDelivery,
 )
-from dure.model_cache import MODEL_CACHE_KIND_FULL_SNAPSHOT
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+)
 from dure.models import (
     VLLM_RAY_PP_BACKEND,
     VLLM_RAY_PP_RUNTIME_VERSION,
@@ -27,6 +32,7 @@ from dure.models import (
     ModelSpec,
     NodeAssignment,
     NodeProfile,
+    StageArtifactBinding,
 )
 from dure.planner import StrictRayPPTopologyError, strict_vllm_ray_pp_order
 from dure.selector import InventoryNode, recommend_model
@@ -40,6 +46,10 @@ from .benchmark import BENCHMARK_POLICY_VERSION, BENCHMARK_SUITE_ID
 
 from .models import (
     AuditEvent,
+    ArtifactChunk,
+    ArtifactFileChunk,
+    ArtifactManifest,
+    ArtifactManifestFile,
     BenchmarkEvidence,
     BenchmarkRun,
     Deployment,
@@ -51,16 +61,42 @@ from .models import (
     NodeProfileRecord,
     PlacementProfileRecord,
     RuntimeRelease,
+    StageArtifactRank,
+    StageArtifactValidationEvidence,
+    StageArtifactValidationRank,
+    StageArtifactVariant,
     Task,
     utcnow,
 )
-from .service import aware, node_status
+from .service import artifact_manifest_dict, aware, node_status
+from .stage_artifacts import (
+    StageArtifactConflictError,
+    StageArtifactNotFoundError,
+    stage_artifact_evidence_dict,
+    validated_stage_artifact_projection,
+)
 
 
-POLICY_VERSION = "central-quality-within-slo-v3"
+POLICY_VERSION = "central-quality-within-slo-v4"
 PROFILE_MAX_AGE = timedelta(seconds=90)
 NETWORK_EVIDENCE_MAX_AGE = timedelta(hours=24)
 GENERATION_NAMESPACE = uuid.UUID("74ebf646-2d77-4fcf-8524-1777a274eb93")
+_MIB = 1024 * 1024
+_CACHE_RESERVE_BYTES = 64 * _MIB
+_FULL_SNAPSHOT_AGENT_VERSION = (0, 3, 16)
+_AGENT_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?")
+
+
+def _agent_supports(value: str | None, minimum: tuple[int, int, int]) -> bool:
+    if not isinstance(value, str):
+        return False
+    matched = _AGENT_VERSION.fullmatch(value)
+    return bool(
+        matched
+        and tuple(int(part) for part in matched.groups()) >= minimum
+    )
+
+
 PRIVATE_IPV4_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -157,6 +193,7 @@ def canonical_inventory_snapshot(nodes: list[InventoryNode]) -> list[dict[str, A
             "profile_fresh": node.profile_fresh,
             "network_verified": node.network_verified,
             "profile_error": node.profile_error,
+            "agent_version": node.agent_version,
             "profile": _canonical_value(node.profile.to_dict()) if node.profile else None,
         }
         for node in sorted(nodes, key=lambda item: item.node_id)
@@ -295,12 +332,27 @@ def _network_evidence_bindings(
         ]
         if evidence.inventory_fingerprint != benchmark_inventory_fingerprint(profiles):
             continue
+        rank_node_ids: tuple[str, ...] = ()
+        try:
+            runtime_bindings = strict_vllm_ray_pp_order(
+                [profile for _node_id, profile in profiles if profile is not None],
+                head_node_id=node_set[0],
+                minimum_gpu_memory_mib=placement.min_gpu_memory_mib,
+            )
+        except StrictRayPPTopologyError:
+            # Keep the evidence visible so the strict topology evaluator can
+            # return the precise denial code.  An empty rank binding can never
+            # authorize a STAGE plan.
+            pass
+        else:
+            rank_node_ids = tuple(item.profile.node_id for item in runtime_bindings)
         bindings.append(
             NetworkEvidenceBinding(
                 evidence_id=evidence.id,
                 evidence_digest=evidence.evidence_digest,
                 node_ids=node_set,
                 registered_at=registered_at.isoformat(),
+                rank_node_ids=rank_node_ids,
             )
         )
     return tuple(
@@ -309,6 +361,199 @@ def _network_evidence_bindings(
             key=lambda item: (item.node_ids, item.evidence_digest, item.evidence_id),
         )
     )
+
+
+def _validated_stage_deliveries(
+    session: Session,
+    *,
+    artifact: ModelArtifact,
+    runtime: RuntimeRelease,
+    placement: PlacementProfileRecord,
+) -> list[tuple[StageArtifactDelivery, dict[str, Any]]]:
+    """Project every exact, currently valid STAGE delivery deterministically."""
+
+    if (
+        placement.node_count not in {2, 3}
+        or placement.tensor_parallel_size != 1
+        or placement.pipeline_parallel_size != placement.node_count
+    ):
+        return []
+    variants = list(
+        session.scalars(
+            select(StageArtifactVariant)
+            .where(
+                StageArtifactVariant.status == "VALIDATED",
+                StageArtifactVariant.source_manifest_digest
+                == artifact.manifest_digest,
+                StageArtifactVariant.runtime_release_id == runtime.id,
+                StageArtifactVariant.runtime_image == runtime.image,
+                StageArtifactVariant.vllm_version == runtime.vllm_version,
+                StageArtifactVariant.quantization == artifact.quantization,
+                StageArtifactVariant.tensor_parallel_size
+                == placement.tensor_parallel_size,
+                StageArtifactVariant.pipeline_parallel_size
+                == placement.pipeline_parallel_size,
+            )
+            .order_by(StageArtifactVariant.artifact_set_digest)
+        )
+    )
+    deliveries: list[tuple[StageArtifactDelivery, dict[str, Any]]] = []
+    for variant in variants:
+        try:
+            projection = validated_stage_artifact_projection(
+                session, variant.artifact_set_digest
+            )
+            latest = session.scalar(
+                select(StageArtifactValidationEvidence)
+                .where(
+                    StageArtifactValidationEvidence.variant_id
+                    == variant.artifact_set_digest,
+                    StageArtifactValidationEvidence.kind == "GPU_EXPORT_LOAD",
+                )
+                .order_by(
+                    StageArtifactValidationEvidence.registration_sequence.desc(),
+                    StageArtifactValidationEvidence.identity_digest.desc(),
+                )
+                .limit(1)
+            )
+            if latest is None:
+                raise StageArtifactConflictError(
+                    "validated stage artifact has no GPU evidence"
+                )
+            evidence = stage_artifact_evidence_dict(session, latest)
+        except (
+            StageArtifactConflictError,
+            StageArtifactNotFoundError,
+            ValueError,
+        ):
+            # A corrupt registry row is never made selectable.  FULL remains
+            # an independently evaluated safe candidate.
+            continue
+        ranks = tuple(
+            StageRankDelivery(
+                rank=item["rank"],
+                pipeline_rank=item["pipeline_rank"],
+                tensor_rank=item["tensor_rank"],
+                manifest_digest=item["manifest_digest"],
+                tensor_key_count=item["tensor_key_count"],
+                tensor_keys_digest=item["tensor_keys_digest"],
+                weight_size_bytes=item["weight_size_bytes"],
+                total_size_bytes=item["total_size_bytes"],
+                file_count=item["file_count"],
+            )
+            for item in projection["ranks"]
+        )
+        delivery = StageArtifactDelivery(
+            artifact_set_digest=projection["artifact_set_digest"],
+            contract_identity_digest=projection["contract_identity_digest"],
+            source_manifest_digest=projection["source_manifest_digest"],
+            runtime_image=projection["runtime_image"],
+            vllm_version=projection["vllm_version"],
+            exporter_build_digest=projection["exporter_build_digest"],
+            architecture=projection["architecture"],
+            quantization=projection["quantization"],
+            tensor_parallel_size=projection["tensor_parallel_size"],
+            pipeline_parallel_size=projection["pipeline_parallel_size"],
+            loader_format=projection["loader_format"],
+            ranks=ranks,
+        )
+        stage_artifact = {
+            key: projection[key]
+            for key in (
+                "artifact_set_digest",
+                "contract_identity_digest",
+                "source_manifest_digest",
+                "runtime_image",
+                "vllm_version",
+                "exporter_build_digest",
+                "architecture",
+                "quantization",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "loader_format",
+            )
+        }
+        closed_evidence = {
+            key: evidence[key]
+            for key in (
+                "identity_digest",
+                "variant_id",
+                "validation_run_id",
+                "registration_sequence",
+                "schema_version",
+                "kind",
+                "status",
+                "validator_version",
+                "validator_build_digest",
+                "rank_count",
+                "failure_code",
+                "ranks",
+            )
+        }
+        deliveries.append(
+            (
+                delivery,
+                {
+                    "model_cache_kind": MODEL_CACHE_KIND_STAGE,
+                    "stage_artifact": stage_artifact,
+                    "stage_ranks": [
+                        {
+                            "rank": item.rank,
+                            "pipeline_rank": item.pipeline_rank,
+                            "tensor_rank": item.tensor_rank,
+                            "manifest_digest": item.manifest_digest,
+                            "tensor_key_count": item.tensor_key_count,
+                            "tensor_keys_digest": item.tensor_keys_digest,
+                            "weight_size_bytes": item.weight_size_bytes,
+                            "total_size_bytes": item.total_size_bytes,
+                            "file_count": item.file_count,
+                            "required_cache_bytes": (
+                                item.total_size_bytes * 2 + 64 * 1024 * 1024
+                            ),
+                        }
+                        for item in ranks
+                    ],
+                    "stage_validation_evidence": closed_evidence,
+                },
+            )
+        )
+    return deliveries
+
+
+def _full_snapshot_delivery_context(
+    session: Session,
+    *,
+    artifact: ModelArtifact,
+    placement: PlacementProfileRecord,
+) -> tuple[int, dict[str, Any]]:
+    """Return the deterministic FULL snapshot size gate and frozen wire fields."""
+
+    total_size_bytes = artifact.size_mib * _MIB
+    size_source = "MODEL_ARTIFACT_DECLARED_SIZE"
+    manifest_record = session.get(ArtifactManifest, artifact.manifest_digest)
+    if (
+        manifest_record is not None
+        and manifest_record.model_artifact_id == artifact.id
+    ):
+        try:
+            manifest_projection = artifact_manifest_dict(session, manifest_record)
+        except ValueError:
+            # Legacy releases can predate normalized manifests. Their declared
+            # artifact size remains the deterministic fallback input.
+            pass
+        else:
+            total_size_bytes = manifest_projection["total_size_bytes"]
+            size_source = "REGISTERED_ARTIFACT_MANIFEST"
+    required_cache_bytes = max(
+        total_size_bytes * 2 + _CACHE_RESERVE_BYTES,
+        placement.min_disk_free_mib * _MIB,
+    )
+    return total_size_bytes, {
+        "model_cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        "full_snapshot_total_size_bytes": total_size_bytes,
+        "full_snapshot_required_cache_bytes": required_cache_bytes,
+        "full_snapshot_size_source": size_source,
+    }
 
 
 def _active_catalog(
@@ -338,7 +583,14 @@ def _active_catalog(
     contexts: dict[str, dict[str, Any]] = {}
     snapshot: list[dict[str, Any]] = []
     for release, artifact, runtime, placement in rows:
-        candidate_id = f"{release.id}:{placement.id}"
+        full_candidate_id = f"{release.id}:{placement.id}"
+        full_snapshot_size_bytes, full_delivery_context = (
+            _full_snapshot_delivery_context(
+                session,
+                artifact=artifact,
+                placement=placement,
+            )
+        )
         network_evidence = _network_evidence_bindings(
             session,
             release=release,
@@ -348,8 +600,7 @@ def _active_catalog(
             inventory=inventory,
             now=now,
         )
-        context = {
-            "candidate_id": candidate_id,
+        base_context = {
             "model_id": artifact.model_id,
             "model_release_id": release.id,
             "artifact_id": artifact.id,
@@ -363,95 +614,134 @@ def _active_catalog(
             "runtime_image": runtime.image,
         }
         if placement.node_count > 1:
-            context.update(
+            base_context.update(
                 {
                     "execution_backend": VLLM_RAY_PP_BACKEND,
                     "runtime_vllm_version": runtime.vllm_version,
-                    "model_cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
                 }
             )
-        contexts[candidate_id] = context
-        snapshot.append(
+        artifact_snapshot = {
+            "repository": artifact.repository,
+            "revision": artifact.revision,
+            "manifest_digest": artifact.manifest_digest,
+            "quantization": artifact.quantization,
+            "size_mib": artifact.size_mib,
+            "default_max_model_len": artifact.default_max_model_len,
+            "layer_count": artifact.layer_count,
+        }
+        runtime_snapshot = {
+            "version": runtime.version,
+            "vllm_version": runtime.vllm_version,
+            "cuda_version": runtime.cuda_version,
+            "gpu_architectures": sorted(runtime.gpu_architectures),
+        }
+        placement_snapshot = {
+            "topology": placement.topology,
+            "node_count": placement.node_count,
+            "min_gpu_memory_mib": placement.min_gpu_memory_mib,
+            "min_disk_free_mib": placement.min_disk_free_mib,
+            "pipeline_parallel_size": placement.pipeline_parallel_size,
+            "tensor_parallel_size": placement.tensor_parallel_size,
+            "requires_network_evidence": placement.requires_network_evidence,
+            "requires_nccl": placement.requires_nccl,
+            "min_bandwidth_mbps": placement.min_bandwidth_mbps,
+            "max_rtt_ms": placement.max_rtt_ms,
+            "max_packet_loss_pct": placement.max_packet_loss_pct,
+            "max_ttft_p95_ms": placement.max_ttft_p95_ms,
+            "max_tpot_p95_ms": placement.max_tpot_p95_ms,
+            "max_e2e_p95_ms": placement.max_e2e_p95_ms,
+            "min_success_rate": placement.min_success_rate,
+            "min_vram_headroom_pct": placement.min_vram_headroom_pct,
+            "min_throughput_tps": placement.min_throughput_tps,
+        }
+        evidence_snapshot = [
             {
-                **context,
-                "artifact": {
-                    "repository": artifact.repository,
-                    "revision": artifact.revision,
-                    "manifest_digest": artifact.manifest_digest,
-                    "quantization": artifact.quantization,
-                    "size_mib": artifact.size_mib,
-                    "default_max_model_len": artifact.default_max_model_len,
-                    "layer_count": artifact.layer_count,
-                },
-                "runtime": {
-                    "version": runtime.version,
-                    "vllm_version": runtime.vllm_version,
-                    "cuda_version": runtime.cuda_version,
-                    "gpu_architectures": sorted(runtime.gpu_architectures),
-                },
-                "release": {
-                    "status": release.status,
-                    "quality_rank": release.quality_rank,
-                },
-                "placement": {
-                    "topology": placement.topology,
-                    "node_count": placement.node_count,
-                    "min_gpu_memory_mib": placement.min_gpu_memory_mib,
-                    "min_disk_free_mib": placement.min_disk_free_mib,
-                    "pipeline_parallel_size": placement.pipeline_parallel_size,
-                    "tensor_parallel_size": placement.tensor_parallel_size,
-                    "requires_network_evidence": placement.requires_network_evidence,
-                    "requires_nccl": placement.requires_nccl,
-                    "min_bandwidth_mbps": placement.min_bandwidth_mbps,
-                    "max_rtt_ms": placement.max_rtt_ms,
-                    "max_packet_loss_pct": placement.max_packet_loss_pct,
-                    "max_ttft_p95_ms": placement.max_ttft_p95_ms,
-                    "max_tpot_p95_ms": placement.max_tpot_p95_ms,
-                    "max_e2e_p95_ms": placement.max_e2e_p95_ms,
-                    "min_success_rate": placement.min_success_rate,
-                    "min_vram_headroom_pct": placement.min_vram_headroom_pct,
-                    "min_throughput_tps": placement.min_throughput_tps,
-                },
-                "network_evidence": [
-                    {
-                        "evidence_id": item.evidence_id,
-                        "evidence_digest": item.evidence_digest,
-                        "node_ids": list(item.node_ids),
-                        "registered_at": item.registered_at,
-                    }
-                    for item in network_evidence
-                ],
+                "evidence_id": item.evidence_id,
+                "evidence_digest": item.evidence_digest,
+                "node_ids": list(item.node_ids),
+                "rank_node_ids": list(item.rank_node_ids),
+                "registered_at": item.registered_at,
             }
+            for item in network_evidence
+        ]
+        model = ModelSpec(
+            model_id=artifact.model_id,
+            repository=artifact.repository,
+            quantization=artifact.quantization,
+            checkpoint_gib=artifact.size_mib / 1024,
+            min_gpu_memory_gib=placement.min_gpu_memory_mib / 1024,
+            default_max_model_len=artifact.default_max_model_len,
+            layer_count=artifact.layer_count,
         )
-        entries.append(
-            CatalogEntry(
-                model=ModelSpec(
-                    model_id=artifact.model_id,
-                    repository=artifact.repository,
-                    quantization=artifact.quantization,
-                    checkpoint_gib=artifact.size_mib / 1024,
-                    min_gpu_memory_gib=placement.min_gpu_memory_mib / 1024,
-                    default_max_model_len=artifact.default_max_model_len,
-                    layer_count=artifact.layer_count,
-                ),
-                placement=PlacementProfile(
-                    profile_id=placement.profile_id,
-                    node_count=placement.node_count,
-                    min_gpu_memory_mib=placement.min_gpu_memory_mib,
-                    min_disk_free_mib=placement.min_disk_free_mib,
-                    pipeline_parallel_size=placement.pipeline_parallel_size,
-                    tensor_parallel_size=placement.tensor_parallel_size,
-                    requires_network_evidence=(
-                        placement.requires_network_evidence or placement.node_count > 1
-                    ),
-                ),
-                quality_rank=release.quality_rank,
-                artifact_revision=artifact.revision,
-                candidate_id=candidate_id,
-                gpu_architectures=tuple(sorted(runtime.gpu_architectures)),
-                network_evidence=network_evidence,
+        catalog_placement = PlacementProfile(
+            profile_id=placement.profile_id,
+            node_count=placement.node_count,
+            min_gpu_memory_mib=placement.min_gpu_memory_mib,
+            min_disk_free_mib=placement.min_disk_free_mib,
+            pipeline_parallel_size=placement.pipeline_parallel_size,
+            tensor_parallel_size=placement.tensor_parallel_size,
+            requires_network_evidence=(
+                placement.requires_network_evidence or placement.node_count > 1
+            ),
+        )
+
+        delivery_candidates: list[
+            tuple[str, StageArtifactDelivery | None, dict[str, Any]]
+        ] = []
+        for delivery, stage_context in _validated_stage_deliveries(
+            session,
+            artifact=artifact,
+            runtime=runtime,
+            placement=placement,
+        ):
+            delivery_candidates.append(
+                (
+                    f"{full_candidate_id}:STAGE:{delivery.artifact_set_digest}",
+                    delivery,
+                    stage_context,
+                )
+            )
+        delivery_candidates.append(
+            (
+                full_candidate_id,
+                None,
+                full_delivery_context,
             )
         )
+
+        for candidate_id, stage_delivery, delivery_context in delivery_candidates:
+            context = {
+                "candidate_id": candidate_id,
+                **base_context,
+                **delivery_context,
+            }
+            contexts[candidate_id] = context
+            snapshot.append(
+                {
+                    **context,
+                    "artifact": artifact_snapshot,
+                    "runtime": runtime_snapshot,
+                    "release": {
+                        "status": release.status,
+                        "quality_rank": release.quality_rank,
+                    },
+                    "placement": placement_snapshot,
+                    "network_evidence": evidence_snapshot,
+                }
+            )
+            entries.append(
+                CatalogEntry(
+                    model=model,
+                    placement=catalog_placement,
+                    quality_rank=release.quality_rank,
+                    artifact_revision=artifact.revision,
+                    candidate_id=candidate_id,
+                    gpu_architectures=tuple(sorted(runtime.gpu_architectures)),
+                    network_evidence=network_evidence,
+                    stage_artifact=stage_delivery,
+                    full_snapshot_size_bytes=full_snapshot_size_bytes,
+                )
+            )
 
     return (
         ModelCatalog(
@@ -523,6 +813,7 @@ def _inventory_nodes(
                 profile_fresh=profile_fresh,
                 network_verified=False,
                 profile_error=profile_error,
+                agent_version=node.agent_version,
             )
         )
     return inventory
@@ -534,10 +825,11 @@ def _strict_candidate_rejections(
     entry: CatalogEntry,
     node_ids: list[str],
     inventory_by_id: dict[str, InventoryNode],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Close unsupported strict runtime candidates before selection."""
 
     rejections: list[dict[str, Any]] = []
+    rank_node_ids: list[str] = []
 
     def reject(code: str, detail: str, affected: list[str] | None = None) -> None:
         rejections.append(
@@ -549,6 +841,34 @@ def _strict_candidate_rejections(
         )
 
     placement = entry.placement
+    minimum_agent = (
+        (0, 3, 19)
+        if context.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+        else (0, 3, 18)
+    )
+    unsupported_agents = sorted(
+        node_id
+        for node_id in node_ids
+        if node_id not in inventory_by_id
+        or not _agent_supports(
+            inventory_by_id[node_id].agent_version,
+            minimum_agent,
+        )
+    )
+    if unsupported_agents:
+        reject(
+            (
+                "STAGE_AGENT_VERSION"
+                if context.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+                else "STRICT_AGENT_VERSION"
+            ),
+            (
+                "STAGE 후보는 Dure Agent 0.3.19 이상이 필요합니다."
+                if context.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+                else "엄격한 다중 노드 후보는 Dure Agent 0.3.18 이상이 필요합니다."
+            ),
+            unsupported_agents,
+        )
     if context.get("runtime_vllm_version") != VLLM_RAY_PP_RUNTIME_VERSION:
         reject(
             "STRICT_RUNTIME_VERSION",
@@ -588,10 +908,10 @@ def _strict_candidate_rejections(
             "STRICT_NODE_SET",
             "엄격한 다중 노드 후보에 필요한 정확한 프로필 집합이 없습니다.",
         )
-        return rejections
+        return rejections, rank_node_ids
 
     try:
-        strict_vllm_ray_pp_order(
+        bindings = strict_vllm_ray_pp_order(
             profiles,
             head_node_id=node_ids[0],
             minimum_gpu_memory_mib=placement.min_gpu_memory_mib,
@@ -615,6 +935,8 @@ def _strict_candidate_rejections(
         else:
             code = "STRICT_NODE_SET"
         reject(code, str(exc), list(exc.node_ids))
+    else:
+        rank_node_ids = [item.profile.node_id for item in bindings]
 
     interfaces = [profile.network.default_interface for profile in profiles]
     if (
@@ -629,7 +951,7 @@ def _strict_candidate_rejections(
             "STRICT_NETWORK",
             "엄격한 다중 노드의 기본 네트워크 인터페이스는 명시적이고 모두 같아야 합니다.",
         )
-    return rejections
+    return rejections, rank_node_ids
 
 
 def evaluate_deployment_recommendation(
@@ -670,25 +992,88 @@ def evaluate_deployment_recommendation(
     for evaluation in result.evaluations:
         context = contexts[evaluation.candidate_id]
         candidate_node_ids = list(evaluation.node_ids)
-        strict_rejections: list[dict[str, Any]] = []
+        candidate_rejections: list[dict[str, Any]] = []
+        rank_node_ids: list[str] = []
+        if (
+            context.get("model_cache_kind") == MODEL_CACHE_KIND_FULL_SNAPSHOT
+            and len(candidate_node_ids) == 1
+        ):
+            unsupported_agents = sorted(
+                node_id
+                for node_id in candidate_node_ids
+                if node_id not in inventory_by_id
+                or not _agent_supports(
+                    inventory_by_id[node_id].agent_version,
+                    _FULL_SNAPSHOT_AGENT_VERSION,
+                )
+            )
+            if unsupported_agents:
+                candidate_rejections.append(
+                    {
+                        "code": "FULL_SNAPSHOT_AGENT_VERSION",
+                        "detail": (
+                            "단일 GPU FULL_SNAPSHOT 후보는 모델 준비를 위해 "
+                            "Dure Agent 0.3.16 이상이 필요합니다."
+                        ),
+                        "node_ids": unsupported_agents,
+                    }
+                )
         if context.get("execution_backend") == VLLM_RAY_PP_BACKEND:
             candidate_node_ids = sorted(candidate_node_ids)
-            strict_rejections = _strict_candidate_rejections(
+            strict_rejections, rank_node_ids = _strict_candidate_rejections(
                 context=context,
                 entry=entries_by_id[evaluation.candidate_id],
                 node_ids=candidate_node_ids,
                 inventory_by_id=inventory_by_id,
             )
+            candidate_rejections.extend(strict_rejections)
+            expected_rank_nodes = list(evaluation.rank_node_ids)
+            if context.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE and (
+                not expected_rank_nodes or expected_rank_nodes != rank_node_ids
+            ):
+                candidate_rejections.append(
+                    {
+                        "code": "STAGE_RANK_BINDING",
+                        "detail": (
+                            "STAGE variant를 네트워크 증적의 정확한 node UUID→rank "
+                            "결합에 고정할 수 없습니다."
+                        ),
+                        "node_ids": candidate_node_ids,
+                    }
+                )
         candidate = {
             **context,
             "quality_rank": evaluation.quality_rank,
-            "feasible": evaluation.feasible and not strict_rejections,
+            "feasible": evaluation.feasible and not candidate_rejections,
             "node_ids": candidate_node_ids,
             "rejections": [
                 *(item.to_dict() for item in evaluation.rejections),
-                *strict_rejections,
+                *candidate_rejections,
             ],
         }
+        if rank_node_ids:
+            candidate["rank_node_ids"] = rank_node_ids
+        if (
+            context.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+            and rank_node_ids
+        ):
+            stage_ranks = context.get("stage_ranks")
+            if not isinstance(stage_ranks, list) or len(stage_ranks) != len(
+                rank_node_ids
+            ):
+                candidate["feasible"] = False
+                candidate["rejections"].append(
+                    {
+                        "code": "STAGE_RANK_BINDING",
+                        "detail": "STAGE variant rank 집합이 배포 토폴로지와 다릅니다.",
+                        "node_ids": candidate_node_ids,
+                    }
+                )
+            else:
+                candidate["stage_node_bindings"] = [
+                    {"node_id": rank_node_ids[rank], **stage}
+                    for rank, stage in enumerate(stage_ranks)
+                ]
         if evaluation.network_evidence_id is not None:
             candidate.update(
                 {
@@ -884,29 +1269,42 @@ def _lock_recommendation_inputs(
     if session.get_bind().dialect.name == "postgresql":
         session.execute(
             text(
-                "LOCK TABLE benchmark_evidence, benchmark_runs, model_artifacts, "
-                "model_releases, nodes, node_profiles, placement_profiles, "
-                "runtime_releases IN SHARE MODE"
+                "LOCK TABLE artifact_chunks, artifact_manifests, "
+                "artifact_manifest_files, artifact_file_chunks, benchmark_evidence, "
+                "benchmark_runs, model_artifacts, model_releases, nodes, "
+                "node_profiles, placement_profiles, runtime_releases, "
+                "stage_artifact_variants, stage_artifact_ranks, "
+                "stage_artifact_validation_evidence, "
+                "stage_artifact_validation_ranks IN SHARE MODE"
             )
         )
         return
-    list(
-        session.scalars(
-            select(BenchmarkEvidence)
-            .order_by(BenchmarkEvidence.id)
-            .with_for_update()
-        )
-    )
-    list(
-        session.scalars(
-            select(BenchmarkRun).order_by(BenchmarkRun.id).with_for_update()
-        )
-    )
-    list(
-        session.scalars(
-            select(ModelRelease).order_by(ModelRelease.id).with_for_update()
-        )
-    )
+    # Keep the fallback lock order identical across callers.  SQLite ignores
+    # FOR UPDATE, but this path is also exercised by databases that provide
+    # row locks without PostgreSQL table locks.
+    for model, order_by in (
+        (ArtifactChunk, (ArtifactChunk.digest,)),
+        (ArtifactManifest, (ArtifactManifest.digest,)),
+        (ArtifactManifestFile, (ArtifactManifestFile.id,)),
+        (ArtifactFileChunk, (ArtifactFileChunk.file_id, ArtifactFileChunk.ordinal)),
+        (BenchmarkEvidence, (BenchmarkEvidence.id,)),
+        (BenchmarkRun, (BenchmarkRun.id,)),
+        (ModelArtifact, (ModelArtifact.id,)),
+        (ModelRelease, (ModelRelease.id,)),
+        (PlacementProfileRecord, (PlacementProfileRecord.id,)),
+        (RuntimeRelease, (RuntimeRelease.id,)),
+        (StageArtifactVariant, (StageArtifactVariant.artifact_set_digest,)),
+        (StageArtifactRank, (StageArtifactRank.id,)),
+        (
+            StageArtifactValidationEvidence,
+            (StageArtifactValidationEvidence.identity_digest,),
+        ),
+        (
+            StageArtifactValidationRank,
+            (StageArtifactValidationRank.evidence_id, StageArtifactValidationRank.rank),
+        ),
+    ):
+        list(session.scalars(select(model).order_by(*order_by).with_for_update()))
     node_statement = select(Node).order_by(Node.id)
     profile_statement = select(NodeProfileRecord).order_by(NodeProfileRecord.node_id)
     if record.selection_mode == "explicit_nodes":
@@ -1070,6 +1468,8 @@ def _build_generation_plan(
     execution_backend: str | None = None
     runtime_vllm_version: str | None = None
     model_cache_kind: str | None = None
+    stage_artifact_binding: StageArtifactBinding | None = None
+    selected_cache_kind = selected.get("model_cache_kind")
     if multi_node:
         if selected.get("execution_backend") != VLLM_RAY_PP_BACKEND:
             raise RecommendationNotAcceptableError(
@@ -1086,10 +1486,12 @@ def _build_generation_plan(
                 code="GENERATION_RUNTIME_UNSUPPORTED",
                 details={"vllm_version": runtime.vllm_version},
             )
-        if selected.get("model_cache_kind") != MODEL_CACHE_KIND_FULL_SNAPSHOT:
+        if selected_cache_kind not in {
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            MODEL_CACHE_KIND_STAGE,
+        }:
             raise RecommendationNotAcceptableError(
-                f"{VLLM_RAY_PP_BACKEND} requires a verified "
-                f"{MODEL_CACHE_KIND_FULL_SNAPSHOT} model cache",
+                f"{VLLM_RAY_PP_BACKEND} requires an exact supported model cache",
                 code="GENERATION_MODEL_CACHE_UNSUPPORTED",
             )
         try:
@@ -1120,6 +1522,101 @@ def _build_generation_plan(
                 details={"reason": exc.reason, "node_ids": list(exc.node_ids)},
             ) from exc
         ordered_profiles = [item.profile for item in bindings]
+        rank_node_ids = [item.profile.node_id for item in bindings]
+        if selected.get("rank_node_ids") != rank_node_ids:
+            raise RecommendationStaleError(
+                "selected node UUID to runtime rank binding changed",
+                details={"recommendation_id": recommendation.get("id")},
+            )
+        stage_by_rank: dict[int, dict[str, Any]] = {}
+        if selected_cache_kind == MODEL_CACHE_KIND_STAGE:
+            current_deliveries = _validated_stage_deliveries(
+                session,
+                artifact=artifact,
+                runtime=runtime,
+                placement=placement,
+            )
+            selected_stage = selected.get("stage_artifact")
+            selected_digest = (
+                selected_stage.get("artifact_set_digest")
+                if isinstance(selected_stage, dict)
+                else None
+            )
+            current_context = next(
+                (
+                    context
+                    for delivery, context in current_deliveries
+                    if delivery.artifact_set_digest == selected_digest
+                ),
+                None,
+            )
+            if current_context is None or any(
+                selected.get(key) != current_context.get(key)
+                for key in (
+                    "model_cache_kind",
+                    "stage_artifact",
+                    "stage_ranks",
+                    "stage_validation_evidence",
+                )
+            ):
+                raise RecommendationStaleError(
+                    "selected STAGE variant is no longer exactly validated",
+                    details={
+                        "recommendation_id": recommendation.get("id"),
+                        "artifact_set_digest": selected_digest,
+                    },
+                )
+            expected_node_bindings = [
+                {"node_id": rank_node_ids[rank], **stage}
+                for rank, stage in enumerate(current_context["stage_ranks"])
+            ]
+            if selected.get("stage_node_bindings") != expected_node_bindings:
+                raise RecommendationStaleError(
+                    "selected STAGE rank binding changed",
+                    details={
+                        "recommendation_id": recommendation.get("id"),
+                        "artifact_set_digest": selected_digest,
+                    },
+                )
+            stage_by_rank = {
+                item["rank"]: item for item in expected_node_bindings
+            }
+            try:
+                stage_artifact_binding = StageArtifactBinding.from_dict(
+                    current_context["stage_artifact"]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RecommendationNotAcceptableError(
+                    "selected STAGE loader contract cannot be represented",
+                    code="GENERATION_MODEL_CACHE_UNSUPPORTED",
+                ) from exc
+        elif any(
+            key in selected
+            for key in (
+                "stage_artifact",
+                "stage_ranks",
+                "stage_node_bindings",
+                "stage_validation_evidence",
+            )
+        ):
+            raise RecommendationNotAcceptableError(
+                "FULL_SNAPSHOT selection contains STAGE-only bindings",
+                code="GENERATION_MODEL_CACHE_UNSUPPORTED",
+            )
+        if selected_cache_kind == MODEL_CACHE_KIND_FULL_SNAPSHOT:
+            _, current_full_context = _full_snapshot_delivery_context(
+                session,
+                artifact=artifact,
+                placement=placement,
+            )
+            if any(
+                selected.get(key) != value
+                for key, value in current_full_context.items()
+            ):
+                raise RecommendationStaleError(
+                    "selected FULL_SNAPSHOT delivery identity changed",
+                    details={"recommendation_id": recommendation.get("id")},
+                )
         assignments = [
             NodeAssignment(
                 node_id=binding.profile.node_id,
@@ -1131,14 +1628,55 @@ def _build_generation_plan(
                 role="ray-head" if rank == 0 else "ray-worker",
                 expected_runtime_rank=rank,
                 runtime_address=binding.runtime_address,
+                stage_manifest_digest=(
+                    stage_by_rank[rank]["manifest_digest"]
+                    if selected_cache_kind == MODEL_CACHE_KIND_STAGE
+                    else None
+                ),
+                stage_tensor_keys_digest=(
+                    stage_by_rank[rank]["tensor_keys_digest"]
+                    if selected_cache_kind == MODEL_CACHE_KIND_STAGE
+                    else None
+                ),
             )
             for rank, binding in enumerate(bindings)
         ]
         head_ip = bindings[0].runtime_address
         execution_backend = VLLM_RAY_PP_BACKEND
         runtime_vllm_version = runtime.vllm_version
-        model_cache_kind = MODEL_CACHE_KIND_FULL_SNAPSHOT
+        model_cache_kind = selected_cache_kind
     else:
+        if selected_cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT:
+            raise RecommendationNotAcceptableError(
+                "single-node generation requires an exact FULL_SNAPSHOT model cache",
+                code="GENERATION_MODEL_CACHE_UNSUPPORTED",
+            )
+        _, current_full_context = _full_snapshot_delivery_context(
+            session,
+            artifact=artifact,
+            placement=placement,
+        )
+        if any(
+            selected.get(key) != value
+            for key, value in current_full_context.items()
+        ):
+            raise RecommendationStaleError(
+                "selected FULL_SNAPSHOT delivery identity changed",
+                details={"recommendation_id": recommendation.get("id")},
+            )
+        if any(
+            key in selected
+            for key in (
+                "stage_artifact",
+                "stage_ranks",
+                "stage_node_bindings",
+                "stage_validation_evidence",
+            )
+        ):
+            raise RecommendationNotAcceptableError(
+                "FULL_SNAPSHOT selection contains STAGE-only bindings",
+                code="GENERATION_MODEL_CACHE_UNSUPPORTED",
+            )
         ordered_profiles = profiles
         assignments = [
             NodeAssignment(
@@ -1154,6 +1692,7 @@ def _build_generation_plan(
             )
         ]
         head_ip = _ray_head_ip(profiles[0], multi_node=False)
+        model_cache_kind = selected_cache_kind
     plan = DeploymentPlan(
         deployment_id=deployment_id,
         generation=generation,
@@ -1174,7 +1713,9 @@ def _build_generation_plan(
         network_interface=_network_interface(ordered_profiles),
         model_revision=artifact.revision,
         model_path=(
-            f"/var/lib/dure/models/sha256-{artifact.manifest_digest.removeprefix('sha256:')}"
+            "/var/lib/dure/models/stages"
+            if model_cache_kind == MODEL_CACHE_KIND_STAGE
+            else f"/var/lib/dure/models/sha256-{artifact.manifest_digest.removeprefix('sha256:')}"
             if multi_node
             else f"/var/lib/dure/models/{artifact.model_id}--{artifact.revision}"
         ),
@@ -1188,6 +1729,7 @@ def _build_generation_plan(
         execution_backend=execution_backend,
         runtime_vllm_version=runtime_vllm_version,
         model_cache_kind=model_cache_kind,
+        stage_artifact=stage_artifact_binding,
     )
     try:
         return plan.to_dict()
@@ -1382,6 +1924,56 @@ def accept_deployment_recommendation(
                 ),
             },
         )
+
+    selected = current_snapshot.get("selected")
+    selected_node_ids = (
+        selected.get("node_ids") if type(selected) is dict else None
+    )
+    if (
+        type(selected_node_ids) is list
+        and selected_node_ids
+        and all(type(node_id) is str for node_id in selected_node_ids)
+    ):
+        normalized_selected_node_ids = sorted(set(selected_node_ids))
+        locked_selected_nodes = list(
+            session.scalars(
+                select(Node)
+                .where(Node.id.in_(normalized_selected_node_ids))
+                .order_by(Node.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        if (
+            [node.id for node in locked_selected_nodes]
+            != normalized_selected_node_ids
+        ):
+            raise RecommendationStaleError(
+                "selected recommendation node inventory no longer exists",
+                details={"node_ids": normalized_selected_node_ids},
+            )
+        active_quarantine = session.execute(
+            select(Task.id, Task.node_id)
+            .where(
+                Task.node_id.in_(normalized_selected_node_ids),
+                Task.type == TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+                Task.status.in_(
+                    {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+                ),
+            )
+            .order_by(Task.created_at, Task.id)
+            .limit(1)
+        ).one_or_none()
+        if active_quarantine is not None:
+            raise RecommendationNotAcceptableError(
+                "selected node has an active artifact cache quarantine",
+                code="RECOMMENDATION_NODE_BUSY",
+                details={
+                    "node_id": active_quarantine.node_id,
+                    "task_id": active_quarantine.id,
+                    "task_type": TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+                },
+            )
 
     previous, lineage_id, generation = _previous_generation(
         session, previous_generation_id
