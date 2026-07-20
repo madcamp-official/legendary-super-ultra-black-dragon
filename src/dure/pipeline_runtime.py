@@ -10,6 +10,7 @@ from pathlib import Path
 from .artifact_prepare import validate_digest_pinned_runtime_image
 from .model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_VERIFICATION_VERSION,
 )
 from .models import (
@@ -18,6 +19,15 @@ from .models import (
     NodeProfile,
     VLLM_RAY_PP_BACKEND,
     VLLM_RAY_PP_RUNTIME_VERSION,
+    VLLM_STAGE_ARCHITECTURE,
+    VLLM_STAGE_LOADER_FORMAT,
+)
+from .stage_cache import (
+    StageCacheError,
+    StageCacheIdentity,
+    StageCacheValidation,
+    stage_cache_path,
+    validate_materialized_stage_cache,
 )
 
 
@@ -33,8 +43,14 @@ VLLM_API_COMPONENT = "vllm-api"
 STRICT_IDENTITY_COMPONENTS = frozenset({RAY_COMPONENT, VLLM_API_COMPONENT})
 RAY_DURE_NODE_RESOURCE_PREFIX = "dure_node_"
 STRICT_RUNTIME_CONTRACT_LABEL = "dure.runtime-contract"
+STRICT_CACHE_KIND_LABEL = "dure.cache-kind"
+STRICT_STAGE_VARIANT_LABEL = "dure.stage-variant"
+STRICT_STAGE_MANIFEST_LABEL = "dure.stage-manifest"
+STRICT_STAGE_CACHE_IDENTITY_LABEL = "dure.stage-cache-identity"
+STAGE_CACHE_CHECK = "stage-cache"
 
 _TRUSTED_MODEL_ROOT = Path("/var/lib/dure/models")
+_TRUSTED_STAGE_ROOT = _TRUSTED_MODEL_ROOT / "stages"
 _NETWORK_INTERFACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}")
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _MODEL_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -49,6 +65,13 @@ class PipelineRuntimeContractError(ValueError):
 
 def is_strict_pipeline_plan(plan: DeploymentPlan) -> bool:
     return plan.execution_backend == VLLM_RAY_PP_BACKEND
+
+
+def is_stage_pipeline_plan(plan: DeploymentPlan) -> bool:
+    return (
+        is_strict_pipeline_plan(plan)
+        and plan.model_cache_kind == MODEL_CACHE_KIND_STAGE
+    )
 
 
 def _canonical_uuid(value: object, field: str) -> str:
@@ -95,12 +118,12 @@ def validate_strict_pipeline_plan(
         raise PipelineRuntimeContractError(
             "strict pipeline image must be pinned to one OCI sha256 digest"
         ) from exc
-    if (
-        plan.runtime_vllm_version != VLLM_RAY_PP_RUNTIME_VERSION
-        or plan.model_cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT
+    if plan.runtime_vllm_version != VLLM_RAY_PP_RUNTIME_VERSION or (
+        plan.model_cache_kind
+        not in {MODEL_CACHE_KIND_FULL_SNAPSHOT, MODEL_CACHE_KIND_STAGE}
     ):
         raise PipelineRuntimeContractError(
-            "strict pipeline requires the pinned vLLM and FULL_SNAPSHOT contract"
+            "strict pipeline requires the pinned vLLM and a supported cache contract"
         )
     if (
         type(plan.network_interface) is not str
@@ -146,6 +169,17 @@ def validate_strict_pipeline_plan(
 
     if type(plan.model_path) is not str or not 1 <= len(plan.model_path) <= 4096:
         raise PipelineRuntimeContractError("model_path must be a trusted absolute path")
+    if is_stage_pipeline_plan(plan):
+        if (
+            plan.model_path != str(_TRUSTED_STAGE_ROOT)
+            or plan.stage_artifact is None
+            or plan.stage_artifact.architecture != VLLM_STAGE_ARCHITECTURE
+            or plan.stage_artifact.loader_format != VLLM_STAGE_LOADER_FORMAT
+        ):
+            raise PipelineRuntimeContractError(
+                "STAGE pipeline requires the fixed Dure stage root and loader contract"
+            )
+        return
     if not validate_model_path:
         return
     candidate = Path(plan.model_path)
@@ -226,7 +260,7 @@ def validate_strict_pipeline_node(
         raise PipelineRuntimeContractError(
             "strict pipeline requires a ready Docker NVIDIA runtime"
         )
-    if not require_model_cache:
+    if not require_model_cache or is_stage_pipeline_plan(plan):
         return
 
     try:
@@ -265,17 +299,128 @@ def validate_strict_pipeline_node(
         )
 
 
+def stage_cache_identity(
+    plan: DeploymentPlan,
+    assignment: NodeAssignment,
+) -> StageCacheIdentity:
+    """Build the only stage cache identity accepted by the strict runtime."""
+
+    validate_strict_pipeline_plan(plan)
+    if not is_stage_pipeline_plan(plan) or assignment not in plan.assignments:
+        raise PipelineRuntimeContractError(
+            "stage cache identity is not bound to a STAGE plan assignment"
+        )
+    stage = plan.stage_artifact
+    assert stage is not None
+    try:
+        return StageCacheIdentity(
+            repository=plan.model.repository,
+            revision=plan.model_revision,
+            manifest_digest=assignment.stage_manifest_digest,
+            quantization=plan.model.quantization,
+            artifact_set_digest=stage.artifact_set_digest,
+            contract_identity_digest=stage.contract_identity_digest,
+            source_manifest_digest=stage.source_manifest_digest,
+            runtime_image=stage.runtime_image,
+            vllm_version=stage.vllm_version,
+            exporter_build_digest=stage.exporter_build_digest,
+            architecture=stage.architecture,
+            loader_format=stage.loader_format,
+            tensor_parallel_size=stage.tensor_parallel_size,
+            pipeline_parallel_size=stage.pipeline_parallel_size,
+            pipeline_rank=assignment.pipeline_rank,
+            tensor_rank=0,
+            tensor_keys_digest=assignment.stage_tensor_keys_digest,
+        )
+    except (TypeError, ValueError) as exc:
+        raise PipelineRuntimeContractError(
+            "stage cache identity does not match the strict plan"
+        ) from exc
+
+
+def strict_model_mount_path(
+    plan: DeploymentPlan,
+    assignment: NodeAssignment,
+) -> Path:
+    """Resolve a fixed host source; no task payload may provide this path."""
+
+    validate_strict_pipeline_plan(plan)
+    if assignment not in plan.assignments:
+        raise PipelineRuntimeContractError(
+            "model mount is not bound to a plan assignment"
+        )
+    if not is_stage_pipeline_plan(plan):
+        return Path(plan.model_path)
+    candidate = stage_cache_path(stage_cache_identity(plan, assignment))
+    try:
+        expected_parent = _TRUSTED_STAGE_ROOT.resolve(strict=False)
+        resolved = Path(candidate).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise PipelineRuntimeContractError(
+            "stage cache path cannot be resolved safely"
+        ) from exc
+    if resolved.parent != expected_parent or str(resolved) != str(candidate):
+        raise PipelineRuntimeContractError(
+            "stage cache resolver returned a path outside the fixed Dure stage root"
+        )
+    return Path(candidate)
+
+
+def validate_strict_stage_cache(
+    plan: DeploymentPlan,
+    assignment: NodeAssignment,
+) -> StageCacheValidation | None:
+    """Rehash the exact rank-local stage before a container can consume it."""
+
+    if not is_stage_pipeline_plan(plan):
+        return None
+    identity = stage_cache_identity(plan, assignment)
+    path = strict_model_mount_path(plan, assignment)
+    try:
+        return validate_materialized_stage_cache(path, identity)
+    except StageCacheError as exc:
+        raise PipelineRuntimeContractError(
+            "assigned STAGE cache is missing, swapped, or failed integrity validation"
+        ) from exc
+
+
+def stage_identity_labels(
+    plan: DeploymentPlan,
+    assignment: NodeAssignment,
+) -> dict[str, str]:
+    if not is_stage_pipeline_plan(plan):
+        return {}
+    identity = stage_cache_identity(plan, assignment)
+    stage = plan.stage_artifact
+    assert stage is not None
+    return {
+        STRICT_CACHE_KIND_LABEL: MODEL_CACHE_KIND_STAGE,
+        STRICT_STAGE_VARIANT_LABEL: stage.artifact_set_digest,
+        STRICT_STAGE_MANIFEST_LABEL: assignment.stage_manifest_digest or "",
+        STRICT_STAGE_CACHE_IDENTITY_LABEL: identity.cache_identity_digest,
+    }
+
+
 def ordered_pipeline_bindings(plan: DeploymentPlan) -> list[dict[str, object]]:
     validate_strict_pipeline_plan(plan)
-    return [
-        {
+    values = []
+    for assignment in plan.assignments:
+        value: dict[str, object] = {
             "node_id": assignment.node_id,
             "runtime_address": assignment.runtime_address,
             "pipeline_rank": assignment.pipeline_rank,
             "runtime_rank": assignment.expected_runtime_rank,
         }
-        for assignment in plan.assignments
-    ]
+        if is_stage_pipeline_plan(plan):
+            value.update(
+                stage_manifest_digest=assignment.stage_manifest_digest,
+                stage_tensor_keys_digest=assignment.stage_tensor_keys_digest,
+                stage_cache_identity_digest=stage_cache_identity(
+                    plan, assignment
+                ).cache_identity_digest,
+            )
+        values.append(value)
+    return values
 
 
 def ray_dure_node_resource(node_id: str) -> str:
@@ -340,7 +485,7 @@ def strict_ray_command(
 
 
 def strict_vllm_api_command(plan: DeploymentPlan) -> tuple[str, ...]:
-    return (
+    command = [
         "serve",
         "/models/model",
         "--distributed-executor-backend",
@@ -361,7 +506,10 @@ def strict_vllm_api_command(plan: DeploymentPlan) -> tuple[str, ...]:
         VLLM_API_HOST,
         "--port",
         str(VLLM_API_PORT),
-    )
+    ]
+    if is_stage_pipeline_plan(plan):
+        command.extend(("--load-format", "sharded_state"))
+    return tuple(command)
 
 
 def strict_runtime_contract_digest(
@@ -410,7 +558,7 @@ def strict_runtime_contract_digest(
             "shm_size": shm_size,
             "gpu_device": assignment.gpu_index,
             "mount": {
-                "source": plan.model_path,
+                "source": str(strict_model_mount_path(plan, assignment)),
                 "target": "/models/model",
                 "readonly": True,
             },
@@ -444,4 +592,18 @@ def pipeline_contract_detail(
         "runtime_rank": assignment.expected_runtime_rank,
         "ordered_bindings": ordered_pipeline_bindings(plan),
     }
+    if is_stage_pipeline_plan(plan):
+        stage = plan.stage_artifact
+        assert stage is not None
+        value["stage_artifact"] = {
+            "artifact_set_digest": stage.artifact_set_digest,
+            "contract_identity_digest": stage.contract_identity_digest,
+            "source_manifest_digest": stage.source_manifest_digest,
+            "loader_format": stage.loader_format,
+            "stage_manifest_digest": assignment.stage_manifest_digest,
+            "stage_tensor_keys_digest": assignment.stage_tensor_keys_digest,
+            "stage_cache_identity_digest": stage_cache_identity(
+                plan, assignment
+            ).cache_identity_digest,
+        }
     return json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True)

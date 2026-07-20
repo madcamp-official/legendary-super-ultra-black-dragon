@@ -10,8 +10,12 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from ..model_cache import MODEL_CACHE_KIND_STAGE
 from ..models import DeploymentPlan, VLLM_RAY_PP_BACKEND
-from ..pipeline_runtime import validate_strict_pipeline_plan
+from ..pipeline_runtime import (
+    pipeline_contract_detail,
+    validate_strict_pipeline_plan,
+)
 from ..task import TaskStatus, TaskType
 from .models import (
     AuditEvent,
@@ -26,6 +30,7 @@ from .models import (
 
 ROLLOUT_AGENT_VERSION = (0, 3, 12)
 STRICT_RAY_AGENT_VERSION = (0, 3, 18)
+STAGE_ARTIFACT_AGENT_VERSION = (0, 3, 19)
 ROLLBACK_NODE_PHASES = ("STOP_SOURCE", "START_TARGET", "VERIFY_TARGET")
 ROLLBACK_API_PHASES = ("START_API", "VERIFY_API")
 TERMINAL_TASK_STATUSES = {
@@ -152,6 +157,11 @@ def _supports_rollout(node: Node) -> bool:
 def _supports_strict_ray(node: Node) -> bool:
     version = _agent_version(node.agent_version)
     return version is not None and version >= STRICT_RAY_AGENT_VERSION
+
+
+def _supports_stage_artifact(node: Node) -> bool:
+    version = _agent_version(node.agent_version)
+    return version is not None and version >= STAGE_ARTIFACT_AGENT_VERSION
 
 
 def _node_is_online(node: Node, now: datetime) -> bool:
@@ -825,13 +835,34 @@ def prepare_or_apply_rollback(
             "strict Ray rollback requires API start and actor attestation",
             code="ROLLBACK_STRICT_API_ATTESTATION_REQUIRED",
         )
-    if target.source_recommendation_id is not None:
-        from .preparation import effective_deployment_plan
+    from .preparation import effective_deployment_plan
 
-        # Rollback is deliberately network-free. A recommended target must
-        # already have a fully successful exact preparation record; this call
-        # only validates that immutable evidence and never queues preparation.
-        effective_deployment_plan(session, target, require_prepared=True)
+    # Rollback is deliberately network-free. A recommended target must already
+    # have a fully successful exact preparation record; these calls only read
+    # immutable evidence and never queue preparation. STOP_SOURCE deliberately
+    # retains a revoked source's stored effective plan for exact containment.
+    effective_source = effective_deployment_plan(
+        session, source, require_prepared=False
+    )
+    effective_target = effective_deployment_plan(
+        session, target, require_prepared=True
+    )
+    if any(
+        plan.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+        for plan in (effective_source, effective_target)
+    ):
+        unsupported = sorted(
+            node_id
+            for node_id in normalized_node_ids
+            if (node := session.get(Node, node_id)) is None
+            or not _supports_stage_artifact(node)
+        )
+        if unsupported:
+            raise DeploymentRolloutError(
+                "stage artifact rollback requires Dure Agent 0.3.19 or newer",
+                code="ROLLBACK_STAGE_AGENT_TOO_OLD",
+                details={"node_ids": unsupported},
+            )
     digest = _rollback_request_digest(
         source, target, normalized_node_ids, serve=serve
     )
@@ -1332,11 +1363,17 @@ def valid_deployment_task_success_result(
         TaskType.START_DEPLOYMENT.value,
         TaskType.RESTART_DEPLOYMENT.value,
     }:
+        model_check = (
+            "stage-cache"
+            if strict_pipeline
+            and plan.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+            else "model"
+        )
         required.update(
             {
                 "node-profile",
                 "deployment-plan",
-                "model",
+                model_check,
                 "container-image",
                 "ray-container",
             }
@@ -1381,114 +1418,26 @@ def _valid_pipeline_rank_contract(
     plan: dict[str, Any],
     raw_detail: str,
 ) -> bool:
-    def unique_object(pairs):
-        value = {}
-        for key, item in pairs:
-            if key in value:
-                raise ValueError("duplicate JSON key")
-            value[key] = item
-        return value
+    """Match the agent attestation to the exact persisted node contract.
 
-    def reject_constant(_value):
-        raise ValueError("non-finite JSON number")
-
+    The shared canonical encoder is intentionally used for both FULL and STAGE
+    plans.  A STAGE attestation therefore binds the selected variant, the
+    rank-local manifest/tensor set, and the derived cache identity in addition
+    to the existing topology fields; extra, missing, duplicate, or reordered
+    JSON fields cannot compare equal.
+    """
     try:
-        detail = json.loads(
-            raw_detail,
-            object_pairs_hook=unique_object,
-            parse_constant=reject_constant,
-        )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    fields = {
-        "schema_version",
-        "backend",
-        "vllm_version",
-        "node_id",
-        "runtime_address",
-        "pipeline_rank",
-        "runtime_rank",
-        "ordered_bindings",
-    }
-    if (
-        type(detail) is not dict
-        or set(detail) != fields
-        or raw_detail
-        != json.dumps(
-            detail,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-    ):
-        return False
-    assignments = plan.get("assignments")
-    if type(assignments) is not list or not assignments:
-        return False
-    try:
-        ordered = sorted(
-            assignments,
-            key=lambda item: item["expected_runtime_rank"],
-        )
-    except (KeyError, TypeError):
-        return False
-    expected_bindings: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    for assignment in ordered:
-        if type(assignment) is not dict:
+        typed_plan = DeploymentPlan.from_dict(plan)
+        assignment = typed_plan.assignment_for(task.node_id)
+        if assignment is None:
             return False
-        binding = {
-            "node_id": assignment.get("node_id"),
-            "runtime_address": assignment.get("runtime_address"),
-            "pipeline_rank": assignment.get("pipeline_rank"),
-            "runtime_rank": assignment.get("expected_runtime_rank"),
-        }
-        if (
-            type(binding["node_id"]) is not str
-            or type(binding["runtime_address"]) is not str
-            or type(binding["pipeline_rank"]) is not int
-            or type(binding["runtime_rank"]) is not int
-        ):
-            return False
-        expected_bindings.append(binding)
-        if binding["node_id"] == task.node_id:
-            if current is not None:
-                return False
-            current = binding
-    if current is None:
+        expected = pipeline_contract_detail(
+            typed_plan,
+            assignment,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
         return False
-    observed_bindings = detail["ordered_bindings"]
-    if type(observed_bindings) is not list:
-        return False
-    binding_fields = {
-        "node_id",
-        "runtime_address",
-        "pipeline_rank",
-        "runtime_rank",
-    }
-    for binding in observed_bindings:
-        if (
-            type(binding) is not dict
-            or set(binding) != binding_fields
-            or type(binding["node_id"]) is not str
-            or type(binding["runtime_address"]) is not str
-            or type(binding["pipeline_rank"]) is not int
-            or type(binding["runtime_rank"]) is not int
-        ):
-            return False
-    return (
-        detail["schema_version"] == 1
-        and type(detail["schema_version"]) is int
-        and detail["backend"] == VLLM_RAY_PP_BACKEND
-        and detail["vllm_version"] == plan.get("runtime_vllm_version")
-        and detail["node_id"] == current["node_id"]
-        and detail["runtime_address"] == current["runtime_address"]
-        and detail["pipeline_rank"] == current["pipeline_rank"]
-        and type(detail["pipeline_rank"]) is int
-        and detail["runtime_rank"] == current["runtime_rank"]
-        and type(detail["runtime_rank"]) is int
-        and observed_bindings == expected_bindings
-    )
+    return type(raw_detail) is str and raw_detail == expected
 
 
 def _operation_full_node_set(

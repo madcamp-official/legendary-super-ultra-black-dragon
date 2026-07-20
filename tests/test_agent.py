@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dure import __version__
@@ -32,7 +33,12 @@ from dure.pipeline_runtime import (
 from dure.planner import build_plan
 from dure.runtime import DEPLOYMENT_IDENTITY_FORMAT
 from dure.task import BenchmarkTaskPayload
-from tests.helpers import FakeRunner, profile, strict_pipeline_fixture
+from tests.helpers import (
+    FakeRunner,
+    profile,
+    strict_pipeline_fixture,
+    strict_stage_pipeline_fixture,
+)
 
 
 class AgentRunner:
@@ -345,6 +351,150 @@ class AgentTaskExecutorTests(unittest.TestCase):
         stop_calls = [call for call in runner.calls if call[:2] == ("docker", "stop")]
         self.assertTrue(stop_calls)
         self.assertNotIn("sh", {part for call in runner.calls for part in call})
+
+    def test_stage_apply_and_start_tasks_use_only_the_rank_cache_path(self):
+        plan, head, _ = strict_stage_pipeline_fixture()
+        assignment = plan.assignments[0]
+        successful = CheckResult("test", True, "ok")
+        contract = CheckResult(
+            "pipeline-rank-contract",
+            True,
+            pipeline_contract_detail(plan, assignment),
+        )
+        payload = {
+            "plan": plan.to_dict(),
+            "generation": plan.generation,
+            "serve": False,
+            "accept_model_download": True,
+            "pull_image": True,
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            for kind in ("APPLY_DEPLOYMENT", "START_DEPLOYMENT"):
+                with self.subTest(kind=kind), patch(
+                    "dure.probe.NodeProbe.collect", return_value=head
+                ), patch(
+                    "dure.orchestrator.validate_strict_stage_cache",
+                    return_value=SimpleNamespace(
+                        cache_identity_digest="sha256:" + "9" * 64
+                    ),
+                ) as validate_cache, patch(
+                    "dure.orchestrator.ModelStore.ensure",
+                    side_effect=AssertionError(
+                        "STAGE task must never use legacy model download"
+                    ),
+                ) as ensure_model, patch(
+                    "dure.orchestrator.ContainerRuntime.ensure_image",
+                    return_value=successful,
+                ), patch(
+                    "dure.orchestrator.ContainerRuntime.start_ray",
+                    return_value=successful,
+                ), patch(
+                    "dure.orchestrator.ReadinessVerifier.host_gpu",
+                    return_value=successful,
+                ), patch(
+                    "dure.orchestrator.ReadinessVerifier.container_gpu",
+                    return_value=successful,
+                ), patch(
+                    "dure.orchestrator.ReadinessVerifier.wait_pipeline_rank_contract",
+                    return_value=contract,
+                ):
+                    executor = TaskExecutor(
+                        head.node_id,
+                        runner=FakeRunner(),
+                        state_path=Path(temporary) / f"{kind}.json",
+                    )
+                    result = executor.execute(
+                        {
+                            "type": kind,
+                            "deployment_id": plan.deployment_id,
+                            "payload": payload,
+                        }
+                    )
+
+                self.assertTrue(all(item["ok"] for item in result["checks"]))
+                self.assertIn(
+                    "stage-cache", {item["name"] for item in result["checks"]}
+                )
+                validate_cache.assert_called_once()
+                ensure_model.assert_not_called()
+
+    def test_stage_restart_validates_cache_before_any_container_mutation(self):
+        plan, head, _ = strict_stage_pipeline_fixture()
+        payload = {
+            "plan": plan.to_dict(),
+            "generation": plan.generation,
+            "serve": False,
+        }
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "dure.probe.NodeProbe.collect", return_value=head
+        ), patch(
+            "dure.agent.validate_strict_stage_cache",
+            side_effect=ValueError("assigned STAGE cache failed integrity validation"),
+        ) as validate_cache:
+            executor = TaskExecutor(
+                head.node_id,
+                runner=runner,
+                state_path=Path(temporary) / "state.json",
+            )
+            with self.assertRaisesRegex(ValueError, "integrity"):
+                executor.execute(
+                    {
+                        "type": "RESTART_DEPLOYMENT",
+                        "deployment_id": plan.deployment_id,
+                        "payload": payload,
+                    }
+                )
+
+        validate_cache.assert_called_once_with(plan, plan.assignments[0])
+        self.assertFalse(
+            any(
+                call[:2] in {
+                    ("docker", "stop"),
+                    ("docker", "rm"),
+                    ("docker", "run"),
+                }
+                for call in runner.calls
+            )
+        )
+
+    def test_stage_emergency_stop_remains_independent_of_cache_validation(self):
+        plan, head, _ = strict_stage_pipeline_fixture()
+        payload = {"plan": plan.to_dict(), "generation": plan.generation}
+        listed = (
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            f"label=dure.deployment={plan.deployment_id}",
+            "--filter",
+            f"label=dure.generation={plan.generation}",
+        )
+        runner = FakeRunner(responses={listed: (0, "", "")})
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "dure.agent.validate_strict_stage_cache",
+            side_effect=AssertionError("emergency STOP must not read cache"),
+        ) as validate_cache, patch.object(
+            TaskExecutor,
+            "_profile",
+            side_effect=AssertionError("strict STOP must not probe"),
+        ):
+            result = TaskExecutor(
+                head.node_id,
+                runner=runner,
+                state_path=Path(temporary) / "state.json",
+            ).execute(
+                {
+                    "type": "STOP_DEPLOYMENT",
+                    "deployment_id": plan.deployment_id,
+                    "payload": payload,
+                }
+            )
+
+        validate_cache.assert_not_called()
+        self.assertEqual(result["checks"][0]["name"], "deployment-stop")
+        self.assertTrue(result["checks"][0]["ok"])
 
     def test_verify_api_check_runs_only_on_the_assigned_ray_head(self):
         head_id = "4ec02dee-c5f5-4466-96c5-adc754ef52b8"

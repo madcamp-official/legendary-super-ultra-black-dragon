@@ -12,14 +12,21 @@ from .pipeline_runtime import (
     PIPELINE_CONTRACT_CHECK,
     RAY_DURE_NODE_RESOURCE_PREFIX,
     RAY_COMPONENT,
+    STRICT_CACHE_KIND_LABEL,
+    STRICT_STAGE_CACHE_IDENTITY_LABEL,
+    STRICT_STAGE_MANIFEST_LABEL,
+    STRICT_STAGE_VARIANT_LABEL,
     VLLM_API_COMPONENT,
     VLLM_RAY_PP_RUNTIME_VERSION,
+    is_stage_pipeline_plan,
     is_strict_pipeline_plan,
     pipeline_contract_detail,
     ray_dure_node_resource,
     strict_runtime_contract_digest,
+    stage_identity_labels,
     validate_strict_pipeline_node,
     validate_strict_pipeline_plan,
+    validate_strict_stage_cache,
 )
 from .runtime import ContainerRuntime
 
@@ -153,6 +160,16 @@ class ReadinessVerifier:
                     plan, assignment, component
                 ),
             }
+            stage_labels = stage_identity_labels(plan, assignment)
+            if stage_labels:
+                strict_identity.update(
+                    cache_kind=stage_labels[STRICT_CACHE_KIND_LABEL],
+                    stage_variant=stage_labels[STRICT_STAGE_VARIANT_LABEL],
+                    stage_manifest=stage_labels[STRICT_STAGE_MANIFEST_LABEL],
+                    stage_cache_identity=stage_labels[
+                        STRICT_STAGE_CACHE_IDENTITY_LABEL
+                    ],
+                )
         check, identity = ContainerRuntime(
             self.runner, self.engine
         ).running_container_identity(
@@ -258,6 +275,25 @@ class ReadinessVerifier:
         *,
         require_actors: bool = False,
     ) -> CheckResult:
+        """Run a one-shot contract check with a fresh full cache validation."""
+
+        return self._pipeline_rank_contract(
+            plan,
+            assignment,
+            profile,
+            require_actors=require_actors,
+            stage_cache_prevalidated=False,
+        )
+
+    def _pipeline_rank_contract(
+        self,
+        plan: DeploymentPlan,
+        assignment: NodeAssignment,
+        profile: NodeProfile,
+        *,
+        require_actors: bool,
+        stage_cache_prevalidated: bool,
+    ) -> CheckResult:
         """Verify the source-pinned vLLM 0.9.0 Ray rank contract.
 
         Ray does not expose vLLM's internal pipeline rank as a public runtime
@@ -271,6 +307,8 @@ class ReadinessVerifier:
             validate_strict_pipeline_node(
                 plan, assignment, profile, require_model_cache=True
             )
+            if not stage_cache_prevalidated:
+                validate_strict_stage_cache(plan, assignment)
         except ValueError as exc:
             return CheckResult(PIPELINE_CONTRACT_CHECK, False, str(exc))
         if self.node_id != assignment.node_id:
@@ -465,6 +503,12 @@ class ReadinessVerifier:
         timeout: float = 300,
         interval: float = 5,
     ) -> CheckResult:
+        stage = is_stage_pipeline_plan(plan)
+        if stage:
+            try:
+                validate_strict_stage_cache(plan, assignment)
+            except ValueError as exc:
+                return CheckResult(PIPELINE_CONTRACT_CHECK, False, str(exc))
         deadline = time.monotonic() + timeout
         last = CheckResult(
             PIPELINE_CONTRACT_CHECK,
@@ -472,13 +516,21 @@ class ReadinessVerifier:
             "Pipeline rank contract has not been checked",
         )
         while time.monotonic() < deadline:
-            last = self.pipeline_rank_contract(
+            last = self._pipeline_rank_contract(
                 plan,
                 assignment,
                 profile,
                 require_actors=require_actors,
+                stage_cache_prevalidated=stage,
             )
             if last.ok:
+                if stage:
+                    try:
+                        validate_strict_stage_cache(plan, assignment)
+                    except ValueError as exc:
+                        return CheckResult(
+                            PIPELINE_CONTRACT_CHECK, False, str(exc)
+                        )
                 return last
             time.sleep(interval)
         return CheckResult(

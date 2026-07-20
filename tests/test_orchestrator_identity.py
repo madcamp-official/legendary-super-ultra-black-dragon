@@ -1,13 +1,19 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dure.models import CheckResult
 from dure.orchestrator import InitOrchestrator
 from dure.pipeline_runtime import pipeline_contract_detail
 from dure.planner import build_plan
-from tests.helpers import FakeRunner, profile, strict_pipeline_fixture
+from tests.helpers import (
+    FakeRunner,
+    profile,
+    strict_pipeline_fixture,
+    strict_stage_pipeline_fixture,
+)
 
 
 class OrchestratorIdentityTests(unittest.TestCase):
@@ -36,7 +42,7 @@ class OrchestratorIdentityTests(unittest.TestCase):
         successful = CheckResult("test", True, "ok")
         with tempfile.TemporaryDirectory() as temporary, patch(
             "dure.orchestrator.ModelStore.ensure", return_value=successful
-        ), patch(
+        ) as ensure_model, patch(
             "dure.orchestrator.ContainerRuntime.ensure_image", return_value=successful
         ), patch(
             "dure.orchestrator.ContainerRuntime.start_ray", return_value=successful
@@ -64,3 +70,91 @@ class OrchestratorIdentityTests(unittest.TestCase):
         )
         self.assertTrue(all(item.ok for item in checks))
         self.assertFalse(wait_contract.call_args.kwargs["require_actors"])
+        ensure_model.assert_called_once_with(plan, accept_download=False)
+
+    def test_stage_apply_uses_rank_cache_and_never_legacy_download(self):
+        plan, head, _ = strict_stage_pipeline_fixture()
+        assignment = plan.assignments[0]
+        contract = CheckResult(
+            "pipeline-rank-contract",
+            True,
+            pipeline_contract_detail(plan, assignment),
+        )
+        successful = CheckResult("test", True, "ok")
+        validation = SimpleNamespace(cache_identity_digest="sha256:" + "9" * 64)
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "dure.orchestrator.validate_strict_stage_cache",
+            return_value=validation,
+        ) as validate_cache, patch(
+            "dure.orchestrator.ModelStore.ensure",
+            side_effect=AssertionError("STAGE must never use legacy model download"),
+        ) as ensure_model, patch(
+            "dure.orchestrator.ContainerRuntime.ensure_image",
+            return_value=successful,
+        ), patch(
+            "dure.orchestrator.ContainerRuntime.start_ray",
+            return_value=successful,
+        ), patch(
+            "dure.orchestrator.ReadinessVerifier.host_gpu",
+            return_value=successful,
+        ), patch(
+            "dure.orchestrator.ReadinessVerifier.container_gpu",
+            return_value=successful,
+        ), patch(
+            "dure.orchestrator.ReadinessVerifier.wait_pipeline_rank_contract",
+            return_value=contract,
+        ):
+            orchestrator = InitOrchestrator(
+                runner=FakeRunner(),
+                state_path=Path(temporary) / "state.json",
+                node_id=head.node_id,
+            )
+            orchestrator.probe.collect = lambda: head
+            _, _, checks = orchestrator.run(
+                plan=plan,
+                apply=True,
+                accept_model_download=True,
+                serve=False,
+            )
+
+        validate_cache.assert_called_once_with(plan, assignment)
+        ensure_model.assert_not_called()
+        stage_check = next(item for item in checks if item.name == "stage-cache")
+        self.assertTrue(stage_check.ok, stage_check.detail)
+        self.assertIn(validation.cache_identity_digest, stage_check.detail)
+        self.assertTrue(all(item.ok for item in checks))
+
+    def test_stage_cache_mismatch_fails_before_image_or_container_action(self):
+        plan, head, _ = strict_stage_pipeline_fixture()
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "dure.orchestrator.validate_strict_stage_cache",
+            side_effect=ValueError("assigned STAGE cache failed integrity validation"),
+        ) as validate_cache, patch(
+            "dure.orchestrator.ModelStore.ensure",
+            side_effect=AssertionError("STAGE must never use legacy model download"),
+        ) as ensure_model, patch(
+            "dure.orchestrator.ContainerRuntime.ensure_image"
+        ) as ensure_image, patch(
+            "dure.orchestrator.ContainerRuntime.start_ray"
+        ) as start_ray:
+            orchestrator = InitOrchestrator(
+                runner=FakeRunner(),
+                state_path=Path(temporary) / "state.json",
+                node_id=head.node_id,
+            )
+            orchestrator.probe.collect = lambda: head
+            _, _, checks = orchestrator.run(
+                plan=plan,
+                apply=True,
+                accept_model_download=True,
+                pull=True,
+                serve=False,
+            )
+
+        validate_cache.assert_called_once_with(plan, plan.assignments[0])
+        ensure_model.assert_not_called()
+        ensure_image.assert_not_called()
+        start_ray.assert_not_called()
+        self.assertFalse(checks[-1].ok)
+        self.assertEqual(checks[-1].name, "stage-cache")
+        self.assertIn("integrity", checks[-1].detail)

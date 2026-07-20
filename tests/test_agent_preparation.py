@@ -16,11 +16,13 @@ from dure.artifact_prepare import (
     PREPARATION_FAILURE_CODES,
     preparation_failure_code,
     trusted_origin_from_config,
+    validate_preparation_result,
 )
 from dure.command import CommandResult
 from dure.http import APIError
 from dure.model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_VERIFICATION_VERSION,
 )
 from dure.model_store import (
@@ -29,6 +31,7 @@ from dure.model_store import (
     ModelStoreError,
     PreparedModelCache,
 )
+from dure.stage_cache import StageCacheIdentity, stage_contract_identity_digest
 
 
 NODE_ID = "11111111-1111-4111-8111-111111111111"
@@ -92,6 +95,39 @@ def model_task() -> dict:
     }
 
 
+def stage_model_task() -> dict:
+    task = model_task()
+    contract_identity_digest = stage_contract_identity_digest(
+        source_manifest_digest="sha256:" + "3" * 64,
+        runtime_image=RUNTIME_IMAGE,
+        vllm_version="0.9.0",
+        exporter_build_digest="sha256:" + "4" * 64,
+        architecture="Qwen2ForCausalLM",
+        quantization="awq",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=3,
+        loader_format="VLLM_SHARDED_STATE_V1",
+    )
+    task["payload"].update(
+        cache_kind=MODEL_CACHE_KIND_STAGE,
+        artifact_set_digest="sha256:" + "1" * 64,
+        contract_identity_digest=contract_identity_digest,
+        source_manifest_digest="sha256:" + "3" * 64,
+        runtime_image=RUNTIME_IMAGE,
+        vllm_version="0.9.0",
+        exporter_build_digest="sha256:" + "4" * 64,
+        architecture="Qwen2ForCausalLM",
+        loader_format="VLLM_SHARDED_STATE_V1",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=3,
+        pipeline_rank=1,
+        tensor_rank=0,
+        tensor_keys_digest="sha256:" + "5" * 64,
+    )
+    task["payload"]["quantization"] = "awq"
+    return task
+
+
 def image_task() -> dict:
     return {
         "id": TASK_ID,
@@ -120,6 +156,18 @@ class FakeModelPreparer:
             reused=len(self.calls) > 1,
             file_count=3,
             total_size_bytes=4096,
+        )
+
+    def prepare_stage(self, *, identity, manifest, origin):
+        self.calls.append((identity, manifest, origin))
+        if self.exception is not None:
+            raise self.exception
+        return PreparedModelCache(
+            path=Path("/var/lib/dure/models/stages/not-returned-to-controller"),
+            identity=identity,
+            reused=len(self.calls) > 1,
+            file_count=5,
+            total_size_bytes=8192,
         )
 
 
@@ -283,6 +331,78 @@ class AgentPreparationTests(unittest.TestCase):
         )
         self.assertNotIn("path", result)
         self.assertNotIn("manifest", result)
+
+    def test_stage_task_uses_closed_composite_identity_and_reports_no_path(self):
+        preparer = FakeModelPreparer()
+        executor = self.model_executor(preparer)
+
+        task = stage_model_task()
+        result = executor.execute(task)
+
+        self.assertEqual(len(preparer.calls), 1)
+        identity, manifest, origin = preparer.calls[0]
+        self.assertIsInstance(identity, StageCacheIdentity)
+        self.assertEqual(identity.pipeline_rank, 1)
+        self.assertEqual(identity.tensor_rank, 0)
+        self.assertEqual(identity.artifact_set_digest, "sha256:" + "1" * 64)
+        self.assertEqual(manifest, MANIFEST)
+        self.assertIs(origin, ORIGIN)
+        self.assertEqual(result["cache_kind"], MODEL_CACHE_KIND_STAGE)
+        self.assertEqual(result["manifest_digest"], MANIFEST_DIGEST)
+        self.assertEqual(result["artifact_set_digest"], identity.artifact_set_digest)
+        self.assertEqual(result["pipeline_rank"], 1)
+        self.assertEqual(result["tensor_rank"], 0)
+        self.assertEqual(result["tensor_keys_digest"], identity.tensor_keys_digest)
+        self.assertEqual(
+            result["cache_identity_digest"], identity.cache_identity_digest
+        )
+        self.assertEqual(result["bytes_verified"], 8192)
+        self.assertEqual(result["file_count"], 5)
+        self.assertNotIn("path", result)
+        self.assertNotIn("manifest", result)
+        self.assertNotIn("runtime_image", result)
+
+    def test_stage_result_history_rejects_boolean_integer_aliases(self):
+        task = stage_model_task()
+        result = self.model_executor(FakeModelPreparer()).execute(task)
+
+        for field in ("verification_version", "pipeline_rank", "tensor_rank"):
+            with self.subTest(field=field):
+                tampered = dict(result)
+                tampered[field] = bool(result[field])
+                with self.assertRaises(ArtifactPreparationError) as caught:
+                    validate_preparation_result(task, tampered, NODE_ID)
+                self.assertEqual(
+                    caught.exception.code,
+                    "PREPARATION_HISTORY_INVALID",
+                )
+
+    def test_stage_task_rejects_partial_mixed_and_arbitrary_payloads_before_action(self):
+        variants = []
+        missing = stage_model_task()
+        missing["payload"].pop("tensor_keys_digest")
+        variants.append(missing)
+        mixed = model_task()
+        mixed["payload"]["pipeline_rank"] = 1
+        variants.append(mixed)
+        unpinned = stage_model_task()
+        unpinned["payload"]["runtime_image"] = "registry.example/vllm:latest"
+        variants.append(unpinned)
+        boolean_rank = stage_model_task()
+        boolean_rank["payload"]["pipeline_rank"] = True
+        variants.append(boolean_rank)
+        with_path = stage_model_task()
+        with_path["payload"]["path"] = "/tmp/foreign-stage"
+        variants.append(with_path)
+
+        for task in variants:
+            preparer = FakeModelPreparer()
+            with self.subTest(task=task), self.assertRaises(
+                ArtifactPreparationError
+            ) as caught:
+                self.model_executor(preparer).execute(task)
+            self.assertEqual(caught.exception.code, "PREPARATION_PAYLOAD_REJECTED")
+            self.assertEqual(preparer.calls, [])
 
     def test_model_handler_integrates_pr3_store_with_fake_transport(self):
         config = b'{"model_type":"dure-test"}'

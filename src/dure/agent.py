@@ -31,9 +31,11 @@ from .model_cache import (
 from .models import DeploymentPlan, InstalledModelProfile, NodeProfile
 from .orchestrator import InitOrchestrator
 from .pipeline_runtime import (
+    is_stage_pipeline_plan,
     is_strict_pipeline_plan,
     validate_strict_pipeline_node,
     validate_strict_pipeline_plan,
+    validate_strict_stage_cache,
 )
 from .probe import DURE_MODEL_ROOT, NodeProbe
 from .readiness import ReadinessVerifier
@@ -672,6 +674,11 @@ class TaskExecutor:
             store.save(state)
             return {"checks": [check.to_dict()]}
         if kind == TaskType.RESTART_DEPLOYMENT:
+            if is_stage_pipeline_plan(plan):
+                # A restart is allowed to stop a healthy container only after
+                # the exact immutable replacement cache is known to be usable.
+                # Emergency STOP intentionally remains independent of cache IO.
+                validate_strict_stage_cache(plan, assignment)
             stopped = runtime.stop_deployment(
                 plan.deployment_id,
                 generation=plan.generation,

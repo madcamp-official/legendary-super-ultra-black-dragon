@@ -5,9 +5,12 @@ from pathlib import Path
 from .command import Runner, SubprocessRunner
 from .models import CheckResult, DeploymentPlan, NodeProfile
 from .pipeline_runtime import (
+    STAGE_CACHE_CHECK,
+    is_stage_pipeline_plan,
     is_strict_pipeline_plan,
     validate_strict_pipeline_node,
     validate_strict_pipeline_plan,
+    validate_strict_stage_cache,
 )
 from .planner import build_plan, classify_node
 from .probe import NodeProbe
@@ -148,9 +151,23 @@ class InitOrchestrator:
 
         state.phase = "DOWNLOADING"
         self.store.save(state)
-        model_check = ModelStore(self.runner).ensure(
-            plan, accept_download=accept_model_download
-        )
+        if is_stage_pipeline_plan(plan):
+            try:
+                stage_cache = validate_strict_stage_cache(plan, assignment)
+            except ValueError as exc:
+                model_check = CheckResult(STAGE_CACHE_CHECK, False, str(exc))
+            else:
+                assert stage_cache is not None
+                model_check = CheckResult(
+                    STAGE_CACHE_CHECK,
+                    True,
+                    "Verified immutable rank-local STAGE cache "
+                    f"{stage_cache.cache_identity_digest}",
+                )
+        else:
+            model_check = ModelStore(self.runner).ensure(
+                plan, accept_download=accept_model_download
+            )
         checks.append(model_check)
         if not model_check.ok:
             return self._fail(state, profile, plan, checks, model_check.detail)

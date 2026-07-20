@@ -18,6 +18,7 @@ from dure.control.rollout import (
     claim_operation_task,
     finish_operation_task,
     prepare_or_apply_rollback,
+    valid_deployment_task_success_result,
 )
 from dure.control.service import (
     claim_enrollment,
@@ -26,7 +27,10 @@ from dure.control.service import (
     finish_task,
     save_deployment,
 )
-from dure.model_cache import MODEL_CACHE_KIND_FULL_SNAPSHOT
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+)
 from dure.models import (
     DeploymentPlan,
     ModelSpec,
@@ -34,6 +38,8 @@ from dure.models import (
     VLLM_RAY_PP_BACKEND,
     VLLM_RAY_PP_RUNTIME_VERSION,
 )
+from dure.pipeline_runtime import pipeline_contract_detail
+from dure.stage_cache import stage_contract_identity_digest
 from dure.task import TaskStatus, TaskType
 
 from tests.helpers import profile
@@ -100,7 +106,54 @@ def _strict_plan(
     )
 
 
+def _strict_stage_plan(deployment_id: str) -> DeploymentPlan:
+    plan = _strict_plan(deployment_id).to_dict()
+    source_manifest_digest = "sha256:" + "c" * 64
+    exporter_build_digest = "sha256:" + "d" * 64
+    contract_identity_digest = stage_contract_identity_digest(
+        source_manifest_digest=source_manifest_digest,
+        runtime_image=IMAGE,
+        vllm_version=VLLM_RAY_PP_RUNTIME_VERSION,
+        exporter_build_digest=exporter_build_digest,
+        architecture="Qwen2ForCausalLM",
+        quantization="awq",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+        loader_format="VLLM_SHARDED_STATE_V1",
+    )
+    plan.update(
+        model_path="/var/lib/dure/models/stages",
+        model_cache_kind=MODEL_CACHE_KIND_STAGE,
+        stage_artifact={
+            "artifact_set_digest": "sha256:" + "e" * 64,
+            "contract_identity_digest": contract_identity_digest,
+            "source_manifest_digest": source_manifest_digest,
+            "runtime_image": IMAGE,
+            "vllm_version": VLLM_RAY_PP_RUNTIME_VERSION,
+            "exporter_build_digest": exporter_build_digest,
+            "architecture": "Qwen2ForCausalLM",
+            "quantization": "awq",
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 2,
+            "loader_format": "VLLM_SHARDED_STATE_V1",
+        },
+    )
+    for rank, assignment in enumerate(plan["assignments"]):
+        assignment["stage_manifest_digest"] = (
+            "sha256:" + str(rank + 4) * 64
+        )
+        assignment["stage_tensor_keys_digest"] = (
+            "sha256:" + str(rank + 6) * 64
+        )
+    return DeploymentPlan.from_dict(plan)
+
+
 def _rank_detail(plan: dict, node_id: str) -> str:
+    if plan.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE:
+        typed_plan = DeploymentPlan.from_dict(plan)
+        assignment = typed_plan.assignment_for(node_id)
+        assert assignment is not None
+        return pipeline_contract_detail(typed_plan, assignment)
     bindings = [
         {
             "node_id": assignment["node_id"],
@@ -157,7 +210,9 @@ def _verify_result(plan: dict, node_id: str) -> dict:
     return {"checks": checks, "ok": True}
 
 
-def _apply_result(plan: dict, node_id: str) -> dict:
+def _apply_result(
+    plan: dict, node_id: str, *, model_check: str = "model"
+) -> dict:
     checks = [
         {
             "name": name,
@@ -168,7 +223,7 @@ def _apply_result(plan: dict, node_id: str) -> dict:
         for name in (
             "node-profile",
             "deployment-plan",
-            "model",
+            model_check,
             "container-image",
             "ray-container",
             "host-gpu",
@@ -319,6 +374,77 @@ class StrictRayControlTests(unittest.TestCase):
         self.assertTrue(claim_operation_task(session, task, NODE_A))
         session.commit()
         return task
+
+    def test_strict_start_results_require_cache_kind_specific_check(self) -> None:
+        plans = (
+            (
+                _strict_plan(str(uuid.uuid4())).to_dict(),
+                "model",
+                "stage-cache",
+            ),
+            (
+                _strict_stage_plan(str(uuid.uuid4())).to_dict(),
+                "stage-cache",
+                "model",
+            ),
+        )
+        for plan, required_check, wrong_check in plans:
+            for task_type in (
+                TaskType.APPLY_DEPLOYMENT.value,
+                TaskType.START_DEPLOYMENT.value,
+                TaskType.RESTART_DEPLOYMENT.value,
+            ):
+                with self.subTest(
+                    cache_kind=plan["model_cache_kind"],
+                    task_type=task_type,
+                ):
+                    task = Task(
+                        node_id=NODE_B,
+                        type=task_type,
+                        deployment_id=plan["deployment_id"],
+                        payload={"plan": plan, "serve": False},
+                    )
+                    valid = _apply_result(
+                        plan, NODE_B, model_check=required_check
+                    )
+                    self.assertTrue(
+                        valid_deployment_task_success_result(
+                            task,
+                            valid,
+                            operation_kind="APPLY",
+                            operation_phase="APPLY",
+                        )
+                    )
+
+                    wrong = _apply_result(
+                        plan, NODE_B, model_check=wrong_check
+                    )
+                    self.assertFalse(
+                        valid_deployment_task_success_result(
+                            task,
+                            wrong,
+                            operation_kind="APPLY",
+                            operation_phase="APPLY",
+                        )
+                    )
+
+                    extra = copy.deepcopy(valid)
+                    extra["checks"].append(
+                        {
+                            "name": wrong_check,
+                            "ok": True,
+                            "detail": "verified",
+                            "blocking": True,
+                        }
+                    )
+                    self.assertFalse(
+                        valid_deployment_task_success_result(
+                            task,
+                            extra,
+                            operation_kind="APPLY",
+                            operation_phase="APPLY",
+                        )
+                    )
 
     def test_strict_deployment_requires_exact_uuid_nodes_and_new_agents(self) -> None:
         with self.factory() as session:

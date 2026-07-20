@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .command import Runner, SubprocessRunner
 from .model_cache import (
+    MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_MARKER_FILE,
     MODEL_CACHE_SCHEMA_V1,
     ModelCacheMarker,
@@ -29,8 +30,10 @@ from .models import (
 
 
 DURE_MODEL_ROOT = Path("/var/lib/dure/models")
+DURE_STAGE_ROOT = DURE_MODEL_ROOT / "stages"
 DEFAULT_MODEL_ROOTS = (
     DURE_MODEL_ROOT,
+    DURE_STAGE_ROOT,
     Path.home() / ".cache" / "huggingface" / "hub",
 )
 MAX_DISCOVERED_MODELS = 100
@@ -280,10 +283,13 @@ class NodeProbe:
     def _probe_dure_models(self, root: Path) -> list[InstalledModelProfile]:
         if not self._safe_model_directory(root):
             return []
+        stage_root = root == DURE_STAGE_ROOT or root.name == DURE_STAGE_ROOT.name
         try:
             candidates = []
             for item in root.iterdir():
-                if item.name == DURE_MODEL_STAGING_DIRECTORY:
+                if item.name == DURE_MODEL_STAGING_DIRECTORY or (
+                    root == DURE_MODEL_ROOT and item == DURE_STAGE_ROOT
+                ):
                     continue
                 try:
                     state = item.lstat()
@@ -312,6 +318,10 @@ class NodeProbe:
             ):
                 metadata = None
             configured_name = config.get("_name_or_path")
+            advisory_stage = stage_root or (
+                metadata is not None
+                and metadata.cache_kind == MODEL_CACHE_KIND_STAGE
+            )
             model_id = (
                 metadata.repository
                 if metadata
@@ -333,11 +343,84 @@ class NodeProbe:
                         else configured_quantization
                     ),
                     size_mib=self._model_size_mib(candidate),
-                    complete=parsed_config is not None,
+                    # Heartbeat probing does not rehash a potentially huge stage
+                    # tree.  The identity is advisory until the start/readiness
+                    # gate validates every file through the canonical manifest.
+                    complete=parsed_config is not None and not advisory_stage,
                     manifest_digest=metadata.manifest_digest if metadata else None,
                     cache_kind=metadata.cache_kind if metadata else None,
                     verification_version=(
                         metadata.verification_version if metadata else None
+                    ),
+                    artifact_set_digest=(
+                        getattr(metadata, "artifact_set_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    contract_identity_digest=(
+                        getattr(metadata, "contract_identity_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    source_manifest_digest=(
+                        getattr(metadata, "source_manifest_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    runtime_image=(
+                        getattr(metadata, "runtime_image", None)
+                        if metadata
+                        else None
+                    ),
+                    vllm_version=(
+                        getattr(metadata, "vllm_version", None)
+                        if metadata
+                        else None
+                    ),
+                    exporter_build_digest=(
+                        getattr(metadata, "exporter_build_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    architecture=(
+                        getattr(metadata, "architecture", None)
+                        if metadata
+                        else None
+                    ),
+                    loader_format=(
+                        getattr(metadata, "loader_format", None)
+                        if metadata
+                        else None
+                    ),
+                    tensor_parallel_size=(
+                        getattr(metadata, "tensor_parallel_size", None)
+                        if metadata
+                        else None
+                    ),
+                    pipeline_parallel_size=(
+                        getattr(metadata, "pipeline_parallel_size", None)
+                        if metadata
+                        else None
+                    ),
+                    pipeline_rank=(
+                        getattr(metadata, "pipeline_rank", None)
+                        if metadata
+                        else None
+                    ),
+                    tensor_rank=(
+                        getattr(metadata, "tensor_rank", None)
+                        if metadata
+                        else None
+                    ),
+                    tensor_keys_digest=(
+                        getattr(metadata, "tensor_keys_digest", None)
+                        if metadata
+                        else None
+                    ),
+                    cache_identity_digest=(
+                        getattr(metadata, "cache_identity_digest", None)
+                        if metadata
+                        else None
                     ),
                 )
             )

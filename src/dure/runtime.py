@@ -13,17 +13,24 @@ from .pipeline_runtime import (
     RAY_MAX_WORKER_PORT,
     RAY_MIN_WORKER_PORT,
     STRICT_IDENTITY_COMPONENTS,
+    STRICT_CACHE_KIND_LABEL,
     STRICT_RUNTIME_CONTRACT_LABEL,
+    STRICT_STAGE_CACHE_IDENTITY_LABEL,
+    STRICT_STAGE_MANIFEST_LABEL,
+    STRICT_STAGE_VARIANT_LABEL,
     VLLM_API_COMPONENT,
     VLLM_API_HOST,
     VLLM_API_PORT,
     is_strict_pipeline_plan,
+    stage_identity_labels,
+    strict_model_mount_path,
     strict_ray_command,
     strict_runtime_contract_digest,
     strict_vllm_api_command,
     strict_vllm_environment,
     validate_strict_pipeline_node,
     validate_strict_pipeline_plan,
+    validate_strict_stage_cache,
 )
 
 
@@ -40,11 +47,41 @@ DEPLOYMENT_IDENTITY_FORMAT = (
     '{{index .Config.Labels "dure.pipeline-rank"}}\t'
     '{{index .Config.Labels "dure.runtime-rank"}}\t'
     '{{index .Config.Labels "dure.component"}}\t'
-    '{{index .Config.Labels "dure.runtime-contract"}}'
+    '{{index .Config.Labels "dure.runtime-contract"}}\t'
+    '{{index .Config.Labels "dure.cache-kind"}}\t'
+    '{{index .Config.Labels "dure.stage-variant"}}\t'
+    '{{index .Config.Labels "dure.stage-manifest"}}\t'
+    '{{index .Config.Labels "dure.stage-cache-identity"}}'
 )
 STOPPED_CONTAINER_STATES = frozenset({"created", "exited", "dead"})
 STOPPABLE_CONTAINER_STATES = frozenset({"running", "restarting", "paused"})
 MISSING_DOCKER_LABEL_VALUES = frozenset({"", "<no value>", "<nil>"})
+
+
+def _stage_identity_kwargs(
+    plan: DeploymentPlan,
+    assignment: NodeAssignment,
+) -> dict[str, str]:
+    labels = stage_identity_labels(plan, assignment)
+    if not labels:
+        return {}
+    return {
+        "cache_kind": labels[STRICT_CACHE_KIND_LABEL],
+        "stage_variant": labels[STRICT_STAGE_VARIANT_LABEL],
+        "stage_manifest": labels[STRICT_STAGE_MANIFEST_LABEL],
+        "stage_cache_identity": labels[STRICT_STAGE_CACHE_IDENTITY_LABEL],
+    }
+
+
+def _stage_label_arguments(
+    plan: DeploymentPlan,
+    assignment: NodeAssignment,
+) -> list[str]:
+    return [
+        value
+        for key, item in sorted(stage_identity_labels(plan, assignment).items())
+        for value in ("--label", f"{key}={item}")
+    ]
 
 
 @dataclass(frozen=True)
@@ -59,15 +96,19 @@ class DeploymentContainerIdentity:
     runtime_rank: str = ""
     component: str = ""
     runtime_contract: str = ""
+    cache_kind: str = ""
+    stage_variant: str = ""
+    stage_manifest: str = ""
+    stage_cache_identity: str = ""
 
     @classmethod
     def parse(cls, value: str) -> "DeploymentContainerIdentity | None":
         parts = value.split("\t")
         # SubprocessRunner strips trailing tabs.  Older Dure containers have
         # none of the strict identity labels and some also lack dure.node.
-        if not 4 <= len(parts) <= 10:
+        if not 4 <= len(parts) <= 14:
             return None
-        parts.extend([""] * (10 - len(parts)))
+        parts.extend([""] * (14 - len(parts)))
         parts[2:] = [
             "" if part in MISSING_DOCKER_LABEL_VALUES else part
             for part in parts[2:]
@@ -87,6 +128,10 @@ class DeploymentContainerIdentity:
         runtime_rank: int | None = None,
         component: str | None = None,
         runtime_contract: str | None = None,
+        cache_kind: str | None = None,
+        stage_variant: str | None = None,
+        stage_manifest: str | None = None,
+        stage_cache_identity: str | None = None,
     ) -> bool:
         base_matches = (
             self.deployment_id == deployment_id
@@ -102,7 +147,35 @@ class DeploymentContainerIdentity:
                 and not self.runtime_rank
                 and not self.component
                 and not self.runtime_contract
+                and not self.cache_kind
+                and not self.stage_variant
+                and not self.stage_manifest
+                and not self.stage_cache_identity
             )
+        stage_expected = any(
+            value is not None
+            for value in (
+                cache_kind,
+                stage_variant,
+                stage_manifest,
+                stage_cache_identity,
+            )
+        )
+        stage_matches = (
+            self.cache_kind == cache_kind
+            and self.stage_variant == stage_variant
+            and self.stage_manifest == stage_manifest
+            and self.stage_cache_identity == stage_cache_identity
+            if stage_expected
+            else not any(
+                (
+                    self.cache_kind,
+                    self.stage_variant,
+                    self.stage_manifest,
+                    self.stage_cache_identity,
+                )
+            )
+        )
         return (
             self.node_id == node_id
             and self.backend == backend
@@ -113,6 +186,7 @@ class DeploymentContainerIdentity:
                 runtime_contract is None
                 or self.runtime_contract == runtime_contract
             )
+            and stage_matches
         )
 
 
@@ -183,6 +257,10 @@ class ContainerRuntime:
         runtime_rank: int | None = None,
         component: str | None = None,
         runtime_contract: str | None = None,
+        cache_kind: str | None = None,
+        stage_variant: str | None = None,
+        stage_manifest: str | None = None,
+        stage_cache_identity: str | None = None,
     ) -> tuple[CheckResult, DeploymentContainerIdentity | None]:
         result, identity = self.inspect_deployment_container(name)
         if not result.ok:
@@ -205,6 +283,10 @@ class ContainerRuntime:
             runtime_rank=runtime_rank,
             component=component,
             runtime_contract=runtime_contract,
+            cache_kind=cache_kind,
+            stage_variant=stage_variant,
+            stage_manifest=stage_manifest,
+            stage_cache_identity=stage_cache_identity,
         ):
             return (
                 CheckResult(
@@ -244,6 +326,10 @@ class ContainerRuntime:
         runtime_rank: int | None = None,
         component: str | None = None,
         runtime_contract: str | None = None,
+        cache_kind: str | None = None,
+        stage_variant: str | None = None,
+        stage_manifest: str | None = None,
+        stage_cache_identity: str | None = None,
     ) -> CheckResult:
         check, _ = self.running_container_identity(
             name,
@@ -256,6 +342,10 @@ class ContainerRuntime:
             runtime_rank=runtime_rank,
             component=component,
             runtime_contract=runtime_contract,
+            cache_kind=cache_kind,
+            stage_variant=stage_variant,
+            stage_manifest=stage_manifest,
+            stage_cache_identity=stage_cache_identity,
         )
         return check
 
@@ -273,6 +363,10 @@ class ContainerRuntime:
         runtime_rank: int | None = None,
         component: str | None = None,
         runtime_contract: str | None = None,
+        cache_kind: str | None = None,
+        stage_variant: str | None = None,
+        stage_manifest: str | None = None,
+        stage_cache_identity: str | None = None,
     ) -> tuple[bool, CheckResult | None]:
         result, identity = self.inspect_deployment_container(name)
         if not result.ok:
@@ -292,6 +386,10 @@ class ContainerRuntime:
             runtime_rank=runtime_rank,
             component=component,
             runtime_contract=runtime_contract,
+            cache_kind=cache_kind,
+            stage_variant=stage_variant,
+            stage_manifest=stage_manifest,
+            stage_cache_identity=stage_cache_identity,
         ):
             return False, CheckResult(
                 check_name,
@@ -415,6 +513,7 @@ class ContainerRuntime:
                         pipeline_rank=assignment.pipeline_rank,
                         runtime_rank=assignment.expected_runtime_rank,
                         component=identity.component,
+                        **_stage_identity_kwargs(plan, assignment),
                     )
                 ):
                     return CheckResult(
@@ -432,6 +531,10 @@ class ContainerRuntime:
                 or identity.runtime_rank
                 or identity.component
                 or identity.runtime_contract
+                or identity.cache_kind
+                or identity.stage_variant
+                or identity.stage_manifest
+                or identity.stage_cache_identity
             ):
                 return CheckResult(
                     "deployment-stop", False, "Deployment container label mismatch"
@@ -470,6 +573,7 @@ class ContainerRuntime:
                 validate_strict_pipeline_node(
                     plan, assignment, profile, require_model_cache=True
                 )
+                validate_strict_stage_cache(plan, assignment)
             except ValueError as exc:
                 return CheckResult("ray-container", False, str(exc))
 
@@ -483,6 +587,7 @@ class ContainerRuntime:
                 "runtime_contract": strict_runtime_contract_digest(
                     plan, assignment, RAY_COMPONENT
                 ),
+                **_stage_identity_kwargs(plan, assignment),
             }
             if strict
             else {}
@@ -574,6 +679,7 @@ class ContainerRuntime:
                     f"dure.component={RAY_COMPONENT}",
                     "--label",
                     f"{STRICT_RUNTIME_CONTRACT_LABEL}={strict_identity['runtime_contract']}",
+                    *_stage_label_arguments(plan, assignment),
                 ]
                 if strict
                 else []
@@ -581,7 +687,9 @@ class ContainerRuntime:
             "--entrypoint",
             "ray",
             "--mount",
-            f"type=bind,src={plan.model_path},dst=/models/model,readonly",
+            "type=bind,src="
+            f"{strict_model_mount_path(plan, assignment) if strict else plan.model_path},"
+            "dst=/models/model,readonly",
             *environment_args,
             plan.image,
             *ray_command,
@@ -608,6 +716,7 @@ class ContainerRuntime:
         if strict:
             try:
                 validate_strict_pipeline_plan(plan)
+                validate_strict_stage_cache(plan, assignment)
             except ValueError as exc:
                 return CheckResult("vllm-api-start", False, str(exc))
             if self.engine != "docker" or assignment not in plan.assignments:
@@ -633,6 +742,7 @@ class ContainerRuntime:
                 "runtime_contract": strict_runtime_contract_digest(
                     plan, assignment, VLLM_API_COMPONENT
                 ),
+                **_stage_identity_kwargs(plan, assignment),
             }
             if strict
             else {}
@@ -708,7 +818,9 @@ class ContainerRuntime:
             "--gpus",
             f"device={assignment.gpu_index}",
             "--mount",
-            f"type=bind,src={plan.model_path},dst=/models/model,readonly",
+            "type=bind,src="
+            f"{strict_model_mount_path(plan, assignment) if strict else plan.model_path},"
+            "dst=/models/model,readonly",
             *environment_args,
             "--label",
             f"dure.deployment={plan.deployment_id}",
@@ -730,6 +842,7 @@ class ContainerRuntime:
                     f"dure.component={VLLM_API_COMPONENT}",
                     "--label",
                     f"{STRICT_RUNTIME_CONTRACT_LABEL}={strict_identity['runtime_contract']}",
+                    *_stage_label_arguments(plan, assignment),
                 ]
                 if strict
                 else []

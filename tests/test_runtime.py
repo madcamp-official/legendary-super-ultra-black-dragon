@@ -1,12 +1,26 @@
 import copy
 import unittest
+from unittest.mock import patch
 
 from dure.command import CommandResult
-from dure.pipeline_runtime import RAY_COMPONENT, strict_runtime_contract_digest
+from dure.pipeline_runtime import (
+    RAY_COMPONENT,
+    stage_cache_identity,
+    stage_identity_labels,
+    strict_model_mount_path,
+    strict_runtime_contract_digest,
+    strict_vllm_api_command,
+)
 from dure.planner import build_plan
 from dure.runtime import ContainerRuntime, DEPLOYMENT_IDENTITY_FORMAT
+from dure.stage_cache import StageCacheError
 
-from .helpers import FakeRunner, profile, strict_pipeline_fixture
+from .helpers import (
+    FakeRunner,
+    profile,
+    strict_pipeline_fixture,
+    strict_stage_pipeline_fixture,
+)
 
 
 class RuntimeTests(unittest.TestCase):
@@ -42,6 +56,37 @@ class RuntimeTests(unittest.TestCase):
                 runtime_rank,
                 component,
                 runtime_contract,
+            )
+        )
+
+    @staticmethod
+    def strict_stage_identity(
+        container_id,
+        state,
+        plan,
+        assignment,
+        component,
+        *,
+        stage_manifest=None,
+    ):
+        labels = stage_identity_labels(plan, assignment)
+        return "\t".join(
+            str(item)
+            for item in (
+                container_id,
+                state,
+                plan.deployment_id,
+                plan.generation,
+                assignment.node_id,
+                plan.execution_backend,
+                assignment.pipeline_rank,
+                assignment.expected_runtime_rank,
+                component,
+                strict_runtime_contract_digest(plan, assignment, component),
+                labels["dure.cache-kind"],
+                labels["dure.stage-variant"],
+                stage_manifest or labels["dure.stage-manifest"],
+                labels["dure.stage-cache-identity"],
             )
         )
 
@@ -377,6 +422,128 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(worker_result.ok)
         self.assertFalse(worker_result.blocking)
 
+    def test_stage_worker_mounts_only_its_derived_cache_with_exact_labels(self):
+        plan, _, worker = strict_stage_pipeline_fixture()
+        assignment = plan.assignments[1]
+        name = f"dure-ray-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        runner = FakeRunner(
+            responses={inspect: CommandResult(inspect, 1, stderr="not found")}
+        )
+
+        with patch("dure.runtime.validate_strict_stage_cache") as validate_cache:
+            result = ContainerRuntime(runner).start_ray(
+                worker, plan, assignment, replace=False
+            )
+
+        self.assertTrue(result.ok, result.detail)
+        validate_cache.assert_called_once_with(plan, assignment)
+        run = runner.calls[-1]
+        expected_source = strict_model_mount_path(plan, assignment)
+        self.assertEqual(
+            run[run.index("--mount") + 1],
+            f"type=bind,src={expected_source},dst=/models/model,readonly",
+        )
+        self.assertNotEqual(str(expected_source), plan.model_path)
+        self.assertEqual(expected_source.parent.as_posix(), plan.model_path)
+        for key, value in stage_identity_labels(plan, assignment).items():
+            self.assertIn(f"{key}={value}", run)
+        self.assertEqual(
+            stage_cache_identity(plan, assignment).pipeline_rank,
+            assignment.pipeline_rank,
+        )
+
+    def test_stage_api_revalidates_cache_and_uses_native_sharded_loader(self):
+        plan, _, _ = strict_stage_pipeline_fixture()
+        assignment = plan.assignments[0]
+        name = f"dure-api-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        runner = FakeRunner(
+            responses={inspect: CommandResult(inspect, 1, stderr="not found")}
+        )
+
+        with patch("dure.runtime.validate_strict_stage_cache") as validate_cache:
+            result = ContainerRuntime(runner).start_api(
+                plan, assignment, replace=False
+            )
+
+        self.assertTrue(result.ok, result.detail)
+        validate_cache.assert_called_once_with(plan, assignment)
+        run = runner.calls[-1]
+        self.assertEqual(run[run.index("--load-format") + 1], "sharded_state")
+        for key, value in stage_identity_labels(plan, assignment).items():
+            self.assertIn(f"{key}={value}", run)
+
+        full_plan, _, _ = strict_pipeline_fixture()
+        self.assertNotIn("--load-format", strict_vllm_api_command(full_plan))
+
+    def test_stage_cache_failure_blocks_all_docker_actions(self):
+        plan, _, worker = strict_stage_pipeline_fixture()
+        assignment = plan.assignments[1]
+        runner = FakeRunner()
+
+        with patch(
+            "dure.pipeline_runtime.validate_materialized_stage_cache",
+            side_effect=StageCacheError("tampered stage cache"),
+        ):
+            result = ContainerRuntime(runner).start_ray(
+                worker, plan, assignment, replace=False
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("integrity", result.detail)
+        self.assertEqual(runner.calls, [])
+
+    def test_stage_name_collision_with_swapped_manifest_is_never_replaced(self):
+        plan, _, worker = strict_stage_pipeline_fixture()
+        assignment = plan.assignments[1]
+        name = f"dure-ray-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        runner = FakeRunner(
+            responses={
+                inspect: (
+                    0,
+                    self.strict_stage_identity(
+                        "swapped-stage",
+                        "exited",
+                        plan,
+                        assignment,
+                        RAY_COMPONENT,
+                        stage_manifest="sha256:" + "9" * 64,
+                    ),
+                    "",
+                )
+            }
+        )
+
+        with patch("dure.runtime.validate_strict_stage_cache"):
+            result = ContainerRuntime(runner).start_ray(
+                worker, plan, assignment, replace=True
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("mismatched Dure identity", result.detail)
+        self.assertFalse(any(call[:2] == ("docker", "rm") for call in runner.calls))
+        self.assertFalse(any(call[:3] == ("docker", "run", "-d") for call in runner.calls))
+
     def test_strict_name_collision_with_missing_or_swapped_rank_is_never_replaced(self):
         plan, _, worker = strict_pipeline_fixture()
         assignment = plan.assignments[1]
@@ -601,6 +768,52 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertFalse(rejected.ok)
         self.assertFalse(any(call[:2] == ("docker", "stop") for call in rejecting.calls))
+
+    def test_stage_stop_uses_exact_labels_without_requiring_cache_access(self):
+        plan, _, worker = strict_stage_pipeline_fixture()
+        assignment = plan.assignments[1]
+        listed = (
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            f"label=dure.deployment={plan.deployment_id}",
+            "--filter",
+            f"label=dure.generation={plan.generation}",
+        )
+        inspected = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            "abc",
+        )
+        runner = FakeRunner(
+            responses={
+                listed: (0, "abc", ""),
+                inspected: (
+                    0,
+                    self.strict_stage_identity(
+                        "abc", "running", plan, assignment, RAY_COMPONENT
+                    ),
+                    "",
+                ),
+                ("docker", "stop", "--time", "30", "abc"): (0, "abc", ""),
+            }
+        )
+
+        with patch("dure.runtime.validate_strict_stage_cache") as validate_cache:
+            result = ContainerRuntime(runner).stop_deployment(
+                plan.deployment_id,
+                generation=plan.generation,
+                node_id=assignment.node_id,
+                plan=plan,
+                assignment=assignment,
+            )
+
+        self.assertTrue(result.ok, result.detail)
+        validate_cache.assert_not_called()
+        self.assertIn(("docker", "stop", "--time", "30", "abc"), runner.calls)
 
     def test_strict_invalid_contract_is_rejected_before_docker(self):
         plan, _, worker = strict_pipeline_fixture()
