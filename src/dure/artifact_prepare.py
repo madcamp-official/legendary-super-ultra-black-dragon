@@ -10,6 +10,7 @@ from .artifact_download import ArtifactChunkDownloader, TrustedHTTPSOrigin
 from .command import CommandResult, Runner, SubprocessRunner
 from .model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_VERIFICATION_VERSION,
 )
 from .model_store import (
@@ -19,6 +20,11 @@ from .model_store import (
     ModelCachePreparer,
     ModelStoreError,
     PreparedModelCache,
+)
+from .stage_cache import (
+    STAGE_CACHE_VERIFICATION_VERSION,
+    StageCacheError,
+    StageCacheIdentity,
 )
 
 
@@ -60,7 +66,7 @@ _COMMON_PAYLOAD_FIELDS = frozenset(
         "apply",
     }
 )
-_MODEL_PAYLOAD_FIELDS = _COMMON_PAYLOAD_FIELDS | frozenset(
+_MODEL_BASE_PAYLOAD_FIELDS = _COMMON_PAYLOAD_FIELDS | frozenset(
     {
         "model_id",
         "repository",
@@ -68,6 +74,24 @@ _MODEL_PAYLOAD_FIELDS = _COMMON_PAYLOAD_FIELDS | frozenset(
         "manifest_digest",
         "quantization",
         "cache_kind",
+    }
+)
+_FULL_MODEL_PAYLOAD_FIELDS = _MODEL_BASE_PAYLOAD_FIELDS
+_STAGE_MODEL_PAYLOAD_FIELDS = _MODEL_BASE_PAYLOAD_FIELDS | frozenset(
+    {
+        "artifact_set_digest",
+        "contract_identity_digest",
+        "source_manifest_digest",
+        "runtime_image",
+        "vllm_version",
+        "exporter_build_digest",
+        "architecture",
+        "loader_format",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "pipeline_rank",
+        "tensor_rank",
+        "tensor_keys_digest",
     }
 )
 _IMAGE_PAYLOAD_FIELDS = _COMMON_PAYLOAD_FIELDS | frozenset({"runtime_image"})
@@ -84,7 +108,7 @@ _COMMON_RESULT_FIELDS = frozenset(
         "reused",
     }
 )
-_MODEL_RESULT_FIELDS = _COMMON_RESULT_FIELDS | frozenset(
+_MODEL_BASE_RESULT_FIELDS = _COMMON_RESULT_FIELDS | frozenset(
     {
         "model_id",
         "manifest_digest",
@@ -92,6 +116,16 @@ _MODEL_RESULT_FIELDS = _COMMON_RESULT_FIELDS | frozenset(
         "verification_version",
         "bytes_verified",
         "file_count",
+    }
+)
+_FULL_MODEL_RESULT_FIELDS = _MODEL_BASE_RESULT_FIELDS
+_STAGE_MODEL_RESULT_FIELDS = _MODEL_BASE_RESULT_FIELDS | frozenset(
+    {
+        "artifact_set_digest",
+        "pipeline_rank",
+        "tensor_rank",
+        "tensor_keys_digest",
+        "cache_identity_digest",
     }
 )
 _IMAGE_RESULT_FIELDS = _COMMON_RESULT_FIELDS | frozenset(
@@ -134,6 +168,14 @@ class FullSnapshotPreparer(Protocol):
         self,
         *,
         identity: CacheIdentity,
+        manifest: dict,
+        origin: object,
+    ) -> PreparedModelCache: ...
+
+    def prepare_stage(
+        self,
+        *,
+        identity: StageCacheIdentity,
         manifest: dict,
         origin: object,
     ) -> PreparedModelCache: ...
@@ -226,11 +268,16 @@ class PreparationBinding:
             raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED")
         _canonical_uuid(task.get("id"))
         payload = task.get("payload")
-        expected_fields = (
-            _MODEL_PAYLOAD_FIELDS
-            if expected_type == PREPARE_MODEL_TASK
-            else _IMAGE_PAYLOAD_FIELDS
-        )
+        if expected_type == PREPARE_MODEL_TASK:
+            cache_kind = payload.get("cache_kind") if type(payload) is dict else None
+            if cache_kind == MODEL_CACHE_KIND_FULL_SNAPSHOT:
+                expected_fields = _FULL_MODEL_PAYLOAD_FIELDS
+            elif cache_kind == MODEL_CACHE_KIND_STAGE:
+                expected_fields = _STAGE_MODEL_PAYLOAD_FIELDS
+            else:
+                raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED")
+        else:
+            expected_fields = _IMAGE_PAYLOAD_FIELDS
         if (
             type(payload) is not dict
             or any(type(key) is not str for key in payload)
@@ -385,18 +432,47 @@ class ArtifactPreparationExecutor:
         if (
             type(payload["model_id"]) is not str
             or _MODEL_ID.fullmatch(payload["model_id"]) is None
-            or payload["cache_kind"] != MODEL_CACHE_KIND_FULL_SNAPSHOT
         ):
             raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED")
         try:
-            identity = CacheIdentity(
-                repository=payload["repository"],
-                revision=payload["revision"],
-                manifest_digest=payload["manifest_digest"],
-                quantization=payload["quantization"],
-                cache_kind=payload["cache_kind"],
-            )
-        except ModelStoreError as exc:
+            if payload["cache_kind"] == MODEL_CACHE_KIND_FULL_SNAPSHOT:
+                identity: CacheIdentity | StageCacheIdentity = CacheIdentity(
+                    repository=payload["repository"],
+                    revision=payload["revision"],
+                    manifest_digest=payload["manifest_digest"],
+                    quantization=payload["quantization"],
+                    cache_kind=payload["cache_kind"],
+                )
+            else:
+                _validated_runtime_image(payload["runtime_image"])
+                identity = StageCacheIdentity(
+                    repository=payload["repository"],
+                    revision=payload["revision"],
+                    manifest_digest=payload["manifest_digest"],
+                    quantization=payload["quantization"],
+                    artifact_set_digest=payload["artifact_set_digest"],
+                    contract_identity_digest=payload[
+                        "contract_identity_digest"
+                    ],
+                    source_manifest_digest=payload[
+                        "source_manifest_digest"
+                    ],
+                    runtime_image=payload["runtime_image"],
+                    vllm_version=payload["vllm_version"],
+                    exporter_build_digest=payload[
+                        "exporter_build_digest"
+                    ],
+                    architecture=payload["architecture"],
+                    loader_format=payload["loader_format"],
+                    tensor_parallel_size=payload["tensor_parallel_size"],
+                    pipeline_parallel_size=payload[
+                        "pipeline_parallel_size"
+                    ],
+                    pipeline_rank=payload["pipeline_rank"],
+                    tensor_rank=payload["tensor_rank"],
+                    tensor_keys_digest=payload["tensor_keys_digest"],
+                )
+        except (ArtifactPreparationError, ModelStoreError, StageCacheError):
             raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED") from None
         if self.origin is None:
             raise ArtifactPreparationError("PREPARATION_ORIGIN_UNAVAILABLE")
@@ -413,11 +489,23 @@ class ArtifactPreparationExecutor:
                 "PREPARATION_MANIFEST_UNAVAILABLE"
             )
         try:
-            prepared = self.model_preparer.prepare_full_snapshot(
-                identity=identity,
-                manifest=manifest,
-                origin=self.origin,
-            )
+            if type(identity) is StageCacheIdentity:
+                prepare_stage = getattr(self.model_preparer, "prepare_stage", None)
+                if not callable(prepare_stage):
+                    raise ArtifactPreparationError(
+                        "PREPARATION_EXECUTION_FAILED"
+                    )
+                prepared = prepare_stage(
+                    identity=identity,
+                    manifest=manifest,
+                    origin=self.origin,
+                )
+            else:
+                prepared = self.model_preparer.prepare_full_snapshot(
+                    identity=identity,
+                    manifest=manifest,
+                    origin=self.origin,
+                )
         except ModelStoreError:
             raise
         except Exception:
@@ -432,15 +520,27 @@ class ArtifactPreparationExecutor:
             or prepared.total_size_bytes < 1
         ):
             raise ArtifactPreparationError("PREPARATION_EXECUTION_FAILED")
-        result = {
+        result: dict = {
             **binding.result_binding(stage="MODEL", reused=prepared.reused),
             "model_id": payload["model_id"],
             "manifest_digest": identity.manifest_digest,
             "cache_kind": identity.cache_kind,
-            "verification_version": MODEL_CACHE_VERIFICATION_VERSION,
+            "verification_version": (
+                STAGE_CACHE_VERIFICATION_VERSION
+                if type(identity) is StageCacheIdentity
+                else MODEL_CACHE_VERIFICATION_VERSION
+            ),
             "bytes_verified": prepared.total_size_bytes,
             "file_count": prepared.file_count,
         }
+        if type(identity) is StageCacheIdentity:
+            result.update(
+                artifact_set_digest=identity.artifact_set_digest,
+                pipeline_rank=identity.pipeline_rank,
+                tensor_rank=identity.tensor_rank,
+                tensor_keys_digest=identity.tensor_keys_digest,
+                cache_identity_digest=identity.cache_identity_digest,
+            )
         return validate_preparation_result(task, result, self.node_id)
 
     def _prepare_image(self, task: dict) -> dict:
@@ -513,11 +613,14 @@ def validate_preparation_result(
         )
     except ArtifactPreparationError:
         raise ArtifactPreparationError("PREPARATION_HISTORY_INVALID") from None
-    expected_fields = (
-        _MODEL_RESULT_FIELDS
-        if task_type == PREPARE_MODEL_TASK
-        else _IMAGE_RESULT_FIELDS
-    )
+    if task_type == PREPARE_MODEL_TASK:
+        expected_fields = (
+            _STAGE_MODEL_RESULT_FIELDS
+            if payload["cache_kind"] == MODEL_CACHE_KIND_STAGE
+            else _FULL_MODEL_RESULT_FIELDS
+        )
+    else:
+        expected_fields = _IMAGE_RESULT_FIELDS
     expected_binding = binding.result_binding(
         stage=PREPARATION_STAGES[task_type],
         reused=result.get("reused") if type(result) is dict else False,
@@ -534,15 +637,68 @@ def validate_preparation_result(
         if (
             result["model_id"] != payload["model_id"]
             or result["manifest_digest"] != payload["manifest_digest"]
-            or result["cache_kind"] != MODEL_CACHE_KIND_FULL_SNAPSHOT
-            or result["verification_version"]
-            != MODEL_CACHE_VERIFICATION_VERSION
+            or result["cache_kind"] != payload["cache_kind"]
+            or type(result["verification_version"]) is not int
             or type(result["bytes_verified"]) is not int
             or result["bytes_verified"] < 1
             or type(result["file_count"]) is not int
             or result["file_count"] < 1
         ):
             raise ArtifactPreparationError("PREPARATION_HISTORY_INVALID")
+        if payload["cache_kind"] == MODEL_CACHE_KIND_FULL_SNAPSHOT:
+            if (
+                result["verification_version"]
+                != MODEL_CACHE_VERIFICATION_VERSION
+            ):
+                raise ArtifactPreparationError("PREPARATION_HISTORY_INVALID")
+        else:
+            try:
+                identity = StageCacheIdentity(
+                    repository=payload["repository"],
+                    revision=payload["revision"],
+                    manifest_digest=payload["manifest_digest"],
+                    quantization=payload["quantization"],
+                    artifact_set_digest=payload["artifact_set_digest"],
+                    contract_identity_digest=payload[
+                        "contract_identity_digest"
+                    ],
+                    source_manifest_digest=payload[
+                        "source_manifest_digest"
+                    ],
+                    runtime_image=payload["runtime_image"],
+                    vllm_version=payload["vllm_version"],
+                    exporter_build_digest=payload[
+                        "exporter_build_digest"
+                    ],
+                    architecture=payload["architecture"],
+                    loader_format=payload["loader_format"],
+                    tensor_parallel_size=payload["tensor_parallel_size"],
+                    pipeline_parallel_size=payload[
+                        "pipeline_parallel_size"
+                    ],
+                    pipeline_rank=payload["pipeline_rank"],
+                    tensor_rank=payload["tensor_rank"],
+                    tensor_keys_digest=payload["tensor_keys_digest"],
+                )
+            except StageCacheError:
+                raise ArtifactPreparationError(
+                    "PREPARATION_HISTORY_INVALID"
+                ) from None
+            if (
+                result["verification_version"]
+                != STAGE_CACHE_VERIFICATION_VERSION
+                or result["artifact_set_digest"]
+                != identity.artifact_set_digest
+                or type(result["pipeline_rank"]) is not int
+                or result["pipeline_rank"] != identity.pipeline_rank
+                or type(result["tensor_rank"]) is not int
+                or result["tensor_rank"] != identity.tensor_rank
+                or result["tensor_keys_digest"]
+                != identity.tensor_keys_digest
+                or result["cache_identity_digest"]
+                != identity.cache_identity_digest
+            ):
+                raise ArtifactPreparationError("PREPARATION_HISTORY_INVALID")
     else:
         try:
             runtime_image, image_id = _validated_runtime_image(

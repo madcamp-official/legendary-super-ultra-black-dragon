@@ -26,7 +26,20 @@ from .model_cache import (
     MODEL_CACHE_MARKER_MAX_BYTES,
     ModelCacheMarkerError,
     build_model_cache_marker,
+    build_stage_model_cache_marker,
     read_model_cache_marker,
+)
+from .stage_cache import (
+    STAGE_CACHE_MANIFEST_FILE,
+    STAGE_MARKER_FILE,
+    STAGE_MARKER_MAX_BYTES,
+    StageCacheError,
+    StageCacheIdentity,
+    canonical_stage_manifest,
+    decode_unique_json,
+    stage_cache_path,
+    validate_materialized_stage_cache,
+    validate_stage_marker_document,
 )
 
 
@@ -35,7 +48,10 @@ DURE_MODEL_CACHE_ROOT = Path("/var/lib/dure/models")
 DURE_MODEL_STAGING_DIRECTORY = ".dure-staging"
 DURE_MODEL_STAGING_WORK_DIRECTORY = ".dure-work"
 DURE_MODEL_STAGING_MARKER_PART_FILE = f"{MODEL_CACHE_MARKER_FILE}.part"
+DURE_STAGE_CACHE_STAGING_DIRECTORY = ".dure-staging"
+DURE_STAGE_CACHE_MANIFEST_PART_FILE = f"{STAGE_CACHE_MANIFEST_FILE}.part"
 ATTEMPT_JOURNAL_SCHEMA_VERSION = 1
+ATTEMPT_JOURNAL_SCHEMA_VERSION_V2 = 2
 MAX_ATTEMPT_JOURNAL_BYTES = 16 * 1024
 MAX_MODEL_CONFIG_BYTES = 1024 * 1024
 MAX_TRACKED_BYTES = (1 << 63) - 1
@@ -87,6 +103,7 @@ _JOURNAL_KEYS = frozenset(
         "failure_code",
     }
 )
+_JOURNAL_V2_KEYS = _JOURNAL_KEYS | frozenset({"cache_identity_digest"})
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
@@ -129,12 +146,18 @@ class AttemptJournal:
     bytes_complete: int
     status: str
     failure_code: str | None = None
+    cache_identity_digest: str | None = None
 
     def __post_init__(self) -> None:
         try:
             require_sha256_digest(self.manifest_digest, field="manifest_digest")
             if self.chunk_digest is not None:
                 require_sha256_digest(self.chunk_digest, field="chunk_digest")
+            if self.cache_identity_digest is not None:
+                require_sha256_digest(
+                    self.cache_identity_digest,
+                    field="cache_identity_digest",
+                )
         except ValueError as exc:
             raise ModelStoreError("MODEL_STORE_INVALID") from exc
         if (
@@ -155,24 +178,42 @@ class AttemptJournal:
             raise ModelStoreError("MODEL_STORE_INVALID")
 
     def to_dict(self) -> dict:
-        return {
-            "schema_version": ATTEMPT_JOURNAL_SCHEMA_VERSION,
+        value = {
+            "schema_version": (
+                ATTEMPT_JOURNAL_SCHEMA_VERSION_V2
+                if self.cache_identity_digest is not None
+                else ATTEMPT_JOURNAL_SCHEMA_VERSION
+            ),
             "manifest_digest": self.manifest_digest,
             "chunk_digest": self.chunk_digest,
             "bytes_complete": self.bytes_complete,
             "status": self.status,
             "failure_code": self.failure_code,
         }
+        if self.cache_identity_digest is not None:
+            value["cache_identity_digest"] = self.cache_identity_digest
+        return value
+
+    @property
+    def storage_digest(self) -> str:
+        return self.cache_identity_digest or self.manifest_digest
 
     @classmethod
     def from_dict(cls, value: object) -> "AttemptJournal":
-        if (
-            type(value) is not dict
-            or any(type(key) is not str for key in value)
-            or set(value) != _JOURNAL_KEYS
-            or type(value.get("schema_version")) is not int
-            or value["schema_version"] != ATTEMPT_JOURNAL_SCHEMA_VERSION
-        ):
+        if type(value) is not dict or any(type(key) is not str for key in value):
+            raise ModelStoreError("MODEL_STORE_JOURNAL_CORRUPT")
+        schema_version = value.get("schema_version")
+        if type(schema_version) is not int:
+            raise ModelStoreError("MODEL_STORE_JOURNAL_CORRUPT")
+        if schema_version == ATTEMPT_JOURNAL_SCHEMA_VERSION:
+            if set(value) != _JOURNAL_KEYS:
+                raise ModelStoreError("MODEL_STORE_JOURNAL_CORRUPT")
+            cache_identity_digest = None
+        elif schema_version == ATTEMPT_JOURNAL_SCHEMA_VERSION_V2:
+            if set(value) != _JOURNAL_V2_KEYS:
+                raise ModelStoreError("MODEL_STORE_JOURNAL_CORRUPT")
+            cache_identity_digest = value["cache_identity_digest"]
+        else:
             raise ModelStoreError("MODEL_STORE_JOURNAL_CORRUPT")
         try:
             return cls(
@@ -181,6 +222,7 @@ class AttemptJournal:
                 bytes_complete=value["bytes_complete"],
                 status=value["status"],
                 failure_code=value["failure_code"],
+                cache_identity_digest=cache_identity_digest,
             )
         except ModelStoreError as exc:
             raise ModelStoreError("MODEL_STORE_JOURNAL_CORRUPT") from exc
@@ -296,6 +338,10 @@ class ContentAddressedModelStore:
         self.chunk_lock_root = self.store_root / "locks" / "chunks"
         self.attempt_root = self.store_root / "attempts"
         self.model_staging_root = self.model_root / DURE_MODEL_STAGING_DIRECTORY
+        self.stage_cache_root = self.model_root / "stages"
+        self.stage_staging_root = (
+            self.stage_cache_root / DURE_STAGE_CACHE_STAGING_DIRECTORY
+        )
 
     def initialize(self) -> None:
         _ensure_safe_directory(self.store_root, root=True)
@@ -310,6 +356,11 @@ class ContentAddressedModelStore:
     def initialize_model_layout(self) -> None:
         _ensure_safe_directory(self.model_root, root=True)
         _ensure_safe_directory(self.model_staging_root)
+
+    def initialize_stage_layout(self) -> None:
+        _ensure_safe_directory(self.model_root, root=True)
+        _ensure_safe_directory(self.stage_cache_root)
+        _ensure_safe_directory(self.stage_staging_root)
 
     def model_cache_path(self, manifest_digest: str) -> Path:
         hexadecimal = _digest_hex(manifest_digest, field="manifest_digest")
@@ -333,6 +384,36 @@ class ContentAddressedModelStore:
         _assert_safe_directory(candidate)
         if created:
             _fsync_directory(self.model_staging_root)
+        return candidate
+
+    def stage_cache_path(self, identity: StageCacheIdentity) -> Path:
+        try:
+            return stage_cache_path(identity, model_root=self.model_root)
+        except StageCacheError as exc:
+            raise ModelStoreError("MODEL_STORE_INVALID") from exc
+
+    def stage_staging_path(self, identity: StageCacheIdentity) -> Path:
+        if type(identity) is not StageCacheIdentity:
+            raise ModelStoreError("MODEL_STORE_INVALID")
+        hexadecimal = identity.cache_identity_digest.removeprefix("sha256:")
+        return self.stage_staging_root / f"{hexadecimal}.assembling"
+
+    def create_stage_staging_directory(
+        self, identity: StageCacheIdentity
+    ) -> Path:
+        self.initialize_stage_layout()
+        candidate = self.stage_staging_path(identity)
+        created = False
+        try:
+            candidate.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+        _assert_safe_directory(candidate)
+        if created:
+            _fsync_directory(self.stage_staging_root)
         return candidate
 
     def chunk_path(self, digest: str) -> Path:
@@ -734,8 +815,13 @@ class ContentAddressedModelStore:
         _ensure_safe_directory(path)
         return path
 
-    def read_attempt(self, manifest_digest: str) -> AttemptJournal | None:
-        directory = self._attempt_directory(manifest_digest)
+    def read_attempt(
+        self,
+        storage_digest: str,
+        *,
+        manifest_digest: str | None = None,
+    ) -> AttemptJournal | None:
+        directory = self._attempt_directory(storage_digest)
         path = directory / "journal.json"
         try:
             observed = path.lstat()
@@ -782,14 +868,20 @@ class ContentAddressedModelStore:
             if descriptor >= 0:
                 os.close(descriptor)
         journal = AttemptJournal.from_dict(value)
-        if journal.manifest_digest != manifest_digest:
+        if (
+            journal.storage_digest != storage_digest
+            or (
+                manifest_digest is not None
+                and journal.manifest_digest != manifest_digest
+            )
+        ):
             raise ModelStoreError("MODEL_STORE_JOURNAL_CORRUPT")
         return journal
 
     def write_attempt(self, journal: AttemptJournal) -> Path:
         if type(journal) is not AttemptJournal:
             raise ModelStoreError("MODEL_STORE_INVALID")
-        directory = self._attempt_directory(journal.manifest_digest)
+        directory = self._attempt_directory(journal.storage_digest)
         path = directory / "journal.json"
         try:
             path_state = path.lstat()
@@ -805,7 +897,10 @@ class ContentAddressedModelStore:
                 or path_state.st_mode & 0o077
             ):
                 raise ModelStoreError("MODEL_STORE_PATH_COLLISION")
-            self.read_attempt(journal.manifest_digest)
+            self.read_attempt(
+                journal.storage_digest,
+                manifest_digest=journal.manifest_digest,
+            )
 
         payload = (
             json.dumps(
@@ -885,7 +980,7 @@ class CacheIdentity:
 @dataclass(frozen=True)
 class PreparedModelCache:
     path: Path
-    identity: CacheIdentity
+    identity: CacheIdentity | StageCacheIdentity
     reused: bool
     file_count: int
     total_size_bytes: int
@@ -984,9 +1079,14 @@ def _safe_regular_digest(path: Path, expected_size: int) -> str:
             os.close(descriptor)
 
 
-def _read_verified_model_config(path: Path, item: dict) -> dict:
+def _read_verified_model_config(
+    path: Path,
+    item: dict,
+    *,
+    maximum: int = MAX_MODEL_CONFIG_BYTES,
+) -> dict:
     expected_size = item["size_bytes"]
-    if expected_size > MAX_MODEL_CONFIG_BYTES:
+    if expected_size > maximum:
         raise ModelStoreError("MODEL_STORE_MANIFEST_MISMATCH")
     descriptor = -1
     try:
@@ -1014,10 +1114,10 @@ def _read_verified_model_config(path: Path, item: dict) -> dict:
         ):
             raise ModelStoreError("MODEL_STORE_FILE_INTEGRITY_FAILED")
         payload = bytearray()
-        while len(payload) <= MAX_MODEL_CONFIG_BYTES:
+        while len(payload) <= maximum:
             block = os.read(
                 descriptor,
-                min(8192, MAX_MODEL_CONFIG_BYTES + 1 - len(payload)),
+                min(8192, maximum + 1 - len(payload)),
             )
             if not block:
                 break
@@ -1072,7 +1172,7 @@ def _read_verified_model_config(path: Path, item: dict) -> dict:
 def _validate_model_config(
     staging: Path,
     manifest: CanonicalArtifactManifest,
-    identity: CacheIdentity,
+    identity: CacheIdentity | StageCacheIdentity,
 ) -> None:
     item = next(
         entry
@@ -1100,9 +1200,12 @@ def _validate_model_config(
 
 def _expected_tree_paths(
     manifest: CanonicalArtifactManifest,
+    identity: CacheIdentity | StageCacheIdentity,
 ) -> tuple[set[str], set[str]]:
     files = {item["path"] for item in manifest.document["files"]}
     files.add(MODEL_CACHE_MARKER_FILE)
+    if type(identity) is StageCacheIdentity:
+        files.add(STAGE_CACHE_MANIFEST_FILE)
     directories: set[str] = set()
     for file_path in files:
         parts = Path(file_path).parts
@@ -1214,7 +1317,7 @@ def _scan_exact_tree(root: Path) -> tuple[set[str], set[str]]:
 def _verified_staging_bytes(
     root: Path,
     manifest: CanonicalArtifactManifest,
-    identity: CacheIdentity,
+    identity: CacheIdentity | StageCacheIdentity,
 ) -> tuple[int, int]:
     try:
         root.lstat()
@@ -1223,13 +1326,15 @@ def _verified_staging_bytes(
     except OSError as exc:
         raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
 
-    expected_files, expected_directories = _expected_tree_paths(manifest)
+    expected_files, expected_directories = _expected_tree_paths(manifest, identity)
     items = {item["path"]: item for item in manifest.document["files"]}
     parts = {_staging_part_relative(item): item for item in items.values()}
     actual_files, actual_directories = _scan_exact_tree(root)
     allowed_files = expected_files | set(parts) | {
-        DURE_MODEL_STAGING_MARKER_PART_FILE
+        DURE_MODEL_STAGING_MARKER_PART_FILE,
     }
+    if type(identity) is StageCacheIdentity:
+        allowed_files.add(DURE_STAGE_CACHE_MANIFEST_PART_FILE)
     allowed_directories = expected_directories | {
         DURE_MODEL_STAGING_WORK_DIRECTORY
     }
@@ -1278,9 +1383,25 @@ def _verified_staging_bytes(
 def _verify_cache_tree(
     root: Path,
     manifest: CanonicalArtifactManifest,
-    identity: CacheIdentity,
+    identity: CacheIdentity | StageCacheIdentity,
 ) -> None:
-    expected_files, expected_directories = _expected_tree_paths(manifest)
+    if type(identity) is StageCacheIdentity:
+        try:
+            validation = validate_materialized_stage_cache(
+                root,
+                identity,
+                require_canonical_path=False,
+            )
+        except StageCacheError as exc:
+            raise ModelStoreError("MODEL_STORE_FILE_INTEGRITY_FAILED") from exc
+        if (
+            validation.manifest_digest != manifest.digest
+            or validation.total_size_bytes != manifest.total_size_bytes
+            or validation.file_count != manifest.file_count
+        ):
+            raise ModelStoreError("MODEL_STORE_MANIFEST_MISMATCH")
+        return
+    expected_files, expected_directories = _expected_tree_paths(manifest, identity)
     actual_files, actual_directories = _scan_exact_tree(root)
     if actual_files != expected_files or actual_directories != expected_directories:
         raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
@@ -1355,7 +1476,7 @@ class ModelCachePreparer:
 
     @staticmethod
     def _journal(
-        identity: CacheIdentity,
+        identity: CacheIdentity | StageCacheIdentity,
         status: str,
         bytes_complete: int,
         failure_code: str | None = None,
@@ -1366,6 +1487,33 @@ class ModelCachePreparer:
             bytes_complete=bytes_complete,
             status=status,
             failure_code=failure_code,
+            cache_identity_digest=(
+                identity.cache_identity_digest
+                if type(identity) is StageCacheIdentity
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _storage_digest(identity: CacheIdentity | StageCacheIdentity) -> str:
+        return (
+            identity.cache_identity_digest
+            if type(identity) is StageCacheIdentity
+            else identity.manifest_digest
+        )
+
+    def _cache_path(self, identity: CacheIdentity | StageCacheIdentity) -> Path:
+        return (
+            self.store.stage_cache_path(identity)
+            if type(identity) is StageCacheIdentity
+            else self.store.model_cache_path(identity.manifest_digest)
+        )
+
+    def _staging_path(self, identity: CacheIdentity | StageCacheIdentity) -> Path:
+        return (
+            self.store.stage_staging_path(identity)
+            if type(identity) is StageCacheIdentity
+            else self.store.model_staging_path(identity.manifest_digest)
         )
 
     def _free_bytes(self, path: Path) -> int:
@@ -1394,13 +1542,16 @@ class ModelCachePreparer:
         *,
         missing_chunk_bytes: int,
         assembly_bytes: int,
+        metadata_bytes: int = 0,
     ) -> None:
+        if type(metadata_bytes) is not int or metadata_bytes < 0:
+            raise ModelStoreError("MODEL_STORE_INVALID")
         try:
             store_device = self.store.store_root.stat().st_dev
             model_device = self.store.model_root.stat().st_dev
         except OSError as exc:
             raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
-        marker_bytes = 64 * 1024
+        marker_bytes = 64 * 1024 + metadata_bytes
         if store_device == model_device:
             required = (
                 missing_chunk_bytes
@@ -1421,9 +1572,12 @@ class ModelCachePreparer:
             raise ModelStoreError("MODEL_STORE_DISK_INSUFFICIENT")
 
     def _create_directories(
-        self, staging: Path, manifest: CanonicalArtifactManifest
+        self,
+        staging: Path,
+        manifest: CanonicalArtifactManifest,
+        identity: CacheIdentity | StageCacheIdentity,
     ) -> tuple[list[Path], Path]:
-        _, expected = _expected_tree_paths(manifest)
+        _, expected = _expected_tree_paths(manifest, identity)
         directories = [staging]
         for relative in sorted(expected, key=lambda value: (value.count("/"), value)):
             path = staging / relative
@@ -1569,10 +1723,18 @@ class ModelCachePreparer:
                 os.close(descriptor)
 
     @staticmethod
-    def _write_marker(staging: Path, identity: CacheIdentity) -> None:
+    def _write_marker(
+        staging: Path,
+        identity: CacheIdentity | StageCacheIdentity,
+    ) -> None:
+        marker = (
+            build_stage_model_cache_marker(identity)
+            if type(identity) is StageCacheIdentity
+            else identity.marker()
+        )
         payload = (
             json.dumps(
-                identity.marker(),
+                marker,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -1591,7 +1753,11 @@ class ModelCachePreparer:
                 marker = read_model_cache_marker(path)
             except ModelCacheMarkerError as exc:
                 raise ModelStoreError("MODEL_STORE_TARGET_COLLISION") from exc
-            if marker.to_dict() != identity.marker():
+            if marker.to_dict() != (
+                build_stage_model_cache_marker(identity)
+                if type(identity) is StageCacheIdentity
+                else identity.marker()
+            ):
                 raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
             return
 
@@ -1666,18 +1832,121 @@ class ModelCachePreparer:
                 os.close(descriptor)
         _rename_noreplace(partial, path)
 
+    @staticmethod
+    def _write_stage_manifest_sidecar(
+        staging: Path,
+        manifest: CanonicalArtifactManifest,
+    ) -> None:
+        payload = (manifest.canonical_json + "\n").encode("utf-8")
+        path = staging / STAGE_CACHE_MANIFEST_FILE
+        partial = staging / DURE_STAGE_CACHE_MANIFEST_PART_FILE
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            observed = None
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+        if observed is not None:
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or observed.st_mode & 0o077
+                or observed.st_size != len(payload)
+            ):
+                raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
+            if _safe_regular_digest(path, len(payload)) != hashlib.sha256(
+                payload
+            ).hexdigest():
+                raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
+            return
+        try:
+            partial_state = partial.lstat()
+        except FileNotFoundError:
+            partial_state = None
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+        descriptor = -1
+        try:
+            if partial_state is None:
+                descriptor = os.open(
+                    partial,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW,
+                    0o600,
+                )
+            else:
+                descriptor = os.open(
+                    partial,
+                    os.O_RDWR | _CLOEXEC | _NOFOLLOW | _NONBLOCK,
+                )
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or opened.st_mode & 0o077
+                or opened.st_size > len(payload)
+                or (
+                    partial_state is not None
+                    and (
+                        not stat.S_ISREG(partial_state.st_mode)
+                        or opened.st_dev != partial_state.st_dev
+                        or opened.st_ino != partial_state.st_ino
+                    )
+                )
+            ):
+                raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        except ModelStoreError:
+            raise
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise ModelStoreError("MODEL_STORE_DISK_INSUFFICIENT") from exc
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        _rename_noreplace(partial, path)
+        _fsync_directory(staging)
+
     def _assemble(
         self,
         manifest: CanonicalArtifactManifest,
-        identity: CacheIdentity,
+        identity: CacheIdentity | StageCacheIdentity,
     ) -> Path:
-        staging = self.store.create_model_staging_directory(
-            identity.manifest_digest
+        staging = (
+            self.store.create_stage_staging_directory(identity)
+            if type(identity) is StageCacheIdentity
+            else self.store.create_model_staging_directory(
+                identity.manifest_digest
+            )
         )
-        directories, work = self._create_directories(staging, manifest)
+        directories, work = self._create_directories(staging, manifest, identity)
         for item in manifest.document["files"]:
             self._assemble_file(staging, work, item)
         _validate_model_config(staging, manifest, identity)
+        if type(identity) is StageCacheIdentity:
+            marker_item = next(
+                item
+                for item in manifest.document["files"]
+                if item["path"] == STAGE_MARKER_FILE
+            )
+            marker_document = _read_verified_model_config(
+                staging / STAGE_MARKER_FILE,
+                marker_item,
+                maximum=STAGE_MARKER_MAX_BYTES,
+            )
+            try:
+                validate_stage_marker_document(
+                    marker_document,
+                    identity,
+                    manifest,
+                )
+            except StageCacheError as exc:
+                raise ModelStoreError("MODEL_STORE_MANIFEST_MISMATCH") from exc
         try:
             _fsync_directory(work)
             work.rmdir()
@@ -1687,26 +1956,39 @@ class ModelCachePreparer:
             directories, key=lambda value: len(value.parts), reverse=True
         ):
             _fsync_directory(directory)
+        if type(identity) is StageCacheIdentity:
+            self._write_stage_manifest_sidecar(staging, manifest)
         self._write_marker(staging, identity)
         _fsync_directory(staging)
         return staging
 
     @staticmethod
     def _validated_manifest(
-        identity: CacheIdentity, manifest: dict
+        identity: CacheIdentity | StageCacheIdentity, manifest: dict
     ) -> CanonicalArtifactManifest:
-        if identity.cache_kind == MODEL_CACHE_KIND_STAGE:
-            raise ModelStoreError("MODEL_STORE_CACHE_KIND_UNSUPPORTED")
+        reserved = frozenset(
+            {
+                MODEL_CACHE_MARKER_FILE,
+                DURE_MODEL_STAGING_MARKER_PART_FILE,
+                DURE_MODEL_STAGING_WORK_DIRECTORY,
+                DURE_STAGE_CACHE_MANIFEST_PART_FILE,
+            }
+        )
+        if type(identity) is StageCacheIdentity:
+            try:
+                return canonical_stage_manifest(
+                    manifest,
+                    identity,
+                    reserved_paths=reserved,
+                )
+            except StageCacheError as exc:
+                raise ModelStoreError("MODEL_STORE_MANIFEST_MISMATCH") from exc
         if identity.cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT:
             raise ModelStoreError("MODEL_STORE_CACHE_KIND_UNSUPPORTED")
         try:
             parsed = parse_artifact_manifest(
                 manifest,
-                reserved_paths={
-                    MODEL_CACHE_MARKER_FILE,
-                    DURE_MODEL_STAGING_MARKER_PART_FILE,
-                    DURE_MODEL_STAGING_WORK_DIRECTORY,
-                },
+                reserved_paths=reserved,
             )
         except ValueError as exc:
             raise ModelStoreError("MODEL_STORE_MANIFEST_MISMATCH") from exc
@@ -1721,6 +2003,7 @@ class ModelCachePreparer:
                     MODEL_CACHE_MARKER_FILE,
                     DURE_MODEL_STAGING_MARKER_PART_FILE,
                     DURE_MODEL_STAGING_WORK_DIRECTORY,
+                    DURE_STAGE_CACHE_MANIFEST_PART_FILE,
                 )
             )
         ):
@@ -1734,22 +2017,24 @@ class ModelCachePreparer:
                 raise ModelStoreError("MODEL_STORE_MANIFEST_MISMATCH")
         return parsed
 
-    def prepare_full_snapshot(
+    def _prepare_cache(
         self,
         *,
-        identity: CacheIdentity,
+        identity: CacheIdentity | StageCacheIdentity,
         manifest: dict,
         origin: object,
     ) -> PreparedModelCache:
-        if type(identity) is not CacheIdentity:
-            raise ModelStoreError("MODEL_STORE_INVALID")
-        with self.store.artifact_lock(identity.manifest_digest):
+        storage_digest = self._storage_digest(identity)
+        with self.store.artifact_lock(storage_digest):
             completed_bytes = 0
             try:
                 parsed = self._validated_manifest(identity, manifest)
-                final = self.store.model_cache_path(identity.manifest_digest)
+                final = self._cache_path(identity)
                 self.store.initialize()
-                self.store.initialize_model_layout()
+                if type(identity) is StageCacheIdentity:
+                    self.store.initialize_stage_layout()
+                else:
+                    self.store.initialize_model_layout()
                 try:
                     final.lstat()
                 except FileNotFoundError:
@@ -1777,7 +2062,7 @@ class ModelCachePreparer:
                     )
 
                 staged_bytes, staged_allocation = _verified_staging_bytes(
-                    self.store.model_staging_path(identity.manifest_digest),
+                    self._staging_path(identity),
                     parsed,
                     identity,
                 )
@@ -1791,6 +2076,11 @@ class ModelCachePreparer:
                         parsed.total_size_bytes
                         - staged_bytes
                         - staged_allocation,
+                    ),
+                    metadata_bytes=(
+                        len((parsed.canonical_json + "\n").encode("utf-8"))
+                        if type(identity) is StageCacheIdentity
+                        else 0
                     ),
                 )
                 if staged_bytes != parsed.total_size_bytes:
@@ -1815,8 +2105,12 @@ class ModelCachePreparer:
                     self._journal(identity, "ACTIVATING", completed_bytes)
                 )
                 _rename_noreplace(staging, final)
-                _fsync_directory(self.store.model_root)
-                _fsync_directory(self.store.model_staging_root)
+                if type(identity) is StageCacheIdentity:
+                    _fsync_directory(self.store.stage_cache_root)
+                    _fsync_directory(self.store.stage_staging_root)
+                else:
+                    _fsync_directory(self.store.model_root)
+                    _fsync_directory(self.store.model_staging_root)
                 _verify_cache_tree(final, parsed, identity)
                 self.store.write_attempt(
                     self._journal(identity, "SUCCEEDED", completed_bytes)
@@ -1838,3 +2132,36 @@ class ModelCachePreparer:
                     )
                 )
                 raise
+
+    def prepare_full_snapshot(
+        self,
+        *,
+        identity: CacheIdentity,
+        manifest: dict,
+        origin: object,
+    ) -> PreparedModelCache:
+        if (
+            type(identity) is not CacheIdentity
+            or identity.cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT
+        ):
+            raise ModelStoreError("MODEL_STORE_CACHE_KIND_UNSUPPORTED")
+        return self._prepare_cache(
+            identity=identity,
+            manifest=manifest,
+            origin=origin,
+        )
+
+    def prepare_stage(
+        self,
+        *,
+        identity: StageCacheIdentity,
+        manifest: dict,
+        origin: object,
+    ) -> PreparedModelCache:
+        if type(identity) is not StageCacheIdentity:
+            raise ModelStoreError("MODEL_STORE_CACHE_KIND_UNSUPPORTED")
+        return self._prepare_cache(
+            identity=identity,
+            manifest=manifest,
+            origin=origin,
+        )

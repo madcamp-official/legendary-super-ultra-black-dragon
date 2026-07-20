@@ -3,6 +3,7 @@ from __future__ import annotations
 from dure.command import CommandResult
 from dure.model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_VERIFICATION_VERSION,
 )
 from dure.models import (
@@ -14,9 +15,11 @@ from dure.models import (
     NodeAssignment,
     NodeProfile,
     RuntimeProfile,
+    StageArtifactBinding,
     VLLM_RAY_PP_BACKEND,
     VLLM_RAY_PP_RUNTIME_VERSION,
 )
+from dure.stage_cache import stage_contract_identity_digest
 
 
 def profile(
@@ -147,6 +150,45 @@ def strict_pipeline_fixture():
         runtime_vllm_version=VLLM_RAY_PP_RUNTIME_VERSION,
         model_cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
     )
+    plan.validate_execution_contract()
+    return plan, head, worker
+
+
+def strict_stage_pipeline_fixture():
+    plan, head, worker = strict_pipeline_fixture()
+    head.installed_models = []
+    worker.installed_models = []
+    plan.model_cache_kind = MODEL_CACHE_KIND_STAGE
+    plan.model_path = "/var/lib/dure/models/stages"
+    source_manifest_digest = "sha256:" + "f" * 64
+    exporter_build_digest = "sha256:" + "1" * 64
+    contract_identity_digest = stage_contract_identity_digest(
+        source_manifest_digest=source_manifest_digest,
+        runtime_image=plan.image,
+        vllm_version=plan.runtime_vllm_version,
+        exporter_build_digest=exporter_build_digest,
+        architecture="Qwen2ForCausalLM",
+        quantization=plan.model.quantization,
+        tensor_parallel_size=plan.tensor_parallel_size,
+        pipeline_parallel_size=plan.pipeline_parallel_size,
+        loader_format="VLLM_SHARDED_STATE_V1",
+    )
+    plan.stage_artifact = StageArtifactBinding(
+        artifact_set_digest="sha256:" + "d" * 64,
+        contract_identity_digest=contract_identity_digest,
+        source_manifest_digest=source_manifest_digest,
+        runtime_image=plan.image,
+        vllm_version=plan.runtime_vllm_version,
+        exporter_build_digest=exporter_build_digest,
+        architecture="Qwen2ForCausalLM",
+        quantization=plan.model.quantization,
+        tensor_parallel_size=plan.tensor_parallel_size,
+        pipeline_parallel_size=plan.pipeline_parallel_size,
+        loader_format="VLLM_SHARDED_STATE_V1",
+    )
+    for rank, assignment in enumerate(plan.assignments):
+        assignment.stage_manifest_digest = "sha256:" + str(rank + 2) * 64
+        assignment.stage_tensor_keys_digest = "sha256:" + str(rank + 4) * 64
     plan.validate_execution_contract()
     return plan, head, worker
 

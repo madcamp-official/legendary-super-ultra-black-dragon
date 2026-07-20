@@ -8,11 +8,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .stage_cache import (
+    STAGE_CACHE_KIND,
+    STAGE_CACHE_VERIFICATION_VERSION,
+    StageCacheError,
+    StageCacheIdentity,
+)
+
 
 MODEL_CACHE_MARKER_FILE = ".dure-model.json"
 MODEL_CACHE_MARKER_MAX_BYTES = 64 * 1024
 MODEL_CACHE_SCHEMA_V1 = "dure-model-cache-v1"
 MODEL_CACHE_SCHEMA_V2 = "dure-model-cache-v2"
+MODEL_CACHE_SCHEMA_V3 = "dure-model-cache-v3"
 MODEL_CACHE_KIND_FULL_SNAPSHOT = "FULL_SNAPSHOT"
 MODEL_CACHE_KIND_STAGE = "STAGE"
 MODEL_CACHE_VERIFICATION_VERSION = 1
@@ -24,6 +32,24 @@ _V1_FIELDS = frozenset(
     {"schema", "repository", "revision", "manifest_digest", "quantization"}
 )
 _V2_FIELDS = _V1_FIELDS | frozenset({"cache_kind", "verification_version"})
+_V3_STAGE_FIELDS = _V2_FIELDS | frozenset(
+    {
+        "artifact_set_digest",
+        "contract_identity_digest",
+        "source_manifest_digest",
+        "runtime_image",
+        "vllm_version",
+        "exporter_build_digest",
+        "architecture",
+        "loader_format",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "pipeline_rank",
+        "tensor_rank",
+        "tensor_keys_digest",
+        "cache_identity_digest",
+    }
+)
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _REVISION = re.compile(r"[0-9a-f]{40,64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -46,6 +72,20 @@ class ModelCacheMarker:
     quantization: str
     cache_kind: str
     verification_version: int
+    artifact_set_digest: str | None = None
+    contract_identity_digest: str | None = None
+    source_manifest_digest: str | None = None
+    runtime_image: str | None = None
+    vllm_version: str | None = None
+    exporter_build_digest: str | None = None
+    architecture: str | None = None
+    loader_format: str | None = None
+    tensor_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
+    pipeline_rank: int | None = None
+    tensor_rank: int | None = None
+    tensor_keys_digest: str | None = None
+    cache_identity_digest: str | None = None
 
     def to_dict(self) -> dict[str, str | int]:
         value: dict[str, str | int] = {
@@ -58,7 +98,52 @@ class ModelCacheMarker:
         if self.schema == MODEL_CACHE_SCHEMA_V2:
             value["cache_kind"] = self.cache_kind
             value["verification_version"] = self.verification_version
+        elif self.schema == MODEL_CACHE_SCHEMA_V3:
+            value.update(
+                cache_kind=self.cache_kind,
+                verification_version=self.verification_version,
+                artifact_set_digest=self.artifact_set_digest,
+                contract_identity_digest=self.contract_identity_digest,
+                source_manifest_digest=self.source_manifest_digest,
+                runtime_image=self.runtime_image,
+                vllm_version=self.vllm_version,
+                exporter_build_digest=self.exporter_build_digest,
+                architecture=self.architecture,
+                loader_format=self.loader_format,
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                pipeline_rank=self.pipeline_rank,
+                tensor_rank=self.tensor_rank,
+                tensor_keys_digest=self.tensor_keys_digest,
+                cache_identity_digest=self.cache_identity_digest,
+            )
         return value
+
+    def stage_identity(self) -> StageCacheIdentity | None:
+        if self.schema != MODEL_CACHE_SCHEMA_V3 or self.cache_kind != STAGE_CACHE_KIND:
+            return None
+        try:
+            return StageCacheIdentity(
+                repository=self.repository,
+                revision=self.revision,
+                manifest_digest=self.manifest_digest,
+                quantization=self.quantization,
+                artifact_set_digest=self.artifact_set_digest,
+                contract_identity_digest=self.contract_identity_digest,
+                source_manifest_digest=self.source_manifest_digest,
+                runtime_image=self.runtime_image,
+                vllm_version=self.vllm_version,
+                exporter_build_digest=self.exporter_build_digest,
+                architecture=self.architecture,
+                loader_format=self.loader_format,
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                pipeline_rank=self.pipeline_rank,
+                tensor_rank=self.tensor_rank,
+                tensor_keys_digest=self.tensor_keys_digest,
+            )
+        except StageCacheError as exc:  # pragma: no cover - parser constructs it first
+            raise ModelCacheMarkerError("invalid stage cache marker identity") from exc
 
 
 def _required_string(value: Any, field: str, pattern: re.Pattern[str]) -> str:
@@ -90,10 +175,24 @@ def parse_model_cache_marker(value: Any) -> ModelCacheMarker:
             raise ModelCacheMarkerError(
                 "unsupported model cache marker verification_version"
             )
+    elif schema == MODEL_CACHE_SCHEMA_V3:
+        if set(value) != _V3_STAGE_FIELDS:
+            raise ModelCacheMarkerError("model cache v3 marker has invalid fields")
+        if value.get("cache_kind") != MODEL_CACHE_KIND_STAGE:
+            raise ModelCacheMarkerError("model cache v3 marker must describe STAGE")
+        verification_version = value.get("verification_version")
+        if (
+            type(verification_version) is not int
+            or verification_version != STAGE_CACHE_VERIFICATION_VERSION
+        ):
+            raise ModelCacheMarkerError(
+                "unsupported stage cache marker verification_version"
+            )
+        cache_kind = MODEL_CACHE_KIND_STAGE
     else:
         raise ModelCacheMarkerError("unsupported model cache marker schema")
 
-    return ModelCacheMarker(
+    marker = ModelCacheMarker(
         schema=schema,
         repository=_required_string(value.get("repository"), "repository", _REPOSITORY),
         revision=_required_string(value.get("revision"), "revision", _REVISION),
@@ -105,7 +204,32 @@ def parse_model_cache_marker(value: Any) -> ModelCacheMarker:
         ),
         cache_kind=cache_kind,
         verification_version=verification_version,
+        artifact_set_digest=value.get("artifact_set_digest"),
+        contract_identity_digest=value.get("contract_identity_digest"),
+        source_manifest_digest=value.get("source_manifest_digest"),
+        runtime_image=value.get("runtime_image"),
+        vllm_version=value.get("vllm_version"),
+        exporter_build_digest=value.get("exporter_build_digest"),
+        architecture=value.get("architecture"),
+        loader_format=value.get("loader_format"),
+        tensor_parallel_size=value.get("tensor_parallel_size"),
+        pipeline_parallel_size=value.get("pipeline_parallel_size"),
+        pipeline_rank=value.get("pipeline_rank"),
+        tensor_rank=value.get("tensor_rank"),
+        tensor_keys_digest=value.get("tensor_keys_digest"),
+        cache_identity_digest=value.get("cache_identity_digest"),
     )
+    if schema == MODEL_CACHE_SCHEMA_V3:
+        try:
+            identity = marker.stage_identity()
+        except ModelCacheMarkerError:
+            raise
+        if (
+            identity is None
+            or marker.cache_identity_digest != identity.cache_identity_digest
+        ):
+            raise ModelCacheMarkerError("stage cache marker digest is inconsistent")
+    return marker
 
 
 def decode_model_cache_marker(value: str) -> ModelCacheMarker:
@@ -215,5 +339,36 @@ def build_model_cache_marker(
         "quantization": quantization,
         "cache_kind": cache_kind,
         "verification_version": MODEL_CACHE_VERIFICATION_VERSION,
+    }
+    return parse_model_cache_marker(value).to_dict()
+
+
+def build_stage_model_cache_marker(
+    identity: StageCacheIdentity,
+) -> dict[str, str | int]:
+    if type(identity) is not StageCacheIdentity:
+        raise ModelCacheMarkerError("stage cache identity is required")
+    value: dict[str, str | int] = {
+        "schema": MODEL_CACHE_SCHEMA_V3,
+        "repository": identity.repository,
+        "revision": identity.revision,
+        "manifest_digest": identity.manifest_digest,
+        "quantization": identity.quantization,
+        "cache_kind": MODEL_CACHE_KIND_STAGE,
+        "verification_version": STAGE_CACHE_VERIFICATION_VERSION,
+        "artifact_set_digest": identity.artifact_set_digest,
+        "contract_identity_digest": identity.contract_identity_digest,
+        "source_manifest_digest": identity.source_manifest_digest,
+        "runtime_image": identity.runtime_image,
+        "vllm_version": identity.vllm_version,
+        "exporter_build_digest": identity.exporter_build_digest,
+        "architecture": identity.architecture,
+        "loader_format": identity.loader_format,
+        "tensor_parallel_size": identity.tensor_parallel_size,
+        "pipeline_parallel_size": identity.pipeline_parallel_size,
+        "pipeline_rank": identity.pipeline_rank,
+        "tensor_rank": identity.tensor_rank,
+        "tensor_keys_digest": identity.tensor_keys_digest,
+        "cache_identity_digest": identity.cache_identity_digest,
     }
     return parse_model_cache_marker(value).to_dict()

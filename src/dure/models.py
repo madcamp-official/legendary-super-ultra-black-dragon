@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .model_cache import MODEL_CACHE_KIND_FULL_SNAPSHOT
+from .model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+)
+from .stage_cache import stage_contract_identity_digest
 
 
 VLLM_RAY_PP_BACKEND = "VLLM_RAY_PP_V1"
 VLLM_RAY_PP_RUNTIME_VERSION = "0.9.0"
+VLLM_STAGE_ARCHITECTURE = "Qwen2ForCausalLM"
+VLLM_STAGE_LOADER_FORMAT = "VLLM_SHARDED_STATE_V1"
+_SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _PRIVATE_IPV4_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -101,6 +109,20 @@ class InstalledModelProfile:
     manifest_digest: str | None = None
     cache_kind: str | None = None
     verification_version: int | None = None
+    artifact_set_digest: str | None = None
+    contract_identity_digest: str | None = None
+    source_manifest_digest: str | None = None
+    runtime_image: str | None = None
+    vllm_version: str | None = None
+    exporter_build_digest: str | None = None
+    architecture: str | None = None
+    loader_format: str | None = None
+    tensor_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
+    pipeline_rank: int | None = None
+    tensor_rank: int | None = None
+    tensor_keys_digest: str | None = None
+    cache_identity_digest: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "InstalledModelProfile":
@@ -158,6 +180,26 @@ class NodeProfile:
         value = asdict(self)
         if not self.network.default_interface_addresses:
             value["network"].pop("default_interface_addresses", None)
+        stage_profile_fields = {
+            "artifact_set_digest",
+            "contract_identity_digest",
+            "source_manifest_digest",
+            "runtime_image",
+            "vllm_version",
+            "exporter_build_digest",
+            "architecture",
+            "loader_format",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "pipeline_rank",
+            "tensor_rank",
+            "tensor_keys_digest",
+            "cache_identity_digest",
+        }
+        for model in value["installed_models"]:
+            for key in stage_profile_fields:
+                if model.get(key) is None:
+                    model.pop(key, None)
         return value
 
     @classmethod
@@ -189,6 +231,86 @@ class ModelSpec:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class StageArtifactBinding:
+    """Immutable registry projection consumed by the stage-local runtime."""
+
+    artifact_set_digest: str
+    contract_identity_digest: str
+    source_manifest_digest: str
+    runtime_image: str
+    vllm_version: str
+    exporter_build_digest: str
+    architecture: str
+    quantization: str
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    loader_format: str
+
+    def validate(self) -> None:
+        digests = (
+            self.artifact_set_digest,
+            self.contract_identity_digest,
+            self.source_manifest_digest,
+            self.exporter_build_digest,
+        )
+        if any(
+            type(value) is not str or _SHA256_DIGEST.fullmatch(value) is None
+            for value in digests
+        ):
+            raise ValueError("stage artifact identity digests are invalid")
+        if (
+            type(self.runtime_image) is not str
+            or type(self.vllm_version) is not str
+            or self.architecture != VLLM_STAGE_ARCHITECTURE
+            or self.quantization != "awq"
+            or type(self.tensor_parallel_size) is not int
+            or type(self.pipeline_parallel_size) is not int
+            or self.loader_format != VLLM_STAGE_LOADER_FORMAT
+        ):
+            raise ValueError("stage artifact loader contract is invalid")
+        expected_contract_digest = stage_contract_identity_digest(
+            source_manifest_digest=self.source_manifest_digest,
+            runtime_image=self.runtime_image,
+            vllm_version=self.vllm_version,
+            exporter_build_digest=self.exporter_build_digest,
+            architecture=self.architecture,
+            quantization=self.quantization,
+            tensor_parallel_size=self.tensor_parallel_size,
+            pipeline_parallel_size=self.pipeline_parallel_size,
+            loader_format=self.loader_format,
+        )
+        if self.contract_identity_digest != expected_contract_digest:
+            raise ValueError("stage artifact contract identity digest is inconsistent")
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "StageArtifactBinding":
+        if type(value) is not dict:
+            raise ValueError("stage_artifact must be an object")
+        expected = {
+            "artifact_set_digest",
+            "contract_identity_digest",
+            "source_manifest_digest",
+            "runtime_image",
+            "vllm_version",
+            "exporter_build_digest",
+            "architecture",
+            "quantization",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "loader_format",
+        }
+        if any(type(key) is not str for key in value) or set(value) != expected:
+            raise ValueError("stage_artifact does not match the closed wire schema")
+        binding = cls(**value)
+        binding.validate()
+        return binding
+
+
 @dataclass
 class NodeAssignment:
     node_id: str
@@ -200,10 +322,17 @@ class NodeAssignment:
     role: str = "ray-worker"
     expected_runtime_rank: int | None = None
     runtime_address: str | None = None
+    stage_manifest_digest: str | None = None
+    stage_tensor_keys_digest: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
-        for key in ("expected_runtime_rank", "runtime_address"):
+        for key in (
+            "expected_runtime_rank",
+            "runtime_address",
+            "stage_manifest_digest",
+            "stage_tensor_keys_digest",
+        ):
             if value[key] is None:
                 value.pop(key)
         return value
@@ -233,6 +362,7 @@ class DeploymentPlan:
     execution_backend: str | None = None
     runtime_vllm_version: str | None = None
     model_cache_kind: str | None = None
+    stage_artifact: StageArtifactBinding | None = None
 
     @property
     def world_size(self) -> int:
@@ -245,12 +375,15 @@ class DeploymentPlan:
         strict_assignment_fields = any(
             assignment.expected_runtime_rank is not None
             or assignment.runtime_address is not None
+            or assignment.stage_manifest_digest is not None
+            or assignment.stage_tensor_keys_digest is not None
             for assignment in self.assignments
         )
         if self.execution_backend is None:
             if (
                 self.runtime_vllm_version is not None
                 or self.model_cache_kind is not None
+                or self.stage_artifact is not None
                 or strict_assignment_fields
             ):
                 raise ValueError("legacy deployment plan contains strict backend metadata")
@@ -262,10 +395,12 @@ class DeploymentPlan:
                 f"{VLLM_RAY_PP_BACKEND} requires vLLM "
                 f"{VLLM_RAY_PP_RUNTIME_VERSION}"
             )
-        if self.model_cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT:
+        if self.model_cache_kind not in {
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            MODEL_CACHE_KIND_STAGE,
+        }:
             raise ValueError(
-                f"{VLLM_RAY_PP_BACKEND} requires "
-                f"{MODEL_CACHE_KIND_FULL_SNAPSHOT} model cache"
+                f"{VLLM_RAY_PP_BACKEND} requires a supported model cache kind"
             )
         if self.model.quantization != "awq":
             raise ValueError(f"{VLLM_RAY_PP_BACKEND} requires AWQ quantization")
@@ -288,6 +423,29 @@ class DeploymentPlan:
 
         _canonical_uuid(self.ray_head_node_id, field_name="ray_head_node_id")
         expected_ranks = list(range(self.pipeline_parallel_size))
+        stage_mode = self.model_cache_kind == MODEL_CACHE_KIND_STAGE
+        if stage_mode:
+            if self.stage_artifact is None:
+                raise ValueError("STAGE pipeline requires an immutable stage artifact binding")
+            self.stage_artifact.validate()
+            if (
+                self.stage_artifact.runtime_image != self.image
+                or self.stage_artifact.vllm_version != self.runtime_vllm_version
+                or self.stage_artifact.quantization != self.model.quantization
+                or self.stage_artifact.tensor_parallel_size
+                != self.tensor_parallel_size
+                or self.stage_artifact.pipeline_parallel_size
+                != self.pipeline_parallel_size
+            ):
+                raise ValueError("stage artifact binding does not match the deployment plan")
+            if self.model_path != "/var/lib/dure/models/stages":
+                raise ValueError("STAGE model_path must be the fixed Dure stage root")
+        elif self.stage_artifact is not None or any(
+            assignment.stage_manifest_digest is not None
+            or assignment.stage_tensor_keys_digest is not None
+            for assignment in self.assignments
+        ):
+            raise ValueError("FULL_SNAPSHOT plan contains STAGE-only metadata")
         if any(type(item.rank) is not int for item in self.assignments):
             raise ValueError("assignment ranks must be integers")
         if any(type(item.pipeline_rank) is not int for item in self.assignments):
@@ -313,6 +471,13 @@ class DeploymentPlan:
             runtime_addresses.append(canonical_private_ipv4(assignment.runtime_address))
             if type(assignment.gpu_index) is not int or assignment.gpu_index < 0:
                 raise ValueError("gpu_index must be a non-negative integer")
+            if stage_mode and (
+                type(assignment.stage_manifest_digest) is not str
+                or _SHA256_DIGEST.fullmatch(assignment.stage_manifest_digest) is None
+                or type(assignment.stage_tensor_keys_digest) is not str
+                or _SHA256_DIGEST.fullmatch(assignment.stage_tensor_keys_digest) is None
+            ):
+                raise ValueError("STAGE assignment identity digests are invalid")
             if (
                 type(assignment.layer_start) is not int
                 or type(assignment.layer_end) is not int
@@ -330,6 +495,10 @@ class DeploymentPlan:
             raise ValueError("assignment node UUIDs must be unique")
         if len(runtime_addresses) != len(set(runtime_addresses)):
             raise ValueError("runtime addresses must be unique")
+        if stage_mode and len(
+            {assignment.stage_manifest_digest for assignment in self.assignments}
+        ) != len(self.assignments):
+            raise ValueError("stage manifests must be unique per pipeline rank")
         if node_ids[0] != self.ray_head_node_id:
             raise ValueError("ray_head_node_id must identify runtime rank 0")
         if self.ray_head_address != f"{runtime_addresses[0]}:6379":
@@ -341,7 +510,12 @@ class DeploymentPlan:
         self.validate_execution_contract()
         value = asdict(self)
         value["assignments"] = [item.to_dict() for item in self.assignments]
-        for key in ("execution_backend", "runtime_vllm_version", "model_cache_kind"):
+        for key in (
+            "execution_backend",
+            "runtime_vllm_version",
+            "model_cache_kind",
+            "stage_artifact",
+        ):
             if value[key] is None:
                 value.pop(key)
         value["world_size"] = self.world_size
@@ -353,6 +527,10 @@ class DeploymentPlan:
         serialized_world_size = data.pop("world_size", None)
         data["model"] = ModelSpec(**data["model"])
         data["assignments"] = [NodeAssignment.from_dict(item) for item in data["assignments"]]
+        if data.get("stage_artifact") is not None:
+            data["stage_artifact"] = StageArtifactBinding.from_dict(
+                data["stage_artifact"]
+            )
         plan = cls(**data)
         plan.validate_execution_contract()
         if (

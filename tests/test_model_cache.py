@@ -11,13 +11,16 @@ from dure.model_cache import (
     MODEL_CACHE_MARKER_MAX_BYTES,
     MODEL_CACHE_SCHEMA_V1,
     MODEL_CACHE_SCHEMA_V2,
+    MODEL_CACHE_SCHEMA_V3,
     MODEL_CACHE_VERIFICATION_VERSION,
     ModelCacheMarkerError,
     build_model_cache_marker,
+    build_stage_model_cache_marker,
     decode_model_cache_marker,
     parse_model_cache_marker,
     read_model_cache_marker,
 )
+from dure.stage_cache import StageCacheIdentity, stage_contract_identity_digest
 
 
 def marker_v1() -> dict[str, str]:
@@ -30,7 +33,78 @@ def marker_v1() -> dict[str, str]:
     }
 
 
+def stage_identity(**changes) -> StageCacheIdentity:
+    values = {
+        "repository": "Example/Model-AWQ",
+        "revision": "a" * 40,
+        "manifest_digest": "sha256:" + "b" * 64,
+        "quantization": "awq",
+        "artifact_set_digest": "sha256:" + "c" * 64,
+        "contract_identity_digest": stage_contract_identity_digest(
+            source_manifest_digest="sha256:" + "e" * 64,
+            runtime_image="registry.example/vllm@sha256:" + "f" * 64,
+            vllm_version="0.9.0",
+            exporter_build_digest="sha256:" + "1" * 64,
+            architecture="Qwen2ForCausalLM",
+            quantization="awq",
+            tensor_parallel_size=1,
+            pipeline_parallel_size=3,
+            loader_format="VLLM_SHARDED_STATE_V1",
+        ),
+        "source_manifest_digest": "sha256:" + "e" * 64,
+        "runtime_image": "registry.example/vllm@sha256:" + "f" * 64,
+        "vllm_version": "0.9.0",
+        "exporter_build_digest": "sha256:" + "1" * 64,
+        "architecture": "Qwen2ForCausalLM",
+        "loader_format": "VLLM_SHARDED_STATE_V1",
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 3,
+        "pipeline_rank": 1,
+        "tensor_rank": 0,
+        "tensor_keys_digest": "sha256:" + "2" * 64,
+    }
+    values.update(changes)
+    return StageCacheIdentity(**values)
+
+
 class ModelCacheMarkerTests(unittest.TestCase):
+    def test_v3_stage_marker_binds_the_complete_cache_identity(self):
+        identity = stage_identity()
+
+        value = build_stage_model_cache_marker(identity)
+        parsed = decode_model_cache_marker(json.dumps(value))
+
+        self.assertEqual(value["schema"], MODEL_CACHE_SCHEMA_V3)
+        self.assertEqual(value["cache_kind"], MODEL_CACHE_KIND_STAGE)
+        self.assertEqual(
+            value["cache_identity_digest"], identity.cache_identity_digest
+        )
+        self.assertEqual(parsed.stage_identity(), identity)
+        self.assertEqual(parsed.to_dict(), value)
+
+    def test_v3_stage_marker_rejects_partial_tampered_and_boolean_identity(self):
+        base = build_stage_model_cache_marker(stage_identity())
+        invalid = []
+        missing = dict(base)
+        missing.pop("source_manifest_digest")
+        invalid.append(missing)
+        tampered = dict(base)
+        tampered["pipeline_rank"] = 2
+        invalid.append(tampered)
+        boolean_rank = dict(base)
+        boolean_rank["pipeline_rank"] = True
+        invalid.append(boolean_rank)
+        extra = dict(base)
+        extra["path"] = "/tmp/model"
+        invalid.append(extra)
+        v2_shape = dict(base)
+        v2_shape["schema"] = MODEL_CACHE_SCHEMA_V2
+        invalid.append(v2_shape)
+
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ModelCacheMarkerError):
+                parse_model_cache_marker(value)
+
     def test_v1_marker_maps_to_full_snapshot_without_changing_wire_shape(self):
         value = marker_v1()
 

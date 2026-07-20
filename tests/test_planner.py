@@ -18,7 +18,7 @@ from dure.planner import (
     strict_vllm_ray_pp_order,
 )
 
-from .helpers import profile
+from .helpers import profile, strict_stage_pipeline_fixture
 
 
 class PlannerTests(unittest.TestCase):
@@ -187,6 +187,69 @@ class PlannerTests(unittest.TestCase):
             [0, 1, 2],
         )
         self.assertEqual(DeploymentPlan.from_dict(serialized).to_dict(), serialized)
+
+    def test_strict_stage_contract_round_trips_without_changing_full_wire(self):
+        plan, _head, _worker = strict_stage_pipeline_fixture()
+
+        serialized = plan.to_dict()
+
+        self.assertEqual(serialized["model_cache_kind"], "STAGE")
+        self.assertEqual(
+            serialized["model_path"], "/var/lib/dure/models/stages"
+        )
+        self.assertEqual(
+            serialized["stage_artifact"]["loader_format"],
+            "VLLM_SHARDED_STATE_V1",
+        )
+        self.assertEqual(
+            [item["stage_manifest_digest"] for item in serialized["assignments"]],
+            ["sha256:" + "2" * 64, "sha256:" + "3" * 64],
+        )
+        self.assertEqual(DeploymentPlan.from_dict(serialized).to_dict(), serialized)
+
+        full = self._strict_plan().to_dict()
+        self.assertNotIn("stage_artifact", full)
+        self.assertTrue(
+            all("stage_manifest_digest" not in item for item in full["assignments"])
+        )
+
+    def test_strict_stage_contract_rejects_open_or_mismatched_identity(self):
+        plan, _head, _worker = strict_stage_pipeline_fixture()
+        serialized = plan.to_dict()
+
+        unknown = copy.deepcopy(serialized)
+        unknown["stage_artifact"]["unexpected"] = True
+        with self.assertRaisesRegex(ValueError, "closed wire schema"):
+            DeploymentPlan.from_dict(unknown)
+
+        wrong_loader = copy.deepcopy(serialized)
+        wrong_loader["stage_artifact"]["loader_format"] = "auto"
+        with self.assertRaisesRegex(ValueError, "loader contract"):
+            DeploymentPlan.from_dict(wrong_loader)
+
+        wrong_runtime = copy.deepcopy(serialized)
+        wrong_runtime["stage_artifact"]["runtime_image"] = (
+            "registry.example/other@sha256:" + "9" * 64
+        )
+        with self.assertRaisesRegex(ValueError, "contract identity"):
+            DeploymentPlan.from_dict(wrong_runtime)
+
+        inconsistent_contract = copy.deepcopy(serialized)
+        inconsistent_contract["stage_artifact"]["source_manifest_digest"] = (
+            "sha256:" + "8" * 64
+        )
+        with self.assertRaisesRegex(ValueError, "contract identity"):
+            DeploymentPlan.from_dict(inconsistent_contract)
+
+        missing_rank = copy.deepcopy(serialized)
+        missing_rank["assignments"][1].pop("stage_manifest_digest")
+        with self.assertRaisesRegex(ValueError, "assignment identity"):
+            DeploymentPlan.from_dict(missing_rank)
+
+        user_path = copy.deepcopy(serialized)
+        user_path["model_path"] = "/tmp/operator-stage"
+        with self.assertRaisesRegex(ValueError, "fixed Dure stage root"):
+            DeploymentPlan.from_dict(user_path)
 
     def test_strict_ray_pp_contract_rejects_unknown_backend_and_public_address(self):
         unknown = self._strict_plan().to_dict()

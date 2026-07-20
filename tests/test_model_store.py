@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from dure import model_store as model_store_module
+from dure import stage_cache as stage_cache_module
 from dure.artifact_download import ArtifactChunkDownloader, TrustedHTTPSOrigin
 from dure.artifact_manifest import ArtifactManifestLimits, parse_artifact_manifest
 from dure.model_cache import (
@@ -25,6 +26,7 @@ from dure.model_cache import (
     MODEL_CACHE_SCHEMA_V2,
 )
 from dure.model_store import (
+    AttemptJournal,
     CacheIdentity,
     ContentAddressedModelStore,
     DURE_MODEL_STAGING_DIRECTORY,
@@ -34,6 +36,16 @@ from dure.model_store import (
     ModelCachePreparer,
     ModelStoreError,
     _rename_noreplace,
+)
+from dure.stage_cache import (
+    STAGE_CACHE_MANIFEST_FILE,
+    StageCacheError,
+    StageCacheIdentity,
+    canonical_stage_manifest,
+    stage_cache_path,
+    stage_contract_identity_digest,
+    validate_materialized_stage_cache,
+    validate_stage_marker_document,
 )
 from dure.probe import NodeProbe
 from tests.helpers import FakeRunner
@@ -123,6 +135,109 @@ def _objects() -> dict[str, bytes]:
         WEIGHT_BYTES[8:],
     ]
     return {_digest(value): value for value in values}
+
+
+def _tensor_digest(keys: list[str]) -> str:
+    encoded = json.dumps(
+        {"schema_version": 1, "tensor_keys": keys},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _digest(encoded)
+
+
+def _stage_fixture(
+    *,
+    pipeline_rank: int = 1,
+    artifact_set_character: str = "c",
+) -> tuple[dict, StageCacheIdentity, dict[str, bytes]]:
+    tensor_keys = [f"model.layers.{pipeline_rank}.weight"]
+    tensor_keys_digest = _tensor_digest(tensor_keys)
+    runtime_image = "registry.example/vllm@sha256:" + "f" * 64
+    contract = {
+        "schema_version": 1,
+        "source_manifest_digest": "sha256:" + "e" * 64,
+        "runtime_image": runtime_image,
+        "exporter_build_digest": "sha256:" + "1" * 64,
+        "model_family": "qwen2.5",
+        "architecture": "Qwen2ForCausalLM",
+        "quantization": "awq",
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 3,
+        "loader_format": "sharded_state",
+        "vllm_version": "0.9.0",
+        "max_part_bytes": 5 * 1024**3,
+        "trust_remote_code": False,
+        "enable_lora": False,
+        "is_moe": False,
+        "is_multimodal": False,
+    }
+    marker = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "VLLM_SHARDED_STATE_PIPELINE_STAGE",
+            "contract": contract,
+            "pipeline_rank": pipeline_rank,
+            "weight_pattern": "model-rank-0-part-*.safetensors",
+            "metadata_files": [
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            ],
+            "tensors": [
+                {
+                    "name": tensor_keys[0],
+                    "dtype": "F16",
+                    "shape": [1],
+                }
+            ],
+            "tensor_key_digest": tensor_keys_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    files = {
+        "config.json": b'{"model_type":"qwen2","quantization_config":{"quant_method":"awq"}}',
+        "tokenizer.json": b'{"version":"1.0"}',
+        "tokenizer_config.json": b'{"model_max_length":4096}',
+        "dure-stage.json": marker,
+        "model-rank-0-part-0.safetensors": b"stage-weight-" + bytes([pipeline_rank]),
+    }
+    manifest = {
+        "schema_version": 1,
+        "files": [_regular_file(path, payload) for path, payload in files.items()],
+    }
+    manifest_digest = parse_artifact_manifest(manifest).digest
+    identity = StageCacheIdentity(
+        repository="Example/Dure-Model",
+        revision="a" * 40,
+        manifest_digest=manifest_digest,
+        quantization="awq",
+        artifact_set_digest="sha256:" + artifact_set_character * 64,
+        contract_identity_digest=stage_contract_identity_digest(
+            source_manifest_digest=contract["source_manifest_digest"],
+            runtime_image=runtime_image,
+            vllm_version="0.9.0",
+            exporter_build_digest=contract["exporter_build_digest"],
+            architecture="Qwen2ForCausalLM",
+            quantization="awq",
+            tensor_parallel_size=1,
+            pipeline_parallel_size=3,
+            loader_format="VLLM_SHARDED_STATE_V1",
+        ),
+        source_manifest_digest=contract["source_manifest_digest"],
+        runtime_image=runtime_image,
+        vllm_version="0.9.0",
+        exporter_build_digest=contract["exporter_build_digest"],
+        architecture="Qwen2ForCausalLM",
+        loader_format="VLLM_SHARDED_STATE_V1",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=3,
+        pipeline_rank=pipeline_rank,
+        tensor_rank=0,
+        tensor_keys_digest=tensor_keys_digest,
+    )
+    return manifest, identity, {_digest(payload): payload for payload in files.values()}
 
 
 class MemoryResponse:
@@ -230,6 +345,250 @@ class CacheHarness:
         self.temporary.cleanup()
 
 
+class StageCachePreparationTests(unittest.TestCase):
+    def test_stage_marker_rejects_boolean_integer_and_flag_aliases(self):
+        manifest, identity, objects = _stage_fixture()
+        canonical = canonical_stage_manifest(manifest, identity)
+        marker_item = next(
+            item for item in manifest["files"] if item["path"] == "dure-stage.json"
+        )
+        marker = json.loads(objects[marker_item["sha256"]])
+        mutations = (
+            lambda value: value.__setitem__("schema_version", True),
+            lambda value: value.__setitem__("pipeline_rank", True),
+            lambda value: value["contract"].__setitem__("schema_version", True),
+            lambda value: value["contract"].__setitem__(
+                "tensor_parallel_size", True
+            ),
+            lambda value: value["contract"].__setitem__(
+                "trust_remote_code", 0
+            ),
+        )
+
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                value = copy.deepcopy(marker)
+                mutate(value)
+                with self.assertRaises(StageCacheError):
+                    validate_stage_marker_document(value, identity, canonical)
+
+    def test_runtime_stage_hashing_uses_bounded_streaming_reads(self):
+        payload = b"x" * (2 * 1024 * 1024 + 17)
+        requests: list[int] = []
+        real_read = os.read
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "stage-weight.safetensors"
+            path.write_bytes(payload)
+
+            def observed_read(descriptor: int, size: int) -> bytes:
+                requests.append(size)
+                return real_read(descriptor, size)
+
+            with patch.object(
+                stage_cache_module.os,
+                "read",
+                side_effect=observed_read,
+            ):
+                observed = stage_cache_module._safe_regular_digest(
+                    path,
+                    len(payload),
+                )
+
+        self.assertEqual(observed, _digest(payload))
+        self.assertGreaterEqual(len(requests), 3)
+        self.assertLessEqual(max(requests), 1024 * 1024)
+
+    def test_stage_materialization_is_atomic_reusable_and_runtime_verifiable(self):
+        manifest, identity, objects = _stage_fixture()
+        harness = CacheHarness(
+            manifest=manifest,
+            identity=identity,
+            objects=objects,
+        )
+        try:
+            first = harness.preparer.prepare_stage(
+                identity=identity,
+                manifest=manifest,
+                origin=ORIGIN,
+            )
+            calls_after_first = len(harness.transport.calls)
+            second = harness.preparer.prepare_stage(
+                identity=identity,
+                manifest=manifest,
+                origin=ORIGIN,
+            )
+
+            self.assertEqual(
+                first.path,
+                stage_cache_path(identity, model_root=harness.store.model_root),
+            )
+            self.assertFalse(first.reused)
+            self.assertTrue(second.reused)
+            self.assertEqual(len(harness.transport.calls), calls_after_first)
+            self.assertTrue((first.path / STAGE_CACHE_MANIFEST_FILE).is_file())
+            validation = validate_materialized_stage_cache(first.path, identity)
+            self.assertEqual(validation.manifest_digest, identity.manifest_digest)
+            self.assertEqual(validation.total_size_bytes, first.total_size_bytes)
+            self.assertEqual(validation.file_count, first.file_count)
+            journal = harness.store.read_attempt(
+                identity.cache_identity_digest,
+                manifest_digest=identity.manifest_digest,
+            )
+            self.assertEqual(journal.status, "SUCCEEDED")
+            self.assertEqual(
+                journal.cache_identity_digest, identity.cache_identity_digest
+            )
+        except ModelStoreError as exc:
+            if exc.code == "MODEL_STORE_ATOMIC_ACTIVATION_UNAVAILABLE":
+                self.skipTest("Linux renameat2(RENAME_NOREPLACE) is unavailable")
+            raise
+        finally:
+            harness.close()
+
+    def test_stage_composite_identity_separates_same_manifest_contracts(self):
+        manifest, first, objects = _stage_fixture()
+        second = replace(
+            first,
+            artifact_set_digest="sha256:" + "9" * 64,
+        )
+        harness = CacheHarness(
+            manifest=manifest,
+            identity=first,
+            objects=objects,
+        )
+        try:
+            first_result = harness.preparer.prepare_stage(
+                identity=first, manifest=manifest, origin=ORIGIN
+            )
+            second_result = harness.preparer.prepare_stage(
+                identity=second, manifest=manifest, origin=ORIGIN
+            )
+            self.assertNotEqual(first.cache_identity_digest, second.cache_identity_digest)
+            self.assertNotEqual(first_result.path, second_result.path)
+            self.assertTrue(first_result.path.is_dir())
+            self.assertTrue(second_result.path.is_dir())
+        except ModelStoreError as exc:
+            if exc.code == "MODEL_STORE_ATOMIC_ACTIVATION_UNAVAILABLE":
+                self.skipTest("Linux renameat2(RENAME_NOREPLACE) is unavailable")
+            raise
+        finally:
+            harness.close()
+
+    def test_stage_marker_contract_tampering_never_activates(self):
+        manifest, identity, objects = _stage_fixture()
+        tampered = copy.deepcopy(manifest)
+        marker_item = next(
+            item for item in tampered["files"] if item["path"] == "dure-stage.json"
+        )
+        marker = json.loads(objects[marker_item["sha256"]])
+        marker["pipeline_rank"] = 2
+        tampered_marker = json.dumps(
+            marker, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        replacement = _regular_file("dure-stage.json", tampered_marker)
+        tampered["files"] = [
+            replacement if item["path"] == "dure-stage.json" else item
+            for item in tampered["files"]
+        ]
+        tampered_identity = replace(
+            identity,
+            manifest_digest=parse_artifact_manifest(tampered).digest,
+        )
+        tampered_objects = dict(objects)
+        tampered_objects[_digest(tampered_marker)] = tampered_marker
+        harness = CacheHarness(
+            manifest=tampered,
+            identity=tampered_identity,
+            objects=tampered_objects,
+        )
+        try:
+            with self.assertRaises(ModelStoreError) as caught:
+                harness.preparer.prepare_stage(
+                    identity=tampered_identity,
+                    manifest=tampered,
+                    origin=ORIGIN,
+                )
+            self.assertEqual(caught.exception.code, "MODEL_STORE_MANIFEST_MISMATCH")
+            self.assertFalse(harness.store.stage_cache_path(tampered_identity).exists())
+        finally:
+            harness.close()
+
+    def test_stage_marker_rejects_reserved_safetensors_metadata_name(self):
+        manifest, identity, objects = _stage_fixture()
+        tampered = copy.deepcopy(manifest)
+        marker_item = next(
+            item for item in tampered["files"] if item["path"] == "dure-stage.json"
+        )
+        marker = json.loads(objects[marker_item["sha256"]])
+        marker["tensors"][0]["name"] = "__metadata__"
+        marker["tensor_key_digest"] = _tensor_digest(["__metadata__"])
+        tampered_marker = json.dumps(
+            marker, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        tampered["files"] = [
+            _regular_file("dure-stage.json", tampered_marker)
+            if item["path"] == "dure-stage.json"
+            else item
+            for item in tampered["files"]
+        ]
+        tampered_identity = replace(
+            identity,
+            manifest_digest=parse_artifact_manifest(tampered).digest,
+            tensor_keys_digest=marker["tensor_key_digest"],
+        )
+        tampered_objects = dict(objects)
+        tampered_objects[_digest(tampered_marker)] = tampered_marker
+        harness = CacheHarness(
+            manifest=tampered,
+            identity=tampered_identity,
+            objects=tampered_objects,
+        )
+        try:
+            with self.assertRaises(ModelStoreError) as caught:
+                harness.preparer.prepare_stage(
+                    identity=tampered_identity,
+                    manifest=tampered,
+                    origin=ORIGIN,
+                )
+            self.assertEqual(caught.exception.code, "MODEL_STORE_MANIFEST_MISMATCH")
+            self.assertFalse(harness.store.stage_cache_path(tampered_identity).exists())
+        finally:
+            harness.close()
+
+    def test_full_and_stage_preparers_do_not_fallback_between_cache_kinds(self):
+        manifest, identity, objects = _stage_fixture()
+        harness = CacheHarness(
+            manifest=manifest,
+            identity=identity,
+            objects=objects,
+        )
+        try:
+            with self.assertRaises(ModelStoreError) as full_rejects_stage:
+                harness.preparer.prepare_full_snapshot(
+                    identity=identity,
+                    manifest=manifest,
+                    origin=ORIGIN,
+                )
+            self.assertEqual(
+                full_rejects_stage.exception.code,
+                "MODEL_STORE_CACHE_KIND_UNSUPPORTED",
+            )
+            with self.assertRaises(ModelStoreError) as stage_rejects_full:
+                harness.preparer.prepare_stage(
+                    identity=_identity(_full_manifest()),
+                    manifest=_full_manifest(),
+                    origin=ORIGIN,
+                )
+            self.assertEqual(
+                stage_rejects_full.exception.code,
+                "MODEL_STORE_CACHE_KIND_UNSUPPORTED",
+            )
+            self.assertEqual(harness.transport.calls, [])
+        finally:
+            harness.close()
+
+
 class ArtifactManifestBoundaryTests(unittest.TestCase):
     def test_canonical_order_is_stable_for_files_and_chunks(self):
         manifest = _full_manifest()
@@ -307,6 +666,22 @@ class ArtifactManifestBoundaryTests(unittest.TestCase):
         for bounded in invalid_limits:
             with self.subTest(limits=bounded), self.assertRaises(ValueError):
                 parse_artifact_manifest(manifest, limits=bounded)
+
+
+class AttemptJournalTests(unittest.TestCase):
+    def test_schema_version_boolean_is_not_accepted_as_v1(self):
+        value = AttemptJournal(
+            manifest_digest="sha256:" + "1" * 64,
+            chunk_digest=None,
+            bytes_complete=0,
+            status="ASSEMBLING",
+        ).to_dict()
+        value["schema_version"] = True
+
+        with self.assertRaises(ModelStoreError) as caught:
+            AttemptJournal.from_dict(value)
+
+        self.assertEqual(caught.exception.code, "MODEL_STORE_JOURNAL_CORRUPT")
 
 
 class ModelStoreLockAndCASTests(unittest.TestCase):
@@ -1101,6 +1476,27 @@ class FullSnapshotPreparationTests(unittest.TestCase):
                 self.harness.identity.manifest_digest
             ).exists()
         )
+
+    def test_full_staging_rejects_stage_sidecar_partial_before_network(self):
+        self.harness.store.initialize_model_layout()
+        staging = self.harness.store.model_staging_path(
+            self.harness.identity.manifest_digest
+        )
+        staging.mkdir(mode=0o700)
+        sidecar_partial = staging / f"{STAGE_CACHE_MANIFEST_FILE}.part"
+        sidecar_partial.write_bytes(b"operator-owned")
+        sidecar_partial.chmod(0o600)
+
+        with self.assertRaises(ModelStoreError) as caught:
+            self.harness.preparer.prepare_full_snapshot(
+                identity=self.harness.identity,
+                manifest=self.harness.manifest,
+                origin=ORIGIN,
+            )
+
+        self.assertEqual(caught.exception.code, "MODEL_STORE_TARGET_COLLISION")
+        self.assertEqual(self.harness.transport.calls, [])
+        self.assertEqual(sidecar_partial.read_bytes(), b"operator-owned")
 
     def test_existing_empty_foreign_symlink_and_special_targets_are_preserved(self):
         scenarios = ["empty", "foreign", "symlink"]
