@@ -13,7 +13,7 @@
 
 | 영역 | 상태 |
 |---|---|
-| 정책 기반 Model Registry와 GPU 추가 자동 추천 | 계획됨 |
+| 정책 기반 모델 레지스트리와 GPU 추가 시 읽기 전용 추천 | 부분 구현 — 레지스트리·결정론적 미리보기 제공, 벤치마크 승격·승인 미구현 |
 | OpenAI 호환 Gateway와 최종 사용자 API key·quota | 계획됨 |
 | data parallel, 다중 GPU/노드 토폴로지 자동 선택 | 계획됨 |
 | usage meter·credit ledger·기여자 console | 계획됨 |
