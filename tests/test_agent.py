@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from dure import __version__
 from dure.agent import (
     Agent,
     BenchmarkAgentError,
@@ -17,8 +18,9 @@ from dure.agent import (
 from dure.benchmark_runtime import SafeBenchmarkRuntime
 from dure.command import CommandResult
 from dure.http import APIError
-from dure.models import InstalledModelProfile
+from dure.models import CheckResult, InstalledModelProfile
 from dure.planner import build_plan
+from dure.runtime import DEPLOYMENT_IDENTITY_FORMAT
 from dure.task import BenchmarkTaskPayload
 from tests.helpers import FakeRunner, profile
 
@@ -26,6 +28,8 @@ from tests.helpers import FakeRunner, profile
 class AgentRunner:
     def __init__(self):
         self.calls = []
+        self.containers = {}
+        self.next_container_id = 1
 
     def exists(self, executable):
         return executable in {"docker", "nvidia-smi"}
@@ -35,12 +39,75 @@ class AgentRunner:
         self.calls.append(command)
         if command[:3] == ("docker", "image", "inspect"):
             return CommandResult(command, 0, "available")
-        if command[:2] == ("docker", "inspect"):
-            return CommandResult(command, 1, stderr="not found")
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+        ):
+            reference = command[-1]
+            container = next(
+                (
+                    item
+                    for item in self.containers.values()
+                    if item["name"] == reference or item["id"] == reference
+                ),
+                None,
+            )
+            if container is None:
+                return CommandResult(command, 1, stderr="No such object")
+            labels = container["labels"]
+            value = "\t".join(
+                (
+                    container["id"],
+                    container["state"],
+                    labels.get("dure.deployment", ""),
+                    labels.get("dure.generation", ""),
+                    labels.get("dure.node", ""),
+                )
+            )
+            return CommandResult(command, 0, value)
         if command[:3] == ("docker", "ps", "-q"):
-            return CommandResult(command, 0, "owned-container")
+            filters = [
+                command[index + 1].removeprefix("label=")
+                for index, value in enumerate(command[:-1])
+                if value == "--filter" and command[index + 1].startswith("label=")
+            ]
+            matches = [
+                item["id"]
+                for item in self.containers.values()
+                if item["state"] == "running"
+                and all(
+                    item["labels"].get(key) == expected
+                    for key, expected in (item.split("=", 1) for item in filters)
+                )
+            ]
+            return CommandResult(command, 0, "\n".join(matches))
         if command[:4] == ("docker", "stop", "--time", "30"):
-            return CommandResult(command, 0, "owned-container")
+            for container_id in command[4:]:
+                if container_id in self.containers:
+                    self.containers[container_id]["state"] = "exited"
+            return CommandResult(command, 0, "\n".join(command[4:]))
+        if command[:2] == ("docker", "rm"):
+            container_id = command[-1]
+            self.containers.pop(container_id, None)
+            return CommandResult(command, 0, container_id)
+        if command[:3] == ("docker", "run", "-d"):
+            container_id = f"{self.next_container_id:064x}"
+            self.next_container_id += 1
+            name = command[command.index("--name") + 1]
+            labels = {
+                command[index + 1].split("=", 1)[0]: command[index + 1].split("=", 1)[1]
+                for index, value in enumerate(command[:-1])
+                if value == "--label"
+            }
+            self.containers[container_id] = {
+                "id": container_id,
+                "name": name,
+                "state": "running",
+                "labels": labels,
+            }
+            return CommandResult(command, 0, container_id)
         if command[:2] == ("docker", "exec") and "ray.cluster_resources" in command[-1]:
             return CommandResult(command, 0, json.dumps({"GPU": 1}))
         return CommandResult(command, 0, "ok")
@@ -220,22 +287,293 @@ class AgentTaskExecutorTests(unittest.TestCase):
             state_path = Path(temporary) / "state.json"
             plan = build_plan([node_profile], image="registry/vllm@sha256:" + "a" * 64)
             plan.model_path = str(model_path)
-            payload = {"plan": plan.to_dict(), "generation": plan.generation, "serve": False}
+            payload = {"plan": plan.to_dict(), "generation": plan.generation}
             executor = TaskExecutor(node_id, runner=runner, state_path=state_path)
             with patch("dure.probe.NodeProbe.collect", return_value=node_profile):
                 probed = executor.execute({"type": "PROBE", "payload": {}})
                 self.assertEqual(probed["profile"]["node_id"], node_id)
-                verified = executor.execute({"type": "VERIFY", "payload": payload})
-                self.assertTrue(verified["ok"])
-                applied = executor.execute({"type": "APPLY_DEPLOYMENT", "payload": payload})
+                applied = executor.execute(
+                    {
+                        "type": "APPLY_DEPLOYMENT",
+                        "deployment_id": plan.deployment_id,
+                        "payload": {**payload, "serve": False},
+                    }
+                )
                 self.assertTrue(applied["checks"])
-                stopped = executor.execute({"type": "STOP_DEPLOYMENT", "payload": payload})
+                verified = executor.execute(
+                    {
+                        "type": "VERIFY",
+                        "deployment_id": plan.deployment_id,
+                        "payload": payload,
+                    }
+                )
+                self.assertTrue(verified["ok"])
+                stopped = executor.execute(
+                    {
+                        "type": "STOP_DEPLOYMENT",
+                        "deployment_id": plan.deployment_id,
+                        "payload": payload,
+                    }
+                )
                 self.assertEqual(stopped["checks"][0]["name"], "deployment-stop")
-                restarted = executor.execute({"type": "RESTART_DEPLOYMENT", "payload": payload})
+                restarted = executor.execute(
+                    {
+                        "type": "RESTART_DEPLOYMENT",
+                        "deployment_id": plan.deployment_id,
+                        "payload": {**payload, "serve": False},
+                    }
+                )
                 self.assertTrue(restarted["checks"])
         stop_calls = [call for call in runner.calls if call[:2] == ("docker", "stop")]
         self.assertTrue(stop_calls)
         self.assertNotIn("sh", {part for call in runner.calls for part in call})
+
+    def test_verify_api_check_runs_only_on_the_assigned_ray_head(self):
+        head_id = "4ec02dee-c5f5-4466-96c5-adc754ef52b8"
+        worker_id = "4ec02dee-c5f5-4466-96c5-adc754ef52b9"
+        worker_two_id = "4ec02dee-c5f5-4466-96c5-adc754ef52ba"
+        head = profile(head_id, address="192.168.0.10")
+        worker = profile(worker_id, address="192.168.0.11")
+        worker_two = profile(worker_two_id, address="192.168.0.12")
+        plan = build_plan(
+            [head, worker, worker_two],
+            model_id="qwen2.5-72b-awq",
+            image="registry/vllm@sha256:" + "a" * 64,
+        )
+        payload = {
+            "plan": plan.to_dict(),
+            "generation": plan.generation,
+            "api": True,
+        }
+        successful = CheckResult("test", True, "ok")
+        executor = TaskExecutor(worker_id, runner=FakeRunner())
+
+        with patch("dure.probe.NodeProbe.collect", return_value=worker), patch(
+            "dure.agent.ReadinessVerifier.host_gpu", return_value=successful
+        ), patch(
+            "dure.agent.ReadinessVerifier.container_gpu", return_value=successful
+        ), patch(
+            "dure.agent.ReadinessVerifier.ray_cluster", return_value=successful
+        ), patch(
+            "dure.agent.ReadinessVerifier.api",
+            side_effect=AssertionError("worker must not probe the head API"),
+        ) as api:
+            result = executor.execute(
+                {
+                    "type": "VERIFY",
+                    "deployment_id": plan.deployment_id,
+                    "payload": payload,
+                }
+            )
+
+        self.assertTrue(result["ok"])
+        api.assert_not_called()
+
+    def test_start_handler_refuses_foreign_named_container_without_mutation(self):
+        node_id = "4ec02dee-c5f5-4466-96c5-adc754ef52b8"
+        node_profile = profile(node_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            model_path = Path(temporary) / "model"
+            model_path.mkdir()
+            (model_path / "config.json").write_text("{}", encoding="utf-8")
+            plan = build_plan(
+                [node_profile], image="registry/vllm@sha256:" + "a" * 64
+            )
+            plan.model_path = str(model_path)
+            name = f"dure-ray-{plan.deployment_id}"
+            inspect = (
+                "docker",
+                "inspect",
+                "--format",
+                DEPLOYMENT_IDENTITY_FORMAT,
+                name,
+            )
+            runner = FakeRunner(
+                responses={
+                    inspect: (
+                        0,
+                        f"foreign\texited\tother\t1\t{node_id}",
+                        "",
+                    )
+                }
+            )
+            executor = TaskExecutor(
+                node_id,
+                runner=runner,
+                state_path=Path(temporary) / "state.json",
+            )
+            payload = {
+                "plan": plan.to_dict(),
+                "generation": plan.generation,
+                "serve": False,
+            }
+
+            with patch("dure.probe.NodeProbe.collect", return_value=node_profile):
+                with self.assertRaises(RuntimeError):
+                    executor.execute(
+                        {
+                            "type": "START_DEPLOYMENT",
+                            "deployment_id": plan.deployment_id,
+                            "payload": payload,
+                        }
+                    )
+
+        self.assertFalse(any(call[:2] == ("docker", "rm") for call in runner.calls))
+        self.assertFalse(any(call[:2] == ("docker", "run") for call in runner.calls))
+
+    def test_verify_and_stop_handlers_require_exact_container_identity(self):
+        node_id = "4ec02dee-c5f5-4466-96c5-adc754ef52b8"
+        node_profile = profile(node_id)
+        plan = build_plan(
+            [node_profile], image="registry/vllm@sha256:" + "a" * 64
+        )
+        payload = {"plan": plan.to_dict(), "generation": plan.generation}
+        name = f"dure-ray-{plan.deployment_id}"
+        name_inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        listed = (
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            f"label=dure.deployment={plan.deployment_id}",
+            "--filter",
+            f"label=dure.generation={plan.generation}",
+        )
+        id_inspect = (*name_inspect[:-1], "foreign")
+        runner = FakeRunner(
+            responses={
+                name_inspect: (
+                    0,
+                    f"foreign\trunning\tother\t{plan.generation}\t{node_id}",
+                    "",
+                ),
+                listed: (0, "foreign", ""),
+                id_inspect: (
+                    0,
+                    f"foreign\trunning\tother\t{plan.generation}\t{node_id}",
+                    "",
+                ),
+            }
+        )
+        executor = TaskExecutor(node_id, runner=runner)
+
+        with patch("dure.probe.NodeProbe.collect", return_value=node_profile):
+            with self.assertRaises(RuntimeError):
+                executor.execute(
+                    {
+                        "type": "VERIFY",
+                        "deployment_id": plan.deployment_id,
+                        "payload": payload,
+                    }
+                )
+            with self.assertRaises(RuntimeError):
+                executor.execute(
+                    {
+                        "type": "STOP_DEPLOYMENT",
+                        "deployment_id": plan.deployment_id,
+                        "payload": payload,
+                    }
+                )
+
+        self.assertFalse(any(call[:2] == ("docker", "exec") for call in runner.calls))
+        self.assertFalse(any(call[:2] == ("docker", "stop") for call in runner.calls))
+
+    def test_deployment_payload_is_rejected_before_probe_or_host_mutation(self):
+        node_id = "4ec02dee-c5f5-4466-96c5-adc754ef52b8"
+        node_profile = profile(node_id)
+        plan = build_plan(
+            [node_profile], image="registry/vllm@sha256:" + "a" * 64
+        )
+        plan_value = plan.to_dict()
+        base = {"plan": plan_value, "generation": plan.generation}
+        kinds = (
+            "APPLY_DEPLOYMENT",
+            "START_DEPLOYMENT",
+            "STOP_DEPLOYMENT",
+            "RESTART_DEPLOYMENT",
+            "VERIFY",
+        )
+        cases = []
+        for kind in kinds:
+            cases.extend(
+                [
+                    (f"{kind}-missing-plan", kind, {"generation": plan.generation}),
+                    (f"{kind}-missing-generation", kind, {"plan": plan_value}),
+                ]
+            )
+        cases.extend(
+            [
+                ("apply-string-serve", "APPLY_DEPLOYMENT", {**base, "serve": "false"}),
+                ("start-string-serve", "START_DEPLOYMENT", {**base, "serve": "false"}),
+                ("stop-string-pull", "STOP_DEPLOYMENT", {**base, "pull_image": "false"}),
+                (
+                    "restart-string-download",
+                    "RESTART_DEPLOYMENT",
+                    {**base, "accept_model_download": "false"},
+                ),
+                ("verify-string-api", "VERIFY", {**base, "api": "false"}),
+                ("unexpected-command", "APPLY_DEPLOYMENT", {**base, "command": ["id"]}),
+                (
+                    "unexpected-docker-args",
+                    "START_DEPLOYMENT",
+                    {**base, "docker_args": ["--privileged"]},
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, (name, kind, payload) in enumerate(cases):
+                with self.subTest(name=name):
+                    runner = AgentRunner()
+                    state_path = Path(temporary) / f"state-{index}.json"
+                    original_state = b'{"sentinel": true}\n'
+                    state_path.write_bytes(original_state)
+                    executor = TaskExecutor(
+                        node_id,
+                        runner=runner,
+                        state_path=state_path,
+                    )
+                    task = {
+                        "type": kind,
+                        "deployment_id": plan.deployment_id,
+                        "payload": payload,
+                    }
+                    with patch(
+                        "dure.probe.NodeProbe.collect",
+                        side_effect=AssertionError("invalid payload must not probe"),
+                    ) as collect:
+                        with self.assertRaises(ValueError):
+                            executor.execute(task)
+                        collect.assert_not_called()
+                    self.assertEqual(runner.calls, [])
+                    self.assertEqual(state_path.read_bytes(), original_state)
+
+            runner = AgentRunner()
+            state_path = Path(temporary) / "state-identity.json"
+            original_state = b'{"sentinel": true}\n'
+            state_path.write_bytes(original_state)
+            executor = TaskExecutor(node_id, runner=runner, state_path=state_path)
+            with patch(
+                "dure.probe.NodeProbe.collect",
+                side_effect=AssertionError("mismatched identity must not probe"),
+            ) as collect:
+                with self.assertRaises(ValueError):
+                    executor.execute(
+                        {
+                            "type": "VERIFY",
+                            "deployment_id": "00000000-0000-4000-8000-000000000001",
+                            "payload": base,
+                        }
+                    )
+                collect.assert_not_called()
+            self.assertEqual(runner.calls, [])
+            self.assertEqual(state_path.read_bytes(), original_state)
 
     def test_arbitrary_task_type_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -645,9 +983,21 @@ class AgentBenchmarkFailureTests(unittest.TestCase):
                 for request in agent.client.requests
                 if request[1].endswith("/complete")
             ]
+            heartbeat_requests = [
+                request
+                for request in agent.client.requests
+                if request[1] == "/v1/agent/heartbeat"
+            ]
 
         self.assertEqual(len(executions), 1)
         self.assertEqual(len(complete_requests), 2)
+        self.assertEqual(len(heartbeat_requests), 2)
+        self.assertTrue(
+            all(
+                request[2]["agent_version"] == __version__
+                for request in heartbeat_requests
+            )
+        )
         self.assertEqual(
             final_history["completed"]["task-benchmark"]["status"],
             "complete",

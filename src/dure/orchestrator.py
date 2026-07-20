@@ -150,7 +150,11 @@ class InitOrchestrator:
 
         state.phase = "VERIFYING"
         self.store.save(state)
-        verifier = ReadinessVerifier(self.runner, profile.runtime.engine or "docker")
+        verifier = ReadinessVerifier(
+            self.runner,
+            profile.runtime.engine or "docker",
+            node_id=profile.node_id,
+        )
         for check in (verifier.host_gpu(profile), verifier.container_gpu(plan)):
             checks.append(check)
             if not check.ok:
@@ -165,12 +169,12 @@ class InitOrchestrator:
             self.store.save(state)
             return profile, plan, checks
 
-        if serve:
+        if serve and assignment.role == "ray-head":
             api_start = runtime.start_api(plan, assignment, replace=replace)
             checks.append(api_start)
             if not api_start.ok:
                 return self._fail(state, profile, plan, checks, api_start.detail)
-            api_ready = verifier.wait_api()
+            api_ready = verifier.wait_api(plan=plan)
             checks.append(api_ready)
             if not api_ready.ok:
                 return self._fail(state, profile, plan, checks, api_ready.detail)
