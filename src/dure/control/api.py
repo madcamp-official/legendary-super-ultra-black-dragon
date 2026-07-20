@@ -5,20 +5,34 @@ from datetime import timedelta
 from functools import partial
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dure import __version__
 
 from .db import Base, make_engine, make_session_factory, session_dependency
-from .models import Deployment, Node, NodeProfileRecord, Task, TaskType, utcnow
+from .models import (
+    Deployment,
+    ModelArtifact,
+    ModelRelease,
+    Node,
+    NodeProfileRecord,
+    PlacementProfileRecord,
+    RuntimeRelease,
+    Task,
+    TaskType,
+    utcnow,
+)
 from .service import (
     authenticate_node,
     approve_node,
     cancel_task,
     claim_enrollment,
     claim_task,
+    create_model_artifact,
+    create_model_release,
+    create_runtime_release,
     create_enrollment,
     create_tasks,
     extend_task,
@@ -29,7 +43,13 @@ from .service import (
     rotate_node_credential,
     save_deployment,
     save_heartbeat,
+    add_placement_profile,
+    transition_model_release,
 )
+
+
+class StrictBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class EnrollmentCreate(BaseModel):
@@ -76,6 +96,57 @@ class TaskFail(BaseModel):
     error: str = Field(min_length=1, max_length=8192)
 
 
+class ModelArtifactCreate(StrictBody):
+    model_id: str
+    repository: str
+    revision: str
+    manifest_digest: str
+    quantization: str
+    size_mib: int = Field(gt=0)
+    default_max_model_len: int = Field(gt=0)
+    layer_count: int = Field(gt=0)
+    license_id: str
+
+
+class RuntimeReleaseCreate(StrictBody):
+    version: str
+    image: str
+    vllm_version: str
+    cuda_version: str
+    gpu_architectures: list[str] = Field(min_length=1)
+
+
+class ModelReleaseCreate(StrictBody):
+    artifact_id: str
+    runtime_id: str
+    quality_rank: int = Field(gt=0)
+
+
+class PlacementProfileCreate(StrictBody):
+    profile_id: str
+    topology: str
+    node_count: int = Field(gt=0)
+    min_gpu_memory_mib: int = Field(gt=0)
+    min_disk_free_mib: int = Field(gt=0)
+    pipeline_parallel_size: int = Field(gt=0)
+    tensor_parallel_size: int = Field(gt=0)
+    requires_network_evidence: bool
+    requires_nccl: bool
+    min_bandwidth_mbps: int | None = None
+    max_rtt_ms: float | None = None
+    max_packet_loss_pct: float | None = None
+    max_ttft_p95_ms: float = Field(gt=0)
+    max_tpot_p95_ms: float = Field(gt=0)
+    max_e2e_p95_ms: float = Field(gt=0)
+    min_success_rate: float = Field(ge=0, le=1)
+    min_vram_headroom_pct: float = Field(ge=0, le=100)
+    min_throughput_tps: float = Field(gt=0)
+
+
+class ModelReleaseTransition(StrictBody):
+    status: str
+
+
 def _bearer(authorization: str | None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bearer authentication required")
@@ -116,6 +187,80 @@ def _node_dict(node: Node, profile: NodeProfileRecord | None = None) -> dict:
         value["profile"] = profile.profile
         value["profile_updated_at"] = profile.updated_at
     return value
+
+
+def _artifact_dict(record: ModelArtifact) -> dict:
+    return {
+        "id": record.id,
+        "model_id": record.model_id,
+        "repository": record.repository,
+        "revision": record.revision,
+        "manifest_digest": record.manifest_digest,
+        "quantization": record.quantization,
+        "size_mib": record.size_mib,
+        "default_max_model_len": record.default_max_model_len,
+        "layer_count": record.layer_count,
+        "license_id": record.license_id,
+    }
+
+
+def _runtime_release_dict(record: RuntimeRelease) -> dict:
+    return {
+        "id": record.id,
+        "version": record.version,
+        "image": record.image,
+        "vllm_version": record.vllm_version,
+        "cuda_version": record.cuda_version,
+        "gpu_architectures": record.gpu_architectures,
+    }
+
+
+def _placement_dict(record: PlacementProfileRecord) -> dict:
+    return {
+        key: getattr(record, key)
+        for key in (
+            "id",
+            "release_id",
+            "profile_id",
+            "topology",
+            "node_count",
+            "min_gpu_memory_mib",
+            "min_disk_free_mib",
+            "pipeline_parallel_size",
+            "tensor_parallel_size",
+            "requires_network_evidence",
+            "requires_nccl",
+            "min_bandwidth_mbps",
+            "max_rtt_ms",
+            "max_packet_loss_pct",
+            "max_ttft_p95_ms",
+            "max_tpot_p95_ms",
+            "max_e2e_p95_ms",
+            "min_success_rate",
+            "min_vram_headroom_pct",
+            "min_throughput_tps",
+        )
+    }
+
+
+def _model_release_dict(session: Session, release: ModelRelease) -> dict:
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    runtime = session.get(RuntimeRelease, release.runtime_id)
+    placements = list(
+        session.scalars(
+            select(PlacementProfileRecord)
+            .where(PlacementProfileRecord.release_id == release.id)
+            .order_by(PlacementProfileRecord.profile_id)
+        )
+    )
+    return {
+        "id": release.id,
+        "status": release.status,
+        "quality_rank": release.quality_rank,
+        "artifact": _artifact_dict(artifact),
+        "runtime": _runtime_release_dict(runtime),
+        "placements": [_placement_dict(item) for item in placements],
+    }
 
 
 def create_app(*, database_url: str | None = None, admin_token: str | None = None, create_schema: bool = False) -> FastAPI:
@@ -252,6 +397,80 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if credential is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
         return {"node_id": node_id, "credential": credential}
+
+    @app.post("/v1/admin/model-artifacts", dependencies=[Depends(admin_auth)])
+    def model_artifact_create(
+        body: ModelArtifactCreate, session: Session = Depends(get_session)
+    ):
+        try:
+            record = create_model_artifact(session, **body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"artifact": _artifact_dict(record)}
+
+    @app.post("/v1/admin/runtime-releases", dependencies=[Depends(admin_auth)])
+    def runtime_release_create(
+        body: RuntimeReleaseCreate, session: Session = Depends(get_session)
+    ):
+        try:
+            record = create_runtime_release(session, **body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"runtime": _runtime_release_dict(record)}
+
+    @app.post("/v1/admin/model-releases", dependencies=[Depends(admin_auth)])
+    def model_release_create(
+        body: ModelReleaseCreate, session: Session = Depends(get_session)
+    ):
+        try:
+            record = create_model_release(session, **body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"release": _model_release_dict(session, record)}
+
+    @app.get("/v1/admin/model-releases", dependencies=[Depends(admin_auth)])
+    def model_releases(session: Session = Depends(get_session)):
+        releases = session.scalars(select(ModelRelease).order_by(ModelRelease.created_at))
+        return {"releases": [_model_release_dict(session, item) for item in releases]}
+
+    @app.get("/v1/admin/model-releases/{release_id}", dependencies=[Depends(admin_auth)])
+    def model_release_detail(release_id: str, session: Session = Depends(get_session)):
+        release = session.get(ModelRelease, release_id)
+        if release is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "model release not found")
+        return {"release": _model_release_dict(session, release)}
+
+    @app.post(
+        "/v1/admin/model-releases/{release_id}/placements",
+        dependencies=[Depends(admin_auth)],
+    )
+    def model_release_placement_create(
+        release_id: str,
+        body: PlacementProfileCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record = add_placement_profile(
+                session, release_id=release_id, **body.model_dump()
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"placement": _placement_dict(record)}
+
+    @app.post(
+        "/v1/admin/model-releases/{release_id}/transition",
+        dependencies=[Depends(admin_auth)],
+    )
+    def model_release_transition(
+        release_id: str,
+        body: ModelReleaseTransition,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            release = transition_model_release(session, release_id, body.status)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"release": _model_release_dict(session, release)}
 
     @app.post("/v1/admin/deployments", dependencies=[Depends(admin_auth)])
     def deployment_create(body: DeploymentCreate, session: Session = Depends(get_session)):
