@@ -1,3 +1,10 @@
+dure (0.3.10) UNRELEASED; urgency=medium
+
+  * Add a closed, single-node GPU benchmark task and evidence collection path.
+  * Bind benchmark execution to immutable build, model, and runtime identities.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 18:11:43 +0900
+
 dure (0.3.4) stable; urgency=medium
 
   * Identify Dure HTTP requests so Cloudflare does not reject Python urllib's default signature.
