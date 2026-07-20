@@ -6,6 +6,7 @@ from dataclasses import replace
 
 from .catalog import STATIC_CATALOG
 from .models import DeploymentPlan, ModelSpec, NodeAssignment, NodeProfile
+from .selector import InventoryNode, recommend_model
 
 
 MODELS: dict[str, ModelSpec] = STATIC_CATALOG.models
@@ -70,27 +71,29 @@ def build_plan(
         raise ValueError(f"duplicate node profile(s): {', '.join(duplicates)}")
 
     healthy: list[tuple[NodeProfile, int]] = []
-    for profile in profiles:
+    for profile in sorted(profiles, key=lambda item: item.node_id):
         node_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
         if node_gpus:
             # The MVP launches one Ray container per node. Prefer the largest GPU
             # until multi-GPU-per-node assignments are implemented explicitly.
-            gpu = max(node_gpus, key=lambda item: item.memory_mib)
+            gpu = max(node_gpus, key=lambda item: (item.memory_mib, -item.index))
             healthy.append((profile, gpu.index))
 
     if not healthy:
         return None
 
     if model_id == "auto":
-        large_nodes = [item for item in healthy if _gpu_for(item[0], item[1]).memory_mib >= 22528]
-        if len(large_nodes) >= 3:
-            model = MODELS["qwen2.5-72b-awq"]
-            selected = large_nodes[:3]
-        else:
-            model = recommend_local_model(healthy[0][0])
-            if model is None:
-                return None
-            selected = [healthy[0]]
+        recommendation = recommend_model(
+            [
+                InventoryNode(profile=profile, network_verified=True)
+                for profile, _gpu_index in healthy
+            ]
+        )
+        if recommendation.selected_model_id is None:
+            return None
+        model = MODELS[recommendation.selected_model_id]
+        selected_ids = set(recommendation.selected_node_ids)
+        selected = [item for item in healthy if item[0].node_id in selected_ids]
     else:
         if model_id not in MODELS:
             raise ValueError(f"unknown model: {model_id}")
