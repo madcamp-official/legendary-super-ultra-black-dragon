@@ -30,6 +30,7 @@ class CatalogEntry:
     placement: PlacementProfile
     quality_rank: int
     artifact_revision: str | None = None
+    candidate_id: str | None = None
 
 
 @dataclass(frozen=True)
