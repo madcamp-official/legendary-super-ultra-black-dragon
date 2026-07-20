@@ -118,3 +118,109 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(completed.status_code, 200)
         detail = self.client.get(f"/v1/admin/tasks/{task['id']}", headers=self.admin).json()["task"]
         self.assertEqual(detail["status"], "SUCCEEDED")
+
+    def test_model_registry_requires_admin_and_rejects_extra_execution_fields(self):
+        artifact_body = {
+            "model_id": "qwen-test-awq",
+            "repository": "Qwen/Test-AWQ",
+            "revision": "a" * 40,
+            "manifest_digest": "sha256:" + "b" * 64,
+            "quantization": "awq",
+            "size_mib": 8192,
+            "default_max_model_len": 8192,
+            "layer_count": 32,
+            "license_id": "apache-2.0",
+        }
+        self.assertEqual(
+            self.client.post("/v1/admin/model-artifacts", json=artifact_body).status_code,
+            401,
+        )
+        unsafe = dict(artifact_body, command="id")
+        self.assertEqual(
+            self.client.post(
+                "/v1/admin/model-artifacts", headers=self.admin, json=unsafe
+            ).status_code,
+            422,
+        )
+
+    def test_model_registry_api_creates_and_transitions_release(self):
+        artifact = self.client.post(
+            "/v1/admin/model-artifacts",
+            headers=self.admin,
+            json={
+                "model_id": "qwen-test-awq",
+                "repository": "Qwen/Test-AWQ",
+                "revision": "a" * 40,
+                "manifest_digest": "sha256:" + "b" * 64,
+                "quantization": "awq",
+                "size_mib": 8192,
+                "default_max_model_len": 8192,
+                "layer_count": 32,
+                "license_id": "apache-2.0",
+            },
+        )
+        self.assertEqual(artifact.status_code, 200)
+        runtime = self.client.post(
+            "/v1/admin/runtime-releases",
+            headers=self.admin,
+            json={
+                "version": "test",
+                "image": "registry.example/vllm@sha256:" + "c" * 64,
+                "vllm_version": "0.9.0",
+                "cuda_version": "12.8",
+                "gpu_architectures": ["ampere"],
+            },
+        )
+        self.assertEqual(runtime.status_code, 200)
+        release = self.client.post(
+            "/v1/admin/model-releases",
+            headers=self.admin,
+            json={
+                "artifact_id": artifact.json()["artifact"]["id"],
+                "runtime_id": runtime.json()["runtime"]["id"],
+                "quality_rank": 10,
+            },
+        )
+        self.assertEqual(release.status_code, 200)
+        release_id = release.json()["release"]["id"]
+        placement = self.client.post(
+            f"/v1/admin/model-releases/{release_id}/placements",
+            headers=self.admin,
+            json={
+                "profile_id": "single-24g",
+                "topology": "single-gpu",
+                "node_count": 1,
+                "min_gpu_memory_mib": 24576,
+                "min_disk_free_mib": 16384,
+                "pipeline_parallel_size": 1,
+                "tensor_parallel_size": 1,
+                "requires_network_evidence": False,
+                "requires_nccl": False,
+                "min_bandwidth_mbps": None,
+                "max_rtt_ms": None,
+                "max_packet_loss_pct": None,
+                "max_ttft_p95_ms": 1000.0,
+                "max_tpot_p95_ms": 100.0,
+                "max_e2e_p95_ms": 5000.0,
+                "min_success_rate": 0.99,
+                "min_vram_headroom_pct": 10.0,
+                "min_throughput_tps": 10.0,
+            },
+        )
+        self.assertEqual(placement.status_code, 200)
+
+        validated = self.client.post(
+            f"/v1/admin/model-releases/{release_id}/transition",
+            headers=self.admin,
+            json={"status": "VALIDATED"},
+        )
+        self.assertEqual(validated.status_code, 200)
+        active = self.client.post(
+            f"/v1/admin/model-releases/{release_id}/transition",
+            headers=self.admin,
+            json={"status": "ACTIVE"},
+        )
+        self.assertEqual(active.status_code, 200)
+        self.assertEqual(active.json()["release"]["status"], "ACTIVE")
+        listed = self.client.get("/v1/admin/model-releases", headers=self.admin)
+        self.assertEqual(listed.json()["releases"][0]["placements"][0]["profile_id"], "single-24g")
