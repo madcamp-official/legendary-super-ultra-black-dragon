@@ -109,6 +109,8 @@ class ModelRelease(Base):
     runtime_id: Mapped[str] = mapped_column(ForeignKey("runtime_releases.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="DRAFT", nullable=False)
     quality_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    promotion_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    promotion_evidence_digest: Mapped[str | None] = mapped_column(String(71))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -166,6 +168,132 @@ class PlacementProfileRecord(Base):
     min_success_rate: Mapped[float] = mapped_column(Float, default=0.99, nullable=False)
     min_vram_headroom_pct: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
     min_throughput_tps: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class BenchmarkEvidence(Base):
+    __tablename__ = "benchmark_evidence"
+    __table_args__ = (
+        CheckConstraint("request_count > 0", name="ck_benchmark_request_count_positive"),
+        CheckConstraint(
+            "registration_sequence > 0",
+            name="ck_benchmark_registration_sequence_positive",
+        ),
+        CheckConstraint("duration_seconds > 0", name="ck_benchmark_duration_positive"),
+        CheckConstraint(
+            "oom_count >= 0",
+            name="ck_benchmark_oom_count_nonnegative",
+        ),
+        CheckConstraint(
+            "crash_count >= 0",
+            name="ck_benchmark_crash_count_nonnegative",
+        ),
+        CheckConstraint(
+            "restart_count >= 0",
+            name="ck_benchmark_restart_count_nonnegative",
+        ),
+        CheckConstraint("input_tokens > 0", name="ck_benchmark_input_tokens_positive"),
+        CheckConstraint("output_tokens > 0", name="ck_benchmark_output_tokens_positive"),
+        CheckConstraint("concurrency > 0", name="ck_benchmark_concurrency_positive"),
+        CheckConstraint(
+            "warmup_requests >= 0", name="ck_benchmark_warmup_nonnegative"
+        ),
+        CheckConstraint(
+            "ttft_p95_ms IS NULL OR ttft_p95_ms > 0",
+            name="ck_benchmark_ttft_positive",
+        ),
+        CheckConstraint(
+            "tpot_p95_ms IS NULL OR tpot_p95_ms > 0",
+            name="ck_benchmark_tpot_positive",
+        ),
+        CheckConstraint(
+            "e2e_p95_ms IS NULL OR e2e_p95_ms > 0",
+            name="ck_benchmark_e2e_positive",
+        ),
+        CheckConstraint(
+            "throughput_tps IS NULL OR throughput_tps > 0",
+            name="ck_benchmark_throughput_positive",
+        ),
+        CheckConstraint(
+            "success_rate >= 0 AND success_rate <= 1",
+            name="ck_benchmark_success_rate_range",
+        ),
+        CheckConstraint(
+            "vram_headroom_pct >= 0 AND vram_headroom_pct <= 100",
+            name="ck_benchmark_vram_headroom_range",
+        ),
+        CheckConstraint(
+            "quality_score >= 0 AND quality_score <= 1",
+            name="ck_benchmark_quality_score_range",
+        ),
+        CheckConstraint(
+            "network_bandwidth_mbps IS NULL OR network_bandwidth_mbps > 0",
+            name="ck_benchmark_bandwidth_positive",
+        ),
+        CheckConstraint(
+            "network_rtt_ms IS NULL OR network_rtt_ms >= 0",
+            name="ck_benchmark_rtt_nonnegative",
+        ),
+        CheckConstraint(
+            "packet_loss_pct IS NULL OR (packet_loss_pct >= 0 AND packet_loss_pct <= 100)",
+            name="ck_benchmark_packet_loss_range",
+        ),
+        CheckConstraint(
+            "status IN ('PASSED', 'FAILED')",
+            name="ck_benchmark_status",
+        ),
+        CheckConstraint(
+            "length(inventory_fingerprint) = 71 AND inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_benchmark_inventory_fingerprint_sha256",
+        ),
+        CheckConstraint(
+            "length(evidence_digest) = 71 AND evidence_digest LIKE 'sha256:%'",
+            name="ck_benchmark_evidence_digest_sha256",
+        ),
+        Index("ix_benchmark_evidence_release_id", "release_id"),
+        Index("ix_benchmark_evidence_placement_id", "placement_id"),
+        Index("ix_benchmark_evidence_status", "status"),
+        UniqueConstraint("placement_id", "registration_sequence"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    release_id: Mapped[str] = mapped_column(
+        ForeignKey("model_releases.id"), nullable=False
+    )
+    placement_id: Mapped[str] = mapped_column(
+        ForeignKey("placement_profiles.id"), nullable=False
+    )
+    registration_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    suite_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    inventory_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    artifact_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_manifest_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    runtime_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    dure_commit: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    concurrency: Mapped[int] = mapped_column(Integer, nullable=False)
+    warmup_requests: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    oom_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    crash_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    restart_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    ttft_p95_ms: Mapped[float | None] = mapped_column(Float)
+    tpot_p95_ms: Mapped[float | None] = mapped_column(Float)
+    e2e_p95_ms: Mapped[float | None] = mapped_column(Float)
+    throughput_tps: Mapped[float | None] = mapped_column(Float)
+    success_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    vram_headroom_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    quality_score: Mapped[float] = mapped_column(Float, nullable=False)
+    network_bandwidth_mbps: Mapped[float | None] = mapped_column(Float)
+    network_rtt_ms: Mapped[float | None] = mapped_column(Float)
+    packet_loss_pct: Mapped[float | None] = mapped_column(Float)
+    nccl_all_reduce_ok: Mapped[bool | None] = mapped_column(Boolean)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    failure_codes: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    evidence_digest: Mapped[str] = mapped_column(String(71), unique=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
