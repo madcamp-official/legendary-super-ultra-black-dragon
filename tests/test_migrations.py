@@ -7,12 +7,31 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.script import ScriptDirectory
-from sqlalchemy import MetaData, Table, func, inspect, select, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKeyConstraint,
+    MetaData,
+    Table,
+    Text,
+    UniqueConstraint,
+    func,
+    inspect,
+    select,
+    text,
+)
+from sqlalchemy.exc import IntegrityError
 
 from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.benchmark import register_benchmark_evidence
 from dure.control.models import (
+    ArtifactChunk,
+    ArtifactFileChunk,
+    ArtifactManifest,
+    ArtifactManifestFile,
     BenchmarkEvidence,
     BenchmarkRun,
     Deployment,
@@ -42,7 +61,14 @@ REGISTRY_TABLES = {
     "model_releases",
     "placement_profiles",
 }
+ARTIFACT_MANIFEST_TABLES = {
+    "artifact_manifests",
+    "artifact_manifest_files",
+    "artifact_chunks",
+    "artifact_file_chunks",
+}
 HEAD_TABLES = REGISTRY_TABLES | {
+    *ARTIFACT_MANIFEST_TABLES,
     "benchmark_evidence",
     "benchmark_runs",
     "deployment_operation_nodes",
@@ -107,6 +133,37 @@ TASK_OPERATION_CHECKS = {
     "ck_tasks_operation_attempt_positive",
     "ck_tasks_operation_binding",
 }
+ARTIFACT_MANIFEST_CHECKS = {
+    "ck_artifact_manifest_canonical_json_nonempty",
+    "ck_artifact_manifest_chunk_count_positive",
+    "ck_artifact_manifest_digest_sha256",
+    "ck_artifact_manifest_file_count_positive",
+    "ck_artifact_manifest_schema_version",
+    "ck_artifact_manifest_total_size_positive",
+}
+ARTIFACT_MANIFEST_FILE_CHECKS = {
+    "ck_artifact_manifest_file_digest_sha256",
+    "ck_artifact_manifest_file_id_length",
+    "ck_artifact_manifest_file_kind",
+    "ck_artifact_manifest_file_ordinal_nonnegative",
+    "ck_artifact_manifest_file_path_length",
+    "ck_artifact_manifest_file_path_relative",
+    "ck_artifact_manifest_file_size_nonnegative",
+}
+ARTIFACT_CHUNK_CHECKS = {
+    "ck_artifact_chunk_digest_sha256",
+    "ck_artifact_chunk_size_positive",
+}
+ARTIFACT_FILE_CHUNK_CHECKS = {
+    "ck_artifact_file_chunk_length_positive",
+    "ck_artifact_file_chunk_offset_nonnegative",
+    "ck_artifact_file_chunk_ordinal_nonnegative",
+}
+ARTIFACT_MANIFEST_FILE_UNIQUES = {
+    ("manifest_digest", "ordinal"),
+    ("manifest_digest", "path"),
+}
+ARTIFACT_FILE_CHUNK_UNIQUES = {("file_id", "offset_bytes")}
 
 
 def config(url: str) -> Config:
@@ -165,11 +222,325 @@ def true_0005_database(url: str) -> Config:
     return migration_config
 
 
+def true_0006_database(url: str) -> Config:
+    """Materialize released 0006 without executing revision 0007."""
+    migration_config = config(url)
+    command.upgrade(migration_config, "0006")
+    engine = make_engine(url)
+    with engine.begin() as connection:
+        for table in (
+            ArtifactFileChunk.__table__,
+            ArtifactManifestFile.__table__,
+            ArtifactChunk.__table__,
+            ArtifactManifest.__table__,
+        ):
+            table.drop(connection, checkfirst=True)
+        operations = Operations(MigrationContext.configure(connection))
+        with operations.batch_alter_table("model_artifacts") as batch:
+            batch.drop_constraint(
+                "uq_model_artifacts_id_manifest_digest",
+                type_="unique",
+            )
+    engine.dispose()
+    return migration_config
+
+
 class MigrationTests(unittest.TestCase):
+    def assert_artifact_manifest_head(self, inspector) -> None:
+        expected_columns = {
+            "artifact_manifests": {
+                "digest",
+                "schema_version",
+                "model_artifact_id",
+                "total_size_bytes",
+                "file_count",
+                "chunk_count",
+                "canonical_json",
+                "created_at",
+            },
+            "artifact_manifest_files": {
+                "id",
+                "manifest_digest",
+                "ordinal",
+                "path",
+                "kind",
+                "size_bytes",
+                "file_digest",
+                "created_at",
+            },
+            "artifact_chunks": {"digest", "size_bytes", "created_at"},
+            "artifact_file_chunks": {
+                "file_id",
+                "ordinal",
+                "chunk_digest",
+                "offset_bytes",
+                "length_bytes",
+            },
+        }
+        for table_name, columns in expected_columns.items():
+            migrated = {
+                item["name"]: item
+                for item in inspector.get_columns(table_name)
+            }
+            self.assertEqual(columns, set(migrated), table_name)
+            self.assertEqual(
+                columns,
+                set(Base.metadata.tables[table_name].columns.keys()),
+                f"Base.metadata {table_name}",
+            )
+
+        manifest_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("artifact_manifests")
+        }
+        self.assertTrue(manifest_columns["model_artifact_id"]["nullable"])
+        for name in expected_columns["artifact_manifests"] - {
+            "model_artifact_id"
+        }:
+            self.assertFalse(manifest_columns[name]["nullable"], name)
+        self.assertIsInstance(
+            manifest_columns["total_size_bytes"]["type"], BigInteger
+        )
+        self.assertIsInstance(manifest_columns["canonical_json"]["type"], Text)
+        self.assertEqual(
+            inspector.get_pk_constraint("artifact_manifests")[
+                "constrained_columns"
+            ],
+            ["digest"],
+        )
+
+        file_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("artifact_manifest_files")
+        }
+        self.assertTrue(all(not item["nullable"] for item in file_columns.values()))
+        self.assertEqual(file_columns["path"]["type"].length, 1024)
+        self.assertIsInstance(file_columns["size_bytes"]["type"], BigInteger)
+        self.assertEqual(
+            inspector.get_pk_constraint("artifact_manifest_files")[
+                "constrained_columns"
+            ],
+            ["id"],
+        )
+
+        chunk_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("artifact_chunks")
+        }
+        self.assertTrue(all(not item["nullable"] for item in chunk_columns.values()))
+        self.assertIsInstance(chunk_columns["size_bytes"]["type"], BigInteger)
+        self.assertEqual(
+            inspector.get_pk_constraint("artifact_chunks")[
+                "constrained_columns"
+            ],
+            ["digest"],
+        )
+
+        file_chunk_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("artifact_file_chunks")
+        }
+        self.assertTrue(
+            all(not item["nullable"] for item in file_chunk_columns.values())
+        )
+        self.assertIsInstance(
+            file_chunk_columns["offset_bytes"]["type"], BigInteger
+        )
+        self.assertIsInstance(
+            file_chunk_columns["length_bytes"]["type"], BigInteger
+        )
+        self.assertEqual(
+            inspector.get_pk_constraint("artifact_file_chunks")[
+                "constrained_columns"
+            ],
+            ["file_id", "ordinal"],
+        )
+
+        expected_checks = {
+            "artifact_manifests": ARTIFACT_MANIFEST_CHECKS,
+            "artifact_manifest_files": ARTIFACT_MANIFEST_FILE_CHECKS,
+            "artifact_chunks": ARTIFACT_CHUNK_CHECKS,
+            "artifact_file_chunks": ARTIFACT_FILE_CHUNK_CHECKS,
+        }
+        for table_name, checks in expected_checks.items():
+            self.assertEqual(
+                checks,
+                {
+                    item["name"]
+                    for item in inspector.get_check_constraints(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                checks,
+                {
+                    constraint.name
+                    for constraint in Base.metadata.tables[
+                        table_name
+                    ].constraints
+                    if isinstance(constraint, CheckConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+
+        expected_unique_columns = {
+            "artifact_manifest_files": ARTIFACT_MANIFEST_FILE_UNIQUES,
+            "artifact_file_chunks": ARTIFACT_FILE_CHUNK_UNIQUES,
+        }
+        expected_unique_names = {
+            "artifact_manifest_files": {
+                ("manifest_digest", "ordinal"): (
+                    "uq_artifact_manifest_files_manifest_ordinal"
+                ),
+                ("manifest_digest", "path"): (
+                    "uq_artifact_manifest_files_manifest_path"
+                ),
+            },
+            "artifact_file_chunks": {
+                ("file_id", "offset_bytes"): (
+                    "uq_artifact_file_chunks_file_offset"
+                )
+            },
+        }
+        for table_name, uniques in expected_unique_columns.items():
+            migrated_uniques = {
+                tuple(item["column_names"]): item["name"]
+                for item in inspector.get_unique_constraints(table_name)
+            }
+            self.assertEqual(
+                uniques,
+                set(migrated_uniques),
+                table_name,
+            )
+            self.assertEqual(
+                expected_unique_names[table_name],
+                migrated_uniques,
+                table_name,
+            )
+            metadata_uniques = {
+                tuple(column.name for column in constraint.columns): (
+                    constraint.name
+                )
+                for constraint in Base.metadata.tables[
+                    table_name
+                ].constraints
+                if isinstance(constraint, UniqueConstraint)
+            }
+            self.assertEqual(
+                uniques,
+                set(metadata_uniques),
+                f"Base.metadata {table_name}",
+            )
+            self.assertEqual(
+                expected_unique_names[table_name],
+                metadata_uniques,
+                f"Base.metadata {table_name}",
+            )
+
+        expected_indexes = {
+            "artifact_manifests": {
+                "ix_artifact_manifests_model_artifact_id"
+            },
+            "artifact_manifest_files": {
+                "ix_artifact_manifest_files_manifest_digest"
+            },
+            "artifact_file_chunks": {
+                "ix_artifact_file_chunks_chunk_digest"
+            },
+        }
+        for table_name, indexes in expected_indexes.items():
+            self.assertEqual(
+                indexes,
+                {
+                    item["name"]
+                    for item in inspector.get_indexes(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                indexes,
+                {
+                    index.name
+                    for index in Base.metadata.tables[table_name].indexes
+                },
+                f"Base.metadata {table_name}",
+            )
+
+        expected_foreign_keys = {
+            "artifact_manifests": {
+                "fk_artifact_manifests_model_artifact_identity": (
+                    ("model_artifact_id", "digest"),
+                    "model_artifacts",
+                    ("id", "manifest_digest"),
+                )
+            },
+            "artifact_manifest_files": {
+                "fk_artifact_manifest_files_manifest_digest": (
+                    ("manifest_digest",),
+                    "artifact_manifests",
+                    ("digest",),
+                )
+            },
+            "artifact_file_chunks": {
+                "fk_artifact_file_chunks_file_id": (
+                    ("file_id",),
+                    "artifact_manifest_files",
+                    ("id",),
+                ),
+                "fk_artifact_file_chunks_chunk_digest": (
+                    ("chunk_digest",),
+                    "artifact_chunks",
+                    ("digest",),
+                ),
+            },
+        }
+        for table_name, expected in expected_foreign_keys.items():
+            self.assertEqual(
+                expected,
+                {
+                    item["name"]: (
+                        tuple(item["constrained_columns"]),
+                        item["referred_table"],
+                        tuple(item["referred_columns"]),
+                    )
+                    for item in inspector.get_foreign_keys(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                set(expected),
+                {
+                    constraint.name
+                    for constraint in Base.metadata.tables[
+                        table_name
+                    ].constraints
+                    if isinstance(constraint, ForeignKeyConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+
+        model_artifact_uniques = {
+            tuple(item["column_names"]): item["name"]
+            for item in inspector.get_unique_constraints("model_artifacts")
+        }
+        self.assertEqual(
+            model_artifact_uniques[("id", "manifest_digest")],
+            "uq_model_artifacts_id_manifest_digest",
+        )
+        self.assertIn(
+            "uq_model_artifacts_id_manifest_digest",
+            {
+                constraint.name
+                for constraint in ModelArtifact.__table__.constraints
+                if isinstance(constraint, UniqueConstraint)
+            },
+        )
+
     def assert_benchmark_head(self, url: str) -> None:
         engine = make_engine(url)
         inspector = inspect(engine)
         self.assertTrue(HEAD_TABLES <= set(inspector.get_table_names()))
+        self.assert_artifact_manifest_head(inspector)
         self.assertEqual(
             BENCHMARK_INDEXES,
             {item["name"] for item in inspector.get_indexes("benchmark_evidence")},
@@ -559,12 +930,12 @@ class MigrationTests(unittest.TestCase):
         )
         engine.dispose()
 
-    def test_migration_history_has_single_0006_head(self):
+    def test_migration_history_has_single_0007_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0006"])
+            self.assertEqual(heads, ["0007"])
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -574,12 +945,247 @@ class MigrationTests(unittest.TestCase):
 
             self.assert_benchmark_head(url)
 
+    def test_true_0006_upgrade_and_empty_round_trip_preserve_legacy_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'artifact-upgrade.db'}"
+            migration_config = true_0006_database(url)
+            engine = make_engine(url)
+            inspector = inspect(engine)
+            self.assertFalse(
+                ARTIFACT_MANIFEST_TABLES & set(inspector.get_table_names())
+            )
+            self.assertNotIn(
+                "uq_model_artifacts_id_manifest_digest",
+                {
+                    item["name"]
+                    for item in inspector.get_unique_constraints(
+                        "model_artifacts"
+                    )
+                },
+            )
+            factory = make_session_factory(engine)
+            manifest_digest = "sha256:" + "7" * 64
+            with factory() as session:
+                artifact = ModelArtifact(
+                    model_id="legacy-artifact",
+                    repository="Example/LegacyArtifact",
+                    revision="a" * 40,
+                    manifest_digest=manifest_digest,
+                    quantization="awq",
+                    size_mib=1,
+                    default_max_model_len=1,
+                    layer_count=1,
+                    license_id="apache-2.0",
+                )
+                session.add(artifact)
+                session.commit()
+                artifact_id = artifact.id
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                preserved = session.get(ModelArtifact, artifact_id)
+                self.assertEqual(preserved.manifest_digest, manifest_digest)
+                self.assertEqual(
+                    session.scalar(
+                        select(func.count()).select_from(ArtifactManifest)
+                    ),
+                    0,
+                )
+            engine.dispose()
+
+            command.downgrade(migration_config, "0006")
+
+            engine = make_engine(url)
+            inspector = inspect(engine)
+            self.assertFalse(
+                ARTIFACT_MANIFEST_TABLES & set(inspector.get_table_names())
+            )
+            factory = make_session_factory(engine)
+            with factory() as session:
+                preserved = session.get(ModelArtifact, artifact_id)
+                self.assertEqual(preserved.manifest_digest, manifest_digest)
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                preserved = session.get(ModelArtifact, artifact_id)
+                self.assertEqual(preserved.manifest_digest, manifest_digest)
+                self.assertEqual(
+                    session.scalar(
+                        select(func.count()).select_from(ArtifactManifest)
+                    ),
+                    0,
+                )
+            engine.dispose()
+
+    def test_0007_composite_identity_rejects_mismatch_but_allows_generic_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'artifact-identity.db'}"
+            command.upgrade(config(url), "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            source_digest = "sha256:" + "8" * 64
+            with factory() as session:
+                artifact = ModelArtifact(
+                    model_id="identity-artifact",
+                    repository="Example/IdentityArtifact",
+                    revision="b" * 40,
+                    manifest_digest=source_digest,
+                    quantization="awq",
+                    size_mib=1,
+                    default_max_model_len=1,
+                    layer_count=1,
+                    license_id="apache-2.0",
+                )
+                session.add(artifact)
+                session.commit()
+                artifact_id = artifact.id
+
+            mismatched_digest = "sha256:" + "9" * 64
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.exec_driver_sql(
+                        "PRAGMA foreign_keys"
+                    ).scalar_one(),
+                    1,
+                )
+                with self.assertRaises(IntegrityError):
+                    connection.execute(
+                        ArtifactManifest.__table__.insert().values(
+                            digest=mismatched_digest,
+                            schema_version=1,
+                            model_artifact_id=artifact_id,
+                            total_size_bytes=1,
+                            file_count=1,
+                            chunk_count=1,
+                            canonical_json="{}",
+                            created_at=utcnow(),
+                        )
+                    )
+                connection.rollback()
+
+            generic_digest = "sha256:" + "a" * 64
+            with factory() as session:
+                session.add(
+                    ArtifactManifest(
+                        digest=generic_digest,
+                        schema_version=1,
+                        model_artifact_id=None,
+                        total_size_bytes=1,
+                        file_count=1,
+                        chunk_count=1,
+                        canonical_json="{}",
+                    )
+                )
+                session.commit()
+                self.assertIsNotNone(
+                    session.get(ArtifactManifest, generic_digest)
+                )
+            engine.dispose()
+
+    def test_0007_downgrade_rejects_registered_manifest_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'artifact-downgrade.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            manifest_digest = "sha256:" + "b" * 64
+            chunk_digest = "sha256:" + "c" * 64
+            file_digest = "sha256:" + "d" * 64
+            with factory() as session:
+                artifact = ModelArtifact(
+                    model_id="downgrade-artifact",
+                    repository="Example/DowngradeArtifact",
+                    revision="c" * 40,
+                    manifest_digest=manifest_digest,
+                    quantization="awq",
+                    size_mib=1,
+                    default_max_model_len=1,
+                    layer_count=1,
+                    license_id="apache-2.0",
+                )
+                session.add(artifact)
+                session.flush()
+                session.add(
+                    ArtifactManifest(
+                        digest=manifest_digest,
+                        schema_version=1,
+                        model_artifact_id=artifact.id,
+                        total_size_bytes=16,
+                        file_count=1,
+                        chunk_count=1,
+                        canonical_json="{}",
+                    )
+                )
+                session.add(ArtifactChunk(digest=chunk_digest, size_bytes=16))
+                session.flush()
+                manifest_file = ArtifactManifestFile(
+                    manifest_digest=manifest_digest,
+                    ordinal=0,
+                    path="weights/model.safetensors",
+                    kind="REGULAR",
+                    size_bytes=16,
+                    file_digest=file_digest,
+                )
+                session.add(manifest_file)
+                session.flush()
+                session.add(
+                    ArtifactFileChunk(
+                        file_id=manifest_file.id,
+                        ordinal=0,
+                        chunk_digest=chunk_digest,
+                        offset_bytes=0,
+                        length_bytes=16,
+                    )
+                )
+                session.commit()
+            engine.dispose()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "artifact manifest data exists",
+            ):
+                command.downgrade(migration_config, "0006")
+
+            engine = make_engine(url)
+            self.assertTrue(
+                ARTIFACT_MANIFEST_TABLES <= set(inspect(engine).get_table_names())
+            )
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.scalar(text("SELECT version_num FROM alembic_version")),
+                    "0007",
+                )
+                for table_name in ARTIFACT_MANIFEST_TABLES:
+                    self.assertEqual(
+                        connection.scalar(
+                            text(f"SELECT COUNT(*) FROM {table_name}")
+                        ),
+                        1,
+                        table_name,
+                    )
+            engine.dispose()
+
     def test_legacy_0001_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'legacy.db'}"
             engine = make_engine(url)
             Base.metadata.create_all(engine)
             for table in (
+                ArtifactFileChunk.__table__,
+                ArtifactManifestFile.__table__,
+                ArtifactChunk.__table__,
+                ArtifactManifest.__table__,
                 DeploymentOperationNode.__table__,
                 DeploymentOperation.__table__,
                 BenchmarkRun.__table__,
@@ -1187,6 +1793,7 @@ class MigrationTests(unittest.TestCase):
                         inventory_snapshot=[],
                     )
                 )
+                session.flush()
                 session.add(
                     Deployment(
                         id=deployment_id,
