@@ -1,3 +1,10 @@
+dure (0.3.9) UNRELEASED; urgency=medium
+
+  * 모델 릴리스의 성능·안정성 벤치마크 증적과 영속 모델을 추가합니다.
+  * SLO, OCI 다이제스트 및 증적 조건을 모두 통과해야 ACTIVE로 승격하도록 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:30:00 +0900
+
 dure (0.3.4) stable; urgency=medium
 
   * Identify Dure HTTP requests so Cloudflare does not reject Python urllib's default signature.
