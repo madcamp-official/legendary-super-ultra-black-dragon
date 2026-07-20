@@ -28,6 +28,10 @@ POLICY_VERSION = "central-quality-within-slo-v1"
 PROFILE_MAX_AGE = timedelta(seconds=90)
 
 
+class RecommendationNodeNotFoundError(ValueError):
+    pass
+
+
 def _content_digest(value: Any) -> str:
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -139,6 +143,7 @@ def _active_catalog(
                 quality_rank=release.quality_rank,
                 artifact_revision=artifact.revision,
                 candidate_id=candidate_id,
+                gpu_architectures=tuple(sorted(runtime.gpu_architectures)),
             )
         )
 
@@ -176,7 +181,9 @@ def _inventory_nodes(
         found = {node.id for node, _ in rows}
         missing = sorted(set(node_ids) - found)
         if missing:
-            raise ValueError(f"unknown node(s): {', '.join(missing)}")
+            raise RecommendationNodeNotFoundError(
+                f"unknown node(s): {', '.join(missing)}"
+            )
     else:
         rows = [
             (node, record)
@@ -184,29 +191,34 @@ def _inventory_nodes(
             if node.approved and node_status(node.last_seen, now) == "online"
         ]
 
-    missing_profiles = sorted(node.id for node, record in rows if record is None)
-    if missing_profiles:
-        raise ValueError(
-            f"stored profile is missing for node(s): {', '.join(missing_profiles)}"
-        )
-
     inventory: list[InventoryNode] = []
     for node, record in rows:
-        try:
-            profile = NodeProfile.from_dict(record.profile)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"invalid stored profile for node: {node.id}") from exc
-        profile_age = now - aware(record.updated_at)
+        profile: NodeProfile | None = None
+        profile_error: str | None = None
+        profile_fresh = False
+        if record is None:
+            profile_error = "missing"
+        else:
+            try:
+                profile = NodeProfile.from_dict(record.profile)
+                # Central assignments and fingerprints use the server-issued UUID.
+                profile.node_id = node.id
+                profile_age = now - aware(record.updated_at)
+                profile_fresh = timedelta(0) <= profile_age <= PROFILE_MAX_AGE
+            except (KeyError, TypeError, ValueError):
+                profile = None
+                profile_error = "invalid"
         inventory.append(
             InventoryNode(
                 node_id=node.id,
                 profile=profile,
                 approved=node.approved,
                 online=node_status(node.last_seen, now) == "online",
-                profile_fresh=timedelta(0) <= profile_age <= PROFILE_MAX_AGE,
+                profile_fresh=profile_fresh,
                 # Network/NCCL evidence is introduced by the benchmark evidence PR.
                 # Until then every central multi-node recommendation fails closed.
                 network_verified=False,
+                profile_error=profile_error,
             )
         )
     return inventory
@@ -224,13 +236,14 @@ def recommend_deployment(
     if objective != "quality-first":
         raise ValueError("unsupported recommendation objective")
     evaluated_at = now or utcnow()
-    inventory = _inventory_nodes(
-        session,
-        node_ids=node_ids,
-        all_online=all_online,
-        now=evaluated_at,
-    )
-    catalog, contexts = _active_catalog(session)
+    with session.no_autoflush:
+        inventory = _inventory_nodes(
+            session,
+            node_ids=node_ids,
+            all_online=all_online,
+            now=evaluated_at,
+        )
+        catalog, contexts = _active_catalog(session)
     result = recommend_model(inventory, catalog=catalog)
 
     candidates: list[dict[str, Any]] = []
@@ -261,5 +274,16 @@ def recommend_deployment(
         "inventory_fingerprint": result.inventory_fingerprint,
         "selected": selected,
         "candidates": candidates,
+        "rejections": (
+            []
+            if candidates
+            else [
+                {
+                    "code": "NO_ACTIVE_CANDIDATE",
+                    "detail": "no ACTIVE model release with a placement profile",
+                    "node_ids": [],
+                }
+            ]
+        ),
     }
     return {"recommendation": {"id": _content_digest(core), **core}}
