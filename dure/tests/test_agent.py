@@ -238,7 +238,7 @@ def benchmark_payload(node_profile=None):
         "release_id": "33333333-3333-4333-8333-333333333333",
         "placement_id": "44444444-4444-4444-8444-444444444444",
         "suite_id": "dure-serving-slo-v1",
-        "policy_version": "benchmark-gate-v1",
+        "policy_version": "benchmark-gate-v2",
         "dure_commit": BENCHMARK_DURE_COMMIT,
         "model_id": "qwen-test-awq",
         "model_repository": "Qwen/Test-AWQ",

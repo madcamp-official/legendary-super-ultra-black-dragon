@@ -11,7 +11,7 @@ from typing import Any
 
 
 BENCHMARK_SUITE_ID = "dure-serving-slo-v1"
-BENCHMARK_POLICY_VERSION = "benchmark-gate-v1"
+BENCHMARK_POLICY_VERSION = "benchmark-gate-v2"
 BENCHMARK_WORKLOAD_IDS = frozenset(
     {
         "short-chat-1k-128",

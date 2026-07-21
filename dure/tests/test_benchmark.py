@@ -528,7 +528,7 @@ class BenchmarkServiceTests(unittest.TestCase):
             self.assertTrue(
                 {
                     "WARMUP_COUNT",
-                    "MEASUREMENT_WINDOW",
+                    "MEASURED_REQUEST_COUNT",
                     "PROCESS_CRASH",
                     "RUNTIME_RESTART",
                     "TTFT_SLO",
@@ -541,6 +541,50 @@ class BenchmarkServiceTests(unittest.TestCase):
                 }
                 <= set(evidence.failure_codes)
             )
+
+    def test_measurement_duration_does_not_replace_required_request_count(self):
+        with self.factory() as session:
+            node = _node(session, "request-count")
+            artifact, runtime, release, placements = _release(
+                session, "request-count"
+            )
+            body = _evidence_body(
+                session,
+                artifact,
+                runtime,
+                release,
+                placements[0],
+                [node],
+                request_count=199,
+                duration_seconds=3600.0,
+            )
+
+            evidence = register_benchmark_evidence(session, **body)
+
+            self.assertEqual(evidence.status, "FAILED")
+            self.assertIn("MEASURED_REQUEST_COUNT", evidence.failure_codes)
+
+    def test_required_request_count_passes_without_minimum_duration(self):
+        with self.factory() as session:
+            node = _node(session, "short-duration")
+            artifact, runtime, release, placements = _release(
+                session, "short-duration"
+            )
+            body = _evidence_body(
+                session,
+                artifact,
+                runtime,
+                release,
+                placements[0],
+                [node],
+                request_count=200,
+                duration_seconds=1.0,
+            )
+
+            evidence = register_benchmark_evidence(session, **body)
+
+            self.assertEqual(evidence.status, "PASSED")
+            self.assertNotIn("MEASURED_REQUEST_COUNT", evidence.failure_codes)
 
     def test_legacy_full_profile_fingerprint_remains_eligible(self):
         with self.factory() as session:
