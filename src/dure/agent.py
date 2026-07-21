@@ -17,6 +17,10 @@ from typing import Protocol
 from . import __version__
 from .command import SubprocessRunner
 from .http import APIError, JSONClient
+from .model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_VERIFICATION_VERSION,
+)
 from .models import DeploymentPlan, InstalledModelProfile, NodeProfile
 from .orchestrator import InitOrchestrator
 from .probe import DURE_MODEL_ROOT, NodeProbe
@@ -130,7 +134,10 @@ def _exact_cached_model(
             or not model.path
             or model.model_id != payload.model_repository
             or model.revision != payload.artifact_revision
+            or model.manifest_digest != payload.artifact_manifest_digest
             or model.quantization != payload.quantization
+            or model.cache_kind != MODEL_CACHE_KIND_FULL_SNAPSHOT
+            or model.verification_version != MODEL_CACHE_VERIFICATION_VERSION
         ):
             continue
         candidate = Path(model.path)
@@ -146,7 +153,7 @@ def _exact_cached_model(
     if len(matches) != 1:
         raise BenchmarkAgentError(
             "BENCHMARK requires exactly one complete local cache matching repository, "
-            "revision, and quantization",
+            "revision, manifest, quantization, and FULL_SNAPSHOT cache kind",
             failure_code="BENCHMARK_ARTIFACT_UNAVAILABLE",
         )
     return matches[0]

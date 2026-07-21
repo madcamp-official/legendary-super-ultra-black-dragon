@@ -140,6 +140,31 @@ dure admin verify <deployment-id> --nodes <ray-head-node-id> --api
 
 모든 경로는 관리자 전달자 인증을 요구합니다. 모델 리비전, 매니페스트, 런타임 이미지가 고정되지 않으면 등록할 수 없고, 허용 목록 밖의 Docker 인자·환경 변수·마운트·호스트 경로는 요청 단계에서 거부됩니다. 레지스트리 등록이나 상태 전이만으로 에이전트 작업 또는 호스트 변경이 발생하지 않습니다.
 
+## 로컬 모델 캐시 준비와 실패 복구
+
+`0.3.15`는 정규 매니페스트를 받아 노드 내부의 검증된 `FULL_SNAPSHOT` 캐시를 만드는 라이브러리를 제공합니다. 현재 작업 열거형에는 `PREPARE_MODEL`과 `PREPARE_IMAGE`가 없고 공개·관리자 준비 API·CLI도 없습니다. 따라서 `recommend`, `accept`, `deployment apply`, rollback과 `benchmark-runs/prepare`는 이 준비기를 호출하지 않습니다. 벤치마크의 prepare는 모델 바이트가 아니라 DB 실행 문맥만 준비하며, 제어면의 노드 등록·추천·수락 자체는 모델 다운로드나 모델 캐시 디렉터리 변경을 일으키지 않습니다. 패키지 설치는 별도로 `/var/lib/dure`의 상태 디렉터리와 권한을 준비합니다. 중앙 연결은 다음 PR에서만 추가합니다.
+
+준비기가 연결되면 사용할 고정 경계는 다음과 같습니다.
+
+- 청크 CAS·잠금·시도 저널: `/var/lib/dure/model-store`
+- 활성 모델과 숨은 조립 영역: `/var/lib/dure/models`
+- 원본: 현재 내부 API가 직접 받는 검증된 `TrustedHTTPSOrigin` 객체. 노드 설정에서 만드는 production 연결은 다음 PR 범위
+- 지원 cache kind: `FULL_SNAPSHOT`만 해당. `STAGE`는 명시적으로 거부
+
+정상 실행은 디스크 사전 검사, 청크 다운로드·전체 digest 검사, 파일 조립·전체 파일 해시 검사, `config.json` 양자화 일치, exact-tree 검사, marker-last 기록과 no-replace 활성화 순서로 진행합니다. 같은 digest의 검증된 청크·완성 파일·final은 다시 검사한 뒤 재사용합니다. `MODEL_STORE_DOWNLOAD_TIMEOUT`과 응답 body 중단, 파일·marker 조립 중단은 결정적 부분 파일에서 이어가지만, non-timeout DNS·TLS·connect 거부와 응답 계약·digest 오류는 청크 `.part`를 0바이트로 되돌리고 재시도합니다.
+
+저장소와 저널 경계가 정상이라면 실패 코드는 `/var/lib/dure/model-store/attempts/<manifesthex>/journal.json`의 폐쇄형 로컬 마지막 상태로 남고 URL, credential, 원격 오류 본문과 예외 원문은 남기지 않습니다. 루트·권한·저널 I/O 자체가 실패하면 실패 상태도 기록하지 못할 수 있습니다. 이 저널은 중앙 operation 진행률, `READY` 증적이나 자동 경보가 아닙니다. 운영자는 다음 원칙으로 대응합니다.
+
+1. `MODEL_STORE_DOWNLOAD_TIMEOUT`이나 body read·조립 중단이면 제한 재시도가 끝났는지 확인하고 같은 요청을 재시도합니다. 새 staging이 계속 생기지 않고 같은 digest 영역을 사용해야 합니다. `MODEL_STORE_DOWNLOAD_REJECTED`나 digest 불일치는 청크 부분 파일을 보존 재개하지 않고 0바이트부터 다시 받습니다.
+2. `MODEL_STORE_DISK_INSUFFICIENT`이면 모델 전체 조립본, 없는 고유 청크와 기본 여유 공간을 합친 용량을 확보합니다. 기존 검증 부분의 실제 할당량은 재시도 계산에 반영됩니다. 사전 검사는 공간 예약이 아니므로 외부·동시 소비로 쓰기 중 `ENOSPC`가 날 수 있습니다. 이때 유효 marker와 final은 게시하지 않고 결정적 부분 파일만 남기므로 공간 확보 뒤 같은 digest를 재시도합니다.
+3. digest·파일 무결성 오류, path·target collision이면 자동 덮어쓰기나 삭제를 시도하지 않습니다. 정확한 매니페스트, origin object와 소유권을 먼저 조사합니다.
+4. staging이나 비활성 final을 수동 격리해야 하면 같은 digest 준비가 실행 중이 아니고 어떤 배포·벤치마크도 참조하지 않는지 확인합니다. 계산된 단일 경로만 같은 파일시스템의 별도 보존 위치로 원자적으로 옮기고 원본 증거를 남깁니다. 공유 CAS 청크는 모든 매니페스트와 진행 중 준비의 미참조를 증명할 수 없으면 옮기거나 삭제하지 않습니다.
+5. `/var/lib/dure/models`, `/var/lib/dure/model-store`나 wildcard를 대상으로 재귀 삭제하지 않습니다. 현재 공식 quarantine·eviction 명령은 없으며 후속 버전에서 감사·참조 검사를 포함해 추가합니다.
+
+패키지 업그레이드는 `/var/lib/dure`를 `root:dure` `0750`으로 바로잡고 `/var/lib/dure/server`만 `dure` 계정에 쓰기를 허용합니다. 이 경로가 symlink이면 설치를 거부합니다. 중앙 서버의 로컬 SQLite 파일이나 기타 쓰기 상태를 상위 `/var/lib/dure`에 새로 만들지 말고 서버 전용 하위에 둡니다. PostgreSQL 운영에는 영향이 없습니다.
+
+기존 중앙 세대 계획의 `/var/lib/dure/models/<model-id>--<revision>` 경로와 새 CAS final `/var/lib/dure/models/sha256-<manifesthex>`는 서로 다른 계약입니다. `0.3.15`는 새 경로를 기존 generation plan에 자동 주입하지 않으므로 기존 중앙 apply가 준비된 CAS를 소비한다고 해석하면 안 됩니다. 다음 중앙 준비 PR이 정확한 prepared path와 증적을 계획에 연결해야 합니다.
+
 ## 벤치마크 증적 등록과 승격
 
 모델 릴리스의 배치 프로필을 모두 추가한 뒤 `VALIDATED`로 전환합니다. 이후 신뢰된 외부 도구의 구조화된 결과를 등록하거나, 승인된 단일 GPU 노드에 폐쇄형 벤치마크 작업을 요청하고 `ACTIVE` 승격을 요청할 수 있습니다.
@@ -281,6 +306,8 @@ VERIFY_TARGET
 롤백 task는 항상 `accept_model_download=false`, `pull_image=false`를 사용합니다. 대상 모델 캐시와 다이제스트 이미지가 모든 노드에 이미 있어야 하며 롤백이 다운로드나 이미지 내려받기를 대신하지 않습니다. 동일 GPU에서 소스 컨테이너를 중지하고 대상 컨테이너를 다시 생성하므로 중단 시간이 생길 수 있고 블루·그린 전환이 아닙니다. 이 흐름은 다중 노드 네트워크·NCCL 시험이나 24시간 복구 검증을 수행하지 않으므로 실제 GPU 환경의 별도 수용 검사를 계속 진행해야 합니다.
 
 ## 업그레이드와 복구
+
+0.3.15 Agent 패키지에서는 캐시 부모 소유권 경계를 먼저 확인합니다. `/var/lib/dure`가 실제 디렉터리인지, `root:dure` `0750`인지, `/var/lib/dure/server`만 `dure` 소유인지 확인한 뒤 Agent를 재시작합니다. post-install script는 두 상태 경로 중 하나가 symlink이면 실패합니다. 기존 중앙 서버가 상위 경로에 직접 쓰는 로컬 파일을 사용했다면 서비스 중지와 백업 후 서버 전용 하위 경로로 명시적으로 이전하고 설정을 갱신해야 합니다. 스크립트가 알 수 없는 파일을 자동 이동하거나 삭제하지 않습니다.
 
 0.3.12에서는 controller를 먼저 업그레이드합니다. PostgreSQL을 백업하고 controller 코드와 migration 0006을 적용한 뒤 server를 재시작하고 세대 조회 API를 확인합니다. 그 다음 Agent를 작은 batch로 업그레이드합니다. 0.3.12 미만 Agent는 세대 인식 롤백 안전 검사를 통과하지 못하며, 전체 노드가 업그레이드되기 전의 검증 성공은 `verified_at` 롤백 증거가 되지 않습니다.
 

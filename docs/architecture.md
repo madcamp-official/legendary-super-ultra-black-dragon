@@ -45,6 +45,28 @@ DISCOVERED → PROBING → ELIGIBLE → PLANNED → DOWNLOADING
 
 CPU 전용 노드는 중앙 제어면, 게이트웨이, 아티팩트 캐시, 관측성, 대기열, 전처리 같은 보조 역할의 후보가 될 수 있습니다. 현재 Dure 런타임은 GPU 노드가 Ray head여야 하며 CPU 노드에는 모델 레이어를 배정하지 않습니다.
 
+## 현재 로컬 모델 캐시 준비 계층
+
+`0.3.15`에는 정규 아티팩트 매니페스트를 로컬 `FULL_SNAPSHOT` 캐시로 materialize하는 노드 라이브러리가 있습니다. 아직 중앙 작업이나 공개 CLI에 연결되지 않았으므로 추천·수락·GPU 추가만으로 실행되지는 않습니다.
+
+```text
+정규 매니페스트 + 검증된 TrustedHTTPSOrigin 객체
+                    ↓ 경로·크기·응답 계약 검사
+        SHA-256 청크 CAS와 재개 가능한 .part
+                    ↓ 청크별·매니페스트별 잠금
+       digest별 고정 staging과 파일별 부분 조립
+                    ↓ 전체 파일·config·트리 재검증
+          v2 marker를 마지막에 기록·fsync
+                    ↓ no-replace 원자적 rename
+             검증된 FULL_SNAPSHOT 캐시
+```
+
+production 기본값에서 CAS와 시도 저널은 `/var/lib/dure/model-store`, 활성 캐시와 숨은 staging은 `/var/lib/dure/models` 아래의 고정 경로를 사용합니다. 매니페스트 다이제스트가 캐시와 staging 이름을 결정하고 원격 task 입력은 호스트 경로를 지정하지 않습니다. 내부 `ContentAddressedModelStore` 생성자는 테스트와 로컬 임베딩을 위한 명시적 루트 override를 허용하지만 이를 원격 payload와 연결하면 안 됩니다. 현재 내부 Python API는 검증된 `TrustedHTTPSOrigin` 객체를 받지만 이를 노드 설정에서 구성하는 production 호출자는 아직 없습니다. 다음 중앙 준비 PR의 Agent handler가 노드 로컬 신뢰 설정만 사용하고 작업 payload의 URL·host·header·token을 거부해야 합니다. 같은 매니페스트의 실행은 하나의 artifact lock으로 직렬화하고, 여러 매니페스트가 공유하는 청크는 chunk lock과 전체 SHA-256 검사 뒤 재사용합니다.
+
+로컬 상태는 `부분 다운로드 → 검증 CAS → assembling → marker-last 검증 staging → no-replace final` 순서로만 전진합니다. 다운로드·조립 중단은 결정적 부분 파일에서 재개합니다. 잘못된 CAS, 예상 밖 entry, symlink·hardlink·special file, marker·양자화 불일치와 기존 final 충돌은 보존한 채 실패하며 자동 재귀 삭제나 캐시 퇴출을 하지 않습니다. 반복 실패가 staging 디렉터리를 계속 늘리지 않도록 매니페스트마다 조립 영역을 하나만 사용합니다. 로컬 저널은 마지막 시도 상태일 뿐 중앙 진행률이나 `READY` 증적이 아닙니다. 특히 공유 CAS 청크는 전역 미참조를 증명할 수 없으면 수동으로 옮기거나 삭제해서는 안 되며, 감사 가능한 quarantine 명령은 후속 범위입니다.
+
+패키지는 root Agent의 캐시 경계를 중앙 서버 계정과 분리합니다. `/var/lib/dure`는 `root:dure`의 비쓰기 부모이고 중앙 서버의 로컬 쓰기 상태는 `/var/lib/dure/server`에 둡니다. 준비기는 설정 루트의 가장 가까운 기존 조상부터 생성한 루트까지 소유권·쓰기 권한·symlink를 검사합니다. 인벤토리와 벤치마크는 `/var/lib/dure/models` 루트와 캐시 후보·`config.json`·marker를 현재 Agent 사용자 소유의 비쓰기 일반 항목으로 각각 검사하며, 상위 `/var/lib/dure`까지 같은 검사를 반복하지는 않습니다. Hugging Face inventory의 표준 snapshot→repository `blobs` 링크는 읽기 호환성을 유지하지만 자동 벤치마크의 검증 캐시가 되지는 않습니다.
+
 ## 현재 모델 자격 검증 흐름
 
 중앙 모델 레지스트리는 고정된 모델 아티팩트, OCI 런타임 이미지, 모델 릴리스와 배치 프로필을 저장합니다. `VALIDATED` 릴리스의 구조화된 벤치마크 증적은 수동 등록 또는 폐쇄형 Agent 작업으로 만들 수 있습니다.
@@ -135,6 +157,8 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 - `START_DEPLOYMENT`
 - `STOP_DEPLOYMENT`
 - `RESTART_DEPLOYMENT`
+
+`PREPARE_MODEL`과 `PREPARE_IMAGE`는 현재 열거형에 없고 공개·관리자 준비 API나 CLI도 없습니다. 추천→수락→apply·rollback 흐름은 로컬 CAS materializer와 아직 연결되지 않았으며, `sha256-<manifesthex>` final 경로도 기존 세대 plan에 자동 주입되지 않습니다. `POST /v1/admin/benchmark-runs/prepare` 역시 모델 바이트를 준비하지 않고 DB의 벤치마크 실행 문맥만 고정합니다. 이 중앙 연결은 다음 준비 PR에서만 추가합니다.
 
 에이전트는 HTTPS 폴링으로 한 번에 하나의 작업을 5분 임대로 요청하고 실행 중 임대를 갱신합니다. 완료한 작업 ID와 결과는 로컬에 보관하므로 재전달된 작업은 가능한 한 변경을 반복하지 않고 이전 결과를 보고합니다. PostgreSQL 노드 행 잠금은 같은 노드의 요청을 직렬화합니다.
 
