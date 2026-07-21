@@ -59,11 +59,11 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
                 "--concurrency",
                 "1",
                 "--warmup-requests",
-                "20",
+                "2",
                 "--request-count",
-                "200",
+                "20",
                 "--duration-seconds",
-                "900",
+                "240",
                 "--output-format",
                 "json-summary-v1",
             ]
@@ -96,11 +96,11 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
                 "--concurrency",
                 "1",
                 "--warmup-requests",
-                "20",
+                "2",
                 "--request-count",
-                "200",
+                "20",
                 "--duration-seconds",
-                "900",
+                "240",
                 "--output-format",
                 "json-summary-v1",
             ]
@@ -170,7 +170,7 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
         ):
             asyncio.run(module._run(args))
 
-        self.assertEqual(len(observed_prompts), 220)
+        self.assertEqual(len(observed_prompts), 22)
         sleep.assert_not_awaited()
         self.assertTrue(
             all(

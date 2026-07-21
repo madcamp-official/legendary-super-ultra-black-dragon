@@ -646,7 +646,7 @@ class BenchmarkEvidenceCreate(StrictBody):
     artifact_manifest_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     runtime_image: str = Field(min_length=1, max_length=512)
     dure_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
-    policy_version: Literal["benchmark-gate-v2"] = BENCHMARK_POLICY_VERSION
+    policy_version: Literal["benchmark-gate-v3"] = BENCHMARK_POLICY_VERSION
     input_tokens: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
     output_tokens: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
     concurrency: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)

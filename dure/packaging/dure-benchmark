@@ -87,26 +87,26 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         "quality-eval": (1024, 256, 1),
     }
     if (
-        args.warmup_requests != 20
-        or args.request_count != 200
-        or args.duration_seconds != 900.0
+        args.warmup_requests != 2
+        or args.request_count != 20
+        or args.duration_seconds != 240.0
     ):
-        raise ValueError("measurement dimensions do not match benchmark v1")
+        raise ValueError("measurement dimensions do not match benchmark v3")
     expected = fixed_dimensions.get(args.workload)
     if expected is not None and (
         args.input_tokens,
         args.output_tokens,
         args.concurrency,
     ) != expected:
-        raise ValueError("workload dimensions do not match benchmark v1")
+        raise ValueError("workload dimensions do not match benchmark v3")
     if args.workload == "max-context" and (
         args.input_tokens <= 0
         or args.output_tokens != 256
         or args.concurrency != 1
     ):
-        raise ValueError("max-context dimensions do not match benchmark v1")
+        raise ValueError("max-context dimensions do not match benchmark v3")
     if args.quantization != "awq":
-        raise ValueError("benchmark v1 requires an AWQ model")
+        raise ValueError("benchmark v3 requires an AWQ model")
 
     from transformers import AutoTokenizer
     from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams

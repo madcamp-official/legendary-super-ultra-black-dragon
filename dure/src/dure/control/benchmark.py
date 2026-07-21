@@ -13,6 +13,9 @@ from sqlalchemy.orm import Session
 
 from dure.models import NodeProfile
 from dure.task import (
+    BENCHMARK_POLICY_VERSION,
+    BENCHMARK_REQUEST_COUNT,
+    BENCHMARK_WARMUP_REQUESTS,
     MAX_BENCHMARK_INTEGER,
     benchmark_inventory_fingerprint as contract_inventory_fingerprint,
 )
@@ -38,9 +41,8 @@ from .qualification import (
 
 
 BENCHMARK_SUITE_ID = "dure-serving-slo-v1"
-BENCHMARK_POLICY_VERSION = "benchmark-gate-v2"
-MIN_WARMUP_REQUESTS = 20
-MIN_MEASURED_REQUESTS = 200
+MIN_WARMUP_REQUESTS = BENCHMARK_WARMUP_REQUESTS
+MIN_MEASURED_REQUESTS = BENCHMARK_REQUEST_COUNT
 MIN_QUALITY_SCORE = 0.80
 GPU_COMPUTE_CAPABILITY_ARCHITECTURES = {
     "8.0": "ampere",

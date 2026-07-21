@@ -55,9 +55,9 @@ def _result(run_id: str, workload_id: str = "short-chat-1k-128") -> dict:
         "benchmark_id": run_id,
         "workload_id": workload_id,
         "metrics": {
-            "duration_seconds": 900.0,
-            "request_count": 200,
-            "warmup_requests": 20,
+            "duration_seconds": 240.0,
+            "request_count": 20,
+            "warmup_requests": 2,
             "oom_count": 0,
             "crash_count": 0,
             "restart_count": 0,
@@ -192,9 +192,9 @@ class BenchmarkTaskAPITests(unittest.TestCase):
         self.assertEqual(task["payload"]["input_tokens"], 1024)
         self.assertEqual(task["payload"]["output_tokens"], 128)
         self.assertEqual(task["payload"]["concurrency"], 8)
-        self.assertEqual(task["payload"]["warmup_requests"], 20)
-        self.assertEqual(task["payload"]["request_count"], 200)
-        self.assertEqual(task["payload"]["duration_seconds"], 900.0)
+        self.assertEqual(task["payload"]["warmup_requests"], 2)
+        self.assertEqual(task["payload"]["request_count"], 20)
+        self.assertEqual(task["payload"]["duration_seconds"], 240.0)
         unsafe = {
             "command",
             "docker_args",

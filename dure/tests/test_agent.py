@@ -238,7 +238,7 @@ def benchmark_payload(node_profile=None):
         "release_id": "33333333-3333-4333-8333-333333333333",
         "placement_id": "44444444-4444-4444-8444-444444444444",
         "suite_id": "dure-serving-slo-v1",
-        "policy_version": "benchmark-gate-v2",
+        "policy_version": "benchmark-gate-v3",
         "dure_commit": BENCHMARK_DURE_COMMIT,
         "model_id": "qwen-test-awq",
         "model_repository": "Qwen/Test-AWQ",
@@ -255,18 +255,18 @@ def benchmark_payload(node_profile=None):
         "input_tokens": 1024,
         "output_tokens": 128,
         "concurrency": 8,
-        "warmup_requests": 20,
-        "request_count": 200,
-        "duration_seconds": 900.0,
+        "warmup_requests": 2,
+        "request_count": 20,
+        "duration_seconds": 240.0,
         "apply": True,
     }
 
 
 def benchmark_metrics():
     return {
-        "duration_seconds": 900.0,
-        "request_count": 200,
-        "warmup_requests": 20,
+        "duration_seconds": 240.0,
+        "request_count": 20,
+        "warmup_requests": 2,
         "oom_count": 0,
         "crash_count": 0,
         "restart_count": 0,
