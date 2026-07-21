@@ -1,3 +1,13 @@
+dure (0.3.22) UNRELEASED; urgency=medium
+
+  * Docker 29가 빈 platform 이름을 반환해도 검증된 Engine 구성요소로 식별합니다.
+  * 버전·OS·architecture가 불일치하는 Docker 호환 shim은 계속 차단합니다.
+  * GPU 노드의 exact 배포 정리, Agent 비활성화와 credential 폐기를 결합한 등록 해제를 추가합니다.
+  * 등록 해제 뒤 install identity만 남은 노드는 안전한 bootstrap pre-join 상태로 인정합니다.
+  * Dure 프로젝트의 하위 디렉터리 이동에 맞춰 패키징과 APT 게시 경로를 정리합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 16:10:00 +0900
+
 dure (0.3.21) UNRELEASED; urgency=medium
 
   * Docker Engine과 NVIDIA Container Toolkit의 로컬 명시적 준비 기능을 추가합니다.

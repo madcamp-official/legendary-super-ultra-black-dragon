@@ -47,7 +47,7 @@
 
 ## 로컬 host bootstrap의 신뢰 경계
 
-`dure bootstrap`은 중앙 제어면이나 Agent task가 호출할 수 없는 노드 로컬 CLI입니다. 새 원격 작업 종류, 임의 명령, Docker 인자, 환경 변수, mount 또는 host 경로를 받지 않습니다. 기본 실행은 읽기 전용이고 root의 명시적 `--apply`만 APT·파일·service를 변경합니다. 적용은 등록 전·Agent 비활성 노드에 한정하고 `/etc/dure/agent.json`이 있으면 거부합니다. bootstrap apply와 `dure join`은 `/run/lock/dure-host-setup.lock`을 함께 사용해 host 변경과 등록을 직렬화합니다.
+`dure bootstrap`은 중앙 제어면이나 Agent task가 호출할 수 없는 노드 로컬 CLI입니다. 새 원격 작업 종류, 임의 명령, Docker 인자, 환경 변수, mount 또는 host 경로를 받지 않습니다. 기본 실행은 읽기 전용이고 root의 명시적 `--apply`만 APT·파일·service를 변경합니다. 적용은 등록 전·Agent 비활성 노드에 한정하고 credential을 포함한 `/etc/dure/agent.json`이 있으면 거부합니다. `dure unjoin`이 남긴 root 소유 regular file에 유일한 문자열 `install_id`만 있을 때는 권한이 없는 설치 identity로 검증해 허용하며, 추가 필드·손상·link·쓰기 가능한 파일은 계속 차단합니다. bootstrap apply, `dure join`과 `dure unjoin`은 `/run/lock/dure-host-setup.lock`을 함께 사용해 host 변경과 등록 해제를 직렬화합니다.
 
 지원 대상은 Ubuntu 22.04·24.04의 `amd64`·`arm64`입니다. 기존 NVIDIA driver가 실제 GPU를 보고해야 하며 Dure는 driver와 CUDA host 설치를 변경하지 않습니다. Docker와 Toolkit 저장소 URL, source 내용, Docker 패키지 이름, Toolkit 버전과 네 패키지 이름은 코드에 고정됩니다. Toolkit 네 패키지는 `1.19.1-1` APT pin으로 묶습니다. 모든 외부 명령은 고정된 system `PATH`와 C locale만 전달받아 호출 프로세스의 `APT_CONFIG`, proxy, GPG 관련 환경 변수 등을 상속하지 않으며, key 다운로드는 curl 사용자 설정도 읽지 않습니다. bootstrap이 내려받는 key는 curl 출력이 1MiB를 넘는 즉시 프로세스를 종료하고, Dure의 고정 경로에서 발견한 key도 같은 크기 상한을 적용합니다. HTTPS redirect만 허용하며 별도 임시 GPG home의 colon 출력을 파싱해 기대한 primary fingerprint 하나만 허용합니다. key의 mode와 비권한 APT reader의 부모 경로 접근도 검사하므로 정상 key와 다른 primary key를 함께 신뢰하거나 root만 읽는 key를 등록하지 않습니다. APT 설치에는 제거 금지를 사용하고 알려진 Docker 충돌 패키지, Docker CLI 없이 남은 package·service·socket, Toolkit 부분 설치·pin 충돌이나 고정 버전 불일치를 자동 정리하지 않습니다.
 
@@ -103,7 +103,7 @@ Ray 실행 입력도 폐쇄돼 있습니다. GCS `6379`, worker `20000-21000`, A
 
 별도의 GPU harness는 신뢰된 2·3노드 환경에서 실제 Ray executor, worker 배치, 분산 load와 최소 추론을 확인합니다. opt-in 전이나 설정·runtime·모델 전제 부족은 `NOT_RUN`·77이고 실제 실행 시작 뒤 오류는 `FAILED`입니다. 설정은 `/etc/dure/acceptance-vllm-ray-pp-v1.json`, 모델 mount는 `/models/model`로 고정되며 command, Docker 인자, 임의 환경 변수 묶음과 host path를 입력받지 않습니다. harness는 Ray custom resource를 통해 주소와 Dure UUID를 대조하지만 설정의 runtime image digest는 선언값이며 현재 프로세스의 OCI digest를 자체 증명하지 않습니다. 신뢰된 digest 고정 wrapper가 실제 실행 문맥과 중앙 계획을 대조해야 유효하고 controller의 노드별 증적을 대체하지 않습니다. 이 harness도 결과 서명, 원격 attestation, driver 무결성이나 host root 침해를 증명하지 않습니다.
 
-실패 시 새 단계는 닫히고 사전 검사 전이라면 기존 세대를 변경하지 않습니다. 실행 전환이 시작된 뒤에는 이전 세대가 계속 실행된다고 가정하지 않고 명시적 상태 확인과 롤백을 수행합니다. 반복 실패 노드는 credential revoke로 작업 수신을 격리할 수 있고, 참조가 없다고 완전하게 증명된 exact 캐시는 별도 `artifact-cache quarantine --apply` task로 보존 이동할 수 있습니다. 이 격리는 노드 격리나 삭제가 아니며 자동 실행되지 않습니다. Dure는 NVIDIA driver를 설치·변경하지 않으며, driver·CUDA·GPU 오류는 운영자가 노드를 격리하고 지원 조합으로 수동 복구해야 합니다. 자동 failover·자동 rollback·자동 cache 삭제는 이 신뢰 경계에 포함되지 않습니다.
+실패 시 새 단계는 닫히고 사전 검사 전이라면 기존 세대를 변경하지 않습니다. 실행 전환이 시작된 뒤에는 이전 세대가 계속 실행된다고 가정하지 않고 명시적 상태 확인과 롤백을 수행합니다. 반복 실패 노드는 credential revoke로 작업 수신을 격리할 수 있습니다. GPU 노드 반납은 노드의 직접 `dure unjoin` 또는 중앙의 폐쇄형 `UNJOIN_NODE` 작업만 사용하며, exact Dure 배포 label 검사·Agent 비활성화·credential 폐기를 모두 완료해야 합니다. 참조가 없다고 완전하게 증명된 exact 캐시는 별도 `artifact-cache quarantine --apply` task로 보존 이동할 수 있습니다. 노드 등록 해제, credential 격리와 캐시 격리는 서로 다른 절차이며 자동 실행되지 않습니다. Dure는 NVIDIA driver를 설치·변경하지 않으며, driver·CUDA·GPU 오류는 운영자가 노드를 격리하고 지원 조합으로 수동 복구해야 합니다. 자동 failover·자동 rollback·자동 cache 삭제는 이 신뢰 경계에 포함되지 않습니다.
 
 ## 콘텐츠 주소 캐시의 신뢰 경계
 

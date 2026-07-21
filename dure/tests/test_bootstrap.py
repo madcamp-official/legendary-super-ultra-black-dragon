@@ -63,6 +63,9 @@ class StrictBootstrapRunner:
         docker_service_without_cli: bool = False,
         docker_version: str = "29.0.0",
         docker_client_version: str | None = None,
+        docker_components: list[dict[str, object]] | None = None,
+        docker_server_os: str = "linux",
+        docker_server_arch: str = "amd64",
         mutate_unrelated_daemon_config: bool = False,
         docker_service_enabled: bool = True,
         oversized_key_download: bool = False,
@@ -91,6 +94,9 @@ class StrictBootstrapRunner:
         self.docker_client_version = (
             docker_version if docker_client_version is None else docker_client_version
         )
+        self.docker_components = docker_components
+        self.docker_server_os = docker_server_os
+        self.docker_server_arch = docker_server_arch
         self.mutate_unrelated_daemon_config = mutate_unrelated_daemon_config
         self.docker_service_enabled = docker_service_enabled
         self.oversized_key_download = oversized_key_download
@@ -170,16 +176,21 @@ class StrictBootstrapRunner:
             "{{json .}}",
         ):
             if self.docker:
+                server = {
+                    "Platform": {"Name": self.docker_engine_name},
+                    "Version": self.docker_version,
+                    "Os": self.docker_server_os,
+                    "Arch": self.docker_server_arch,
+                }
+                if self.docker_components is not None:
+                    server["Components"] = self.docker_components
                 return CommandResult(
                     command,
                     0,
                     json.dumps(
                         {
                             "Client": {"Version": self.docker_client_version},
-                            "Server": {
-                                "Platform": {"Name": self.docker_engine_name},
-                                "Version": self.docker_version,
-                            },
+                            "Server": server,
                         }
                     ),
                 )
@@ -595,6 +606,46 @@ class BootstrapTests(unittest.TestCase):
             self.assertIn("DURE_AGENT_ACTIVE", [check.code for check in report.checks])
             self.assertFalse(any(call[0] == "apt-get" for call in runner.calls))
 
+    def test_unjoined_install_identity_is_inside_the_pre_join_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_root(directory)
+            config = root / "etc" / "dure" / "agent.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                '{"install_id":"0123456789abcdef0123456789abcdef"}\n',
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+
+            report = Bootstrapper(StrictBootstrapRunner(), root=root).run()
+
+            self.assertFalse(report.blocked)
+            self.assertIn("NODE_UNJOINED", [check.code for check in report.checks])
+            self.assertNotIn(
+                "NODE_ALREADY_JOINED", [check.code for check in report.checks]
+            )
+
+    def test_unjoined_config_with_credential_or_invalid_identity_stays_blocked(self):
+        values = (
+            {"install_id": "install-1", "credential": "secret"},
+            {"install_id": ""},
+            {"install_id": 123},
+        )
+        for value in values:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = make_root(directory)
+                config = root / "etc" / "dure" / "agent.json"
+                config.parent.mkdir(parents=True)
+                config.write_text(json.dumps(value), encoding="utf-8")
+                config.chmod(0o600)
+
+                report = Bootstrapper(StrictBootstrapRunner(), root=root).run()
+
+                self.assertTrue(report.blocked)
+                self.assertIn(
+                    "NODE_ALREADY_JOINED", [check.code for check in report.checks]
+                )
+
     def test_unsupported_os_is_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = StrictBootstrapRunner()
@@ -763,6 +814,62 @@ class BootstrapTests(unittest.TestCase):
 
             self.assertTrue(report.blocked)
             self.assertIn("DOCKER_ENGINE_UNSUPPORTED", [check.code for check in report.checks])
+
+    def test_empty_platform_name_accepts_matching_docker_engine_component(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = StrictBootstrapRunner(
+                docker=True,
+                toolkit=True,
+                runtime=True,
+                docker_engine_name="",
+                docker_version="29.1.3",
+                docker_components=[
+                    {
+                        "Name": "Engine",
+                        "Version": "29.1.3",
+                        "Details": {"Os": "linux", "Arch": "amd64"},
+                    },
+                    {"Name": "containerd", "Version": "2.2.1", "Details": {}},
+                ],
+            )
+
+            report = Bootstrapper(runner, root=make_root(directory)).run()
+
+            self.assertFalse(report.blocked)
+            self.assertIn("DOCKER_READY", [check.code for check in report.checks])
+            self.assertNotIn(
+                "DOCKER_ENGINE_UNSUPPORTED", [check.code for check in report.checks]
+            )
+
+    def test_empty_platform_name_rejects_unverified_engine_components(self):
+        cases = (
+            [{"Name": "Podman Engine", "Version": "29.1.3", "Details": {}}],
+            [{"Name": "Engine", "Version": "29.0.0", "Details": {}}],
+            [
+                {
+                    "Name": "Engine",
+                    "Version": "29.1.3",
+                    "Details": {"Os": "windows", "Arch": "amd64"},
+                }
+            ],
+        )
+        for components in cases:
+            with self.subTest(components=components), tempfile.TemporaryDirectory() as directory:
+                runner = StrictBootstrapRunner(
+                    docker=True,
+                    toolkit=True,
+                    runtime=True,
+                    docker_engine_name="",
+                    docker_version="29.1.3",
+                    docker_components=components,
+                )
+
+                report = Bootstrapper(runner, root=make_root(directory)).run()
+
+                self.assertTrue(report.blocked)
+                self.assertIn(
+                    "DOCKER_ENGINE_UNSUPPORTED", [check.code for check in report.checks]
+                )
 
     def test_old_or_unparseable_docker_version_is_rejected(self):
         for version in ("18.09.9", "19.03.15", "not-a-version"):

@@ -449,7 +449,15 @@ class Bootstrapper:
 
     def _inspect_pre_join_boundary(self, report: BootstrapReport) -> None:
         config = self._path(DURE_AGENT_CONFIG_PATH)
-        if config.exists() or config.is_symlink():
+        if self._is_retired_install_config(config):
+            report.checks.append(
+                BootstrapCheck(
+                    "NODE_UNJOINED",
+                    "PASS",
+                    "The local registration is retired and retains only its installation identity",
+                )
+            )
+        elif config.exists() or config.is_symlink():
             report.checks.append(
                 BootstrapCheck(
                     "NODE_ALREADY_JOINED",
@@ -480,7 +488,9 @@ class Bootstrapper:
 
     def _require_pre_join_boundary(self) -> None:
         config = self._path(DURE_AGENT_CONFIG_PATH)
-        if config.exists() or config.is_symlink():
+        if (config.exists() or config.is_symlink()) and not self._is_retired_install_config(
+            config
+        ):
             raise BootstrapExecutionError(
                 "Node joined while bootstrap was running; refusing further host changes"
             )
@@ -492,6 +502,27 @@ class Bootstrapper:
             raise BootstrapExecutionError(
                 "Could not prove dure-agent stayed inactive during bootstrap"
             )
+
+    def _is_retired_install_config(self, config: Path) -> bool:
+        if config.is_symlink() or not config.exists():
+            return False
+        try:
+            metadata = config.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                return False
+            if self.root == Path("/") and (
+                metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                return False
+            value = json.loads(config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return (
+            type(value) is dict
+            and set(value) == {"install_id"}
+            and type(value["install_id"]) is str
+            and 0 < len(value["install_id"]) <= 64
+        )
 
     def _inspect_host_prerequisites(self, report: BootstrapReport) -> None:
         required = ("apt-get", "dpkg", "dpkg-query", "systemctl")
@@ -656,10 +687,7 @@ class Bootstrapper:
             version_data = None
         client = version_data.get("Client") if isinstance(version_data, dict) else None
         server = version_data.get("Server") if isinstance(version_data, dict) else None
-        platform_data = server.get("Platform") if isinstance(server, dict) else None
-        engine_name = (
-            platform_data.get("Name") if isinstance(platform_data, dict) else None
-        )
+        engine_name = self._docker_engine_name(server)
         version = server.get("Version") if isinstance(server, dict) else None
         client_version = client.get("Version") if isinstance(client, dict) else None
         parsed_version = self._parse_docker_version(version)
@@ -698,6 +726,47 @@ class Bootstrapper:
             )
         )
         return True, True
+
+    @staticmethod
+    def _docker_engine_name(server: object) -> str | None:
+        if not isinstance(server, dict):
+            return None
+        platform_data = server.get("Platform")
+        if not isinstance(platform_data, dict):
+            return None
+        platform_name = platform_data.get("Name")
+        if not isinstance(platform_name, str):
+            return None
+        if platform_name.strip():
+            return platform_name if platform_name.startswith("Docker Engine") else None
+
+        version = server.get("Version")
+        server_os = server.get("Os")
+        server_arch = server.get("Arch")
+        components = server.get("Components")
+        if (
+            not isinstance(version, str)
+            or not version
+            or server_os != "linux"
+            or server_arch not in SUPPORTED_ARCHITECTURES
+            or not isinstance(components, list)
+        ):
+            return None
+        engines = [
+            component
+            for component in components
+            if isinstance(component, dict) and component.get("Name") == "Engine"
+        ]
+        if len(engines) != 1 or engines[0].get("Version") != version:
+            return None
+        details = engines[0].get("Details")
+        if not isinstance(details, dict):
+            return None
+        if details.get("Os", server_os) != server_os:
+            return None
+        if details.get("Arch", server_arch) != server_arch:
+            return None
+        return "Docker Engine"
 
     @staticmethod
     def _parse_docker_version(value: object) -> tuple[int, int, int] | None:
