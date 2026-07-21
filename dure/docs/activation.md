@@ -147,6 +147,12 @@ dure admin activate --file activation.json --all-online --apply
 5. 최신 PROBE, 추천 생성과 수락
 6. 배포 아티팩트 준비, API를 포함한 apply와 verify
 
+apply가 중앙 staged operation을 생성하면 CLI는 최초 Agent task 성공만으로 다음
+요청을 보내지 않고 operation의 `APPLY → START_API → VERIFY_API`가 terminal 성공할
+때까지 기다립니다. 그 뒤 별도 전체 `VERIFY --api`를 요청해 deployment의
+`verified_at`을 확정합니다. staged operation이 실패하면 최종 VERIFY를 만들지
+않습니다.
+
 성공 출력의 `status`는 `READY`이며 release, recommendation, deployment,
 preparation과 verify task ID를 함께 기록합니다. 어느 단계든 실패하거나 시간이
 초과되면 뒤 단계를 실행하지 않습니다. SLO 미달은 자동으로 통과시키지 않고 실패

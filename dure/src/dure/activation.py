@@ -18,6 +18,9 @@ _TERMINAL_TASK_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELED"})
 _TERMINAL_PREPARATION_STATUSES = frozenset(
     {"SUCCEEDED", "PARTIAL_FAILED", "FAILED"}
 )
+_TERMINAL_OPERATION_STATUSES = frozenset(
+    {"SUCCEEDED", "PARTIAL_FAILED", "FAILED"}
+)
 _ARTIFACT_FIELDS = frozenset(
     {
         "model_id",
@@ -331,6 +334,42 @@ class ActivationWorkflow:
                 return value
             if time.monotonic() >= deadline:
                 raise TimeoutError("activation artifact preparation timed out")
+            self.sleeper(self.poll_interval)
+
+    def _wait_apply_operation(self, deployment_id: str) -> dict | None:
+        deadline = self._deadline()
+        while True:
+            deployment = self.client.request(
+                "GET", f"/v1/admin/deployments/{deployment_id}"
+            )["deployment"]
+            operations = [
+                item
+                for item in deployment.get("operations", [])
+                if type(item) is dict and item.get("kind") == "APPLY"
+            ]
+            if not operations:
+                return None
+            operation = max(
+                operations,
+                key=lambda item: (item.get("created_at", ""), item.get("id", "")),
+            )
+            if operation.get("status") in _TERMINAL_OPERATION_STATUSES:
+                if operation["status"] != "SUCCEEDED":
+                    failures = sorted(
+                        {
+                            node.get("failure_code")
+                            for node in operation.get("nodes", [])
+                            if type(node) is dict
+                            and type(node.get("failure_code")) is str
+                        }
+                    )
+                    detail = ",".join(failures) if failures else operation["status"]
+                    raise RuntimeError(
+                        "activation staged deployment operation failed: " + detail
+                    )
+                return operation
+            if time.monotonic() >= deadline:
+                raise TimeoutError("activation staged deployment operation timed out")
             self.sleeper(self.poll_interval)
 
     def _wait_benchmark(self, request_id: str) -> dict:
@@ -695,6 +734,8 @@ class ActivationWorkflow:
         self._wait_tasks(
             [item["id"] for item in applied["tasks"]], stage="deployment apply"
         )
+        self.reporter("Waiting for staged deployment operation")
+        self._wait_apply_operation(deployment_id)
         verified = self.client.request(
             "POST",
             "/v1/admin/tasks",

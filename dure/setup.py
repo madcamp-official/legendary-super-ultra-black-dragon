@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="dure",
-    version="0.4.13",
+    version="0.4.14",
     description="Resource-aware community LLM node bootstrapper",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

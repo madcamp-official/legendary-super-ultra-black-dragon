@@ -122,6 +122,7 @@ class FakeActivationClient:
         self.release_status = "DRAFT"
         self.task_counter = 0
         self.selected_release_id = RELEASE_ID
+        self.operation_status = "SUCCEEDED"
 
     def _task(self, task_id):
         return {"id": task_id, "status": "SUCCEEDED", "error": None}
@@ -188,6 +189,34 @@ class FakeActivationClient:
             return {"preparation": {"id": PREPARATION_ID, "status": "PREPARED"}}
         if method == "GET" and "/deployment-preparations/" in path:
             return {"preparation": {"id": PREPARATION_ID, "status": "SUCCEEDED"}}
+        if (method, path) == (
+            "GET",
+            f"/v1/admin/deployments/{DEPLOYMENT_ID}",
+        ):
+            return {
+                "deployment": {
+                    "id": DEPLOYMENT_ID,
+                    "operations": [
+                        {
+                            "id": "99999999-9999-4999-8999-999999999999",
+                            "kind": "APPLY",
+                            "status": self.operation_status,
+                            "created_at": "2026-07-21T00:00:00+00:00",
+                            "nodes": [
+                                {
+                                    "phase": "APPLY",
+                                    "status": self.operation_status,
+                                    "failure_code": (
+                                        None
+                                        if self.operation_status == "SUCCEEDED"
+                                        else "DEPLOYMENT_EXECUTION_FAILED"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
         raise AssertionError(f"unexpected request: {method} {path} {payload}")
 
 
@@ -262,6 +291,19 @@ class ActivationWorkflowTests(unittest.TestCase):
         ]
         self.assertIn("APPLY_DEPLOYMENT", {item["type"] for item in task_payloads})
         self.assertIn("VERIFY", {item["type"] for item in task_payloads})
+        operation_index = next(
+            index
+            for index, (method, path, _payload) in enumerate(client.calls)
+            if (method, path)
+            == ("GET", f"/v1/admin/deployments/{DEPLOYMENT_ID}")
+        )
+        verify_index = next(
+            index
+            for index, (method, path, payload) in enumerate(client.calls)
+            if (method, path) == ("POST", "/v1/admin/tasks")
+            and payload["type"] == "VERIFY"
+        )
+        self.assertLess(operation_index, verify_index)
         benchmark_apply = next(
             payload
             for method, path, payload in client.calls
@@ -286,6 +328,24 @@ class ActivationWorkflowTests(unittest.TestCase):
                 for method, path, _payload in client.calls
             )
         )
+
+    def test_apply_stops_before_final_verify_when_staged_operation_failed(self):
+        client = FakeActivationClient()
+        client.operation_status = "FAILED"
+        workflow = ActivationWorkflow(client, sleeper=lambda _seconds: None)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "staged deployment operation failed"
+        ):
+            workflow.apply(ActivationSpec.from_dict(_spec_document()), node_ids=None)
+
+        task_payloads = [
+            payload
+            for method, path, payload in client.calls
+            if (method, path) == ("POST", "/v1/admin/tasks")
+        ]
+        self.assertIn("APPLY_DEPLOYMENT", {item["type"] for item in task_payloads})
+        self.assertNotIn("VERIFY", {item["type"] for item in task_payloads})
 
 
 if __name__ == "__main__":

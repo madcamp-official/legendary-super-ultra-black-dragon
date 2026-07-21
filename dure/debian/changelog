@@ -1,3 +1,10 @@
+dure (0.4.14) UNRELEASED; urgency=medium
+
+  * activation이 staged APPLY operation 완료를 기다린 뒤 최종 VERIFY를 요청합니다.
+  * 실패 operation에서는 별도 VERIFY를 만들지 않고 구조화된 실패로 종료합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 19:25:00 +0000
+
 dure (0.4.13) UNRELEASED; urgency=medium
 
   * PP=1/TP=1 단일 GPU 계획은 Ray 없이 고정 vLLM API 컨테이너를 직접 실행합니다.
