@@ -933,12 +933,23 @@ class Agent:
             )
         )
         self.runner = runner or SubprocessRunner()
+        artifact_origin_config = config.get("artifact_origin")
+        if (
+            artifact_origin_config is None
+            and config.get("verify_tls", True) is True
+            and type(config.get("server")) is str
+            and config["server"].startswith("https://")
+        ):
+            artifact_origin_config = {
+                "base_url": config["server"].rstrip("/"),
+                "allowed_redirect_hosts": [],
+            }
         self.executor = TaskExecutor(
             config["node_id"],
             runner=self.runner,
             state_path=self.state_path,
             benchmark_executor=benchmark_executor,
-            artifact_origin_config=config.get("artifact_origin"),
+            artifact_origin_config=artifact_origin_config,
             manifest_loader=self._load_artifact_manifest,
             build_commit=self.build_commit,
         )

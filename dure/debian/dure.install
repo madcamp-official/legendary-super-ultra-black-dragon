@@ -1,2 +1,3 @@
 packaging/dure-agent.service lib/systemd/system/
 packaging/dure-client.env etc/dure/
+packaging/dure-benchmark usr/lib/dure/

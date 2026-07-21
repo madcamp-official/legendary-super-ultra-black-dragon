@@ -869,6 +869,14 @@ class ModelStoreRootBoundaryTests(unittest.TestCase):
             "install -d -m 0750 -o dure -g dure /var/lib/dure/server\n",
             script,
         )
+        self.assertIn(
+            "/var/lib/dure/artifacts/chunks/sha256\n",
+            script,
+        )
+        self.assertIn(
+            'install -d -m 0750 -o root -g dure "$artifact_dir"\n',
+            script,
+        )
         self.assertIn("ProtectSystem=strict\n", server_unit)
         self.assertIn("ReadWritePaths=/var/lib/dure/server\n", server_unit)
 

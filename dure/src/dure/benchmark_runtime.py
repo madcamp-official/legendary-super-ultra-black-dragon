@@ -33,6 +33,9 @@ from .task import (
 
 
 BENCHMARK_ENTRYPOINT = "dure-benchmark"
+BENCHMARK_ENTRYPOINT_HOST_PATH = Path("/usr/lib/dure/dure-benchmark")
+BENCHMARK_ENTRYPOINT_CONTAINER_PATH = "/usr/local/bin/dure-benchmark"
+MAX_BENCHMARK_ENTRYPOINT_BYTES = 64 * 1024
 MAX_SUMMARY_BYTES = 32 * 1024
 MAX_BENCHMARK_OUTPUT_BYTES = 64 * 1024
 MAX_MODEL_CONFIG_BYTES = 1024 * 1024
@@ -341,6 +344,42 @@ def _ensure_no_active_workloads(
         )
 
 
+def _default_benchmark_entrypoint_path() -> Path:
+    installed = BENCHMARK_ENTRYPOINT_HOST_PATH
+    if installed.exists():
+        return installed
+    return Path(__file__).resolve().parents[2] / "packaging" / "dure-benchmark"
+
+
+def _validated_benchmark_entrypoint(path: Path) -> Path:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise BenchmarkRuntimeError(
+            "packaged benchmark entrypoint is unavailable",
+            code="BENCHMARK_RUNTIME_UNAVAILABLE",
+        )
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise BenchmarkRuntimeError(
+            "packaged benchmark entrypoint is unavailable",
+            code="BENCHMARK_RUNTIME_UNAVAILABLE",
+        ) from exc
+    if (
+        resolved != path
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or not 1 <= metadata.st_size <= MAX_BENCHMARK_ENTRYPOINT_BYTES
+        or metadata.st_mode & 0o022
+        or metadata.st_mode & 0o111 == 0
+    ):
+        raise BenchmarkRuntimeError(
+            "packaged benchmark entrypoint is unsafe",
+            code="BENCHMARK_RUNTIME_UNAVAILABLE",
+        )
+    return path
+
+
 def _model_context_limit(model_path: Path) -> int:
     config_path = model_path / "config.json"
     try:
@@ -531,14 +570,21 @@ def _validated_metrics(
 class SafeBenchmarkRuntime:
     """Run one fixed, single-node GPU workload without accepting execution knobs."""
 
-    def __init__(self, runner: Runner | None = None) -> None:
+    def __init__(
+        self,
+        runner: Runner | None = None,
+        *,
+        entrypoint_path: Path | None = None,
+    ) -> None:
         self.runner = runner or SubprocessRunner()
+        self.entrypoint_path = entrypoint_path or _default_benchmark_entrypoint_path()
 
     def reconcile(self, payload: BenchmarkTaskPayload) -> None:
         payload = _validated_payload(payload)
         if payload.apply is not True:
             raise ValueError("benchmark reconciliation requires explicit apply approval")
         name = f"dure-benchmark-{payload.benchmark_id}"
+        _validated_benchmark_entrypoint(self.entrypoint_path)
         existing = self.runner.run(
             [
                 "docker",
@@ -630,6 +676,7 @@ class SafeBenchmarkRuntime:
                 "metrics": {},
             }
         name = f"dure-benchmark-{payload.benchmark_id}"
+        entrypoint_path = _validated_benchmark_entrypoint(self.entrypoint_path)
 
         image = self.runner.run(
             ["docker", "image", "inspect", "--format", "{{.Id}}", payload.runtime_image],
@@ -654,6 +701,7 @@ class SafeBenchmarkRuntime:
             gpu_uuid=gpu_uuid,
             memory_limit=memory_limit,
             cpu_limit=cpu_limit,
+            entrypoint_path=entrypoint_path,
         )
         limited_run = getattr(self.runner, "run_limited_output", None)
         if not callable(limited_run):
@@ -840,6 +888,7 @@ class SafeBenchmarkRuntime:
         gpu_uuid: str,
         memory_limit: str,
         cpu_limit: str,
+        entrypoint_path: Path,
     ) -> list[str]:
         labels = (
             "dure.managed=true",
@@ -876,8 +925,6 @@ class SafeBenchmarkRuntime:
             cpu_limit,
             "--restart",
             "no",
-            "--user",
-            "65532:65532",
             "--gpus",
             f"device={gpu_uuid}",
             "--shm-size",
@@ -891,6 +938,11 @@ class SafeBenchmarkRuntime:
             (
                 "--mount",
                 f"type=bind,src={model_path},dst=/models/model,readonly",
+                "--mount",
+                (
+                    "type=bind,src="
+                    f"{entrypoint_path},dst={BENCHMARK_ENTRYPOINT_CONTAINER_PATH},readonly"
+                ),
                 "--entrypoint",
                 BENCHMARK_ENTRYPOINT,
                 payload.runtime_image,

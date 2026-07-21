@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dure.benchmark_runtime import (
+    BENCHMARK_ENTRYPOINT_CONTAINER_PATH,
     BENCHMARK_WORKLOADS,
     MAX_BENCHMARK_OUTPUT_BYTES,
     NVIDIA_COMPUTE_QUERY_COMMAND,
@@ -238,6 +239,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertEqual(command[restart + 1], "no")
         gpus = command.index("--gpus")
         self.assertEqual(command[gpus + 1], f"device=GPU-{NODE_ID}")
+        self.assertNotIn("--user", command)
         self.assertNotIn("all", command)
         self.assertNotIn("dure.deployment", " ".join(command))
         labels = {
@@ -263,6 +265,13 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             command[mount + 1],
             f"type=bind,src={self.model_path},dst=/models/model,readonly",
         )
+        entrypoint_mount = command.index("--mount", mount + 1)
+        self.assertEqual(
+            command[entrypoint_mount + 1],
+            "type=bind,src="
+            f"{Path(__file__).resolve().parents[1] / 'packaging' / 'dure-benchmark'},"
+            f"dst={BENCHMARK_ENTRYPOINT_CONTAINER_PATH},readonly",
+        )
         serialized = json.dumps(result, sort_keys=True)
         self.assertNotIn(str(self.model_path), serialized)
         self.assertNotIn("stdout", serialized)
@@ -271,6 +280,17 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             runner.limited_output_calls,
             [(command, MAX_BENCHMARK_OUTPUT_BYTES)],
         )
+
+    def test_unsafe_packaged_entrypoint_is_rejected_before_docker(self):
+        path = Path(self.temporary.name) / "unsafe-benchmark"
+        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.chmod(0o777)
+        runner = FakeRunner()
+
+        with self.assertRaisesRegex(BenchmarkRuntimeError, "entrypoint is unsafe"):
+            SafeBenchmarkRuntime(runner, entrypoint_path=path).reconcile(payload())
+
+        self.assertEqual(runner.calls, [])
 
     def test_workload_dimensions_and_local_context_are_revalidated(self):
         runtime = SafeBenchmarkRuntime(FakeRunner())

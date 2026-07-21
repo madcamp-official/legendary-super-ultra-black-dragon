@@ -83,7 +83,7 @@ def _agent_supports_preparation(value: object) -> bool:
     if type(value) is not str:
         return False
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[+.-].*)?", value)
-    return match is not None and tuple(int(item) for item in match.groups()) >= (0, 3, 25)
+    return match is not None and tuple(int(item) for item in match.groups()) >= (0, 3, 26)
 
 
 def _positive_number(value: object, field: str) -> float:

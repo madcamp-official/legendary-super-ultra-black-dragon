@@ -1,3 +1,11 @@
+dure (0.3.26) UNRELEASED; urgency=medium
+
+  * HTTPS 중앙 서버를 content-addressed 모델 청크 origin으로 사용합니다.
+  * 고정 네트워크 차단 vLLM 벤치마크 실행기를 Agent 패키지에 포함합니다.
+  * 자동 활성화가 실제 모델 준비부터 벤치마크까지 실행할 수 있게 합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 21:30:00 +0900
+
 dure (0.3.25) UNRELEASED; urgency=medium
 
   * 단일 GPU 릴리스의 등록·준비·벤치마크·승격·추천·배포·검증을 자동화합니다.

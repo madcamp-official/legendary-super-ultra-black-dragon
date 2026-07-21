@@ -84,7 +84,7 @@ def _spec_document() -> dict:
             "min_throughput_tps": 1.0,
         },
         "benchmark": {
-            "workload_id": "short-chat-1k-128",
+            "workload_id": "quality-eval",
             "dure_commit": "d" * 40,
             "attempt": 1,
         },
@@ -96,7 +96,7 @@ def _inventory() -> dict:
         "nodes": [
             {
                 "id": NODE_ID,
-                "agent_version": "0.3.25",
+                "agent_version": "0.3.26",
                 "approved": True,
                 "connectivity": "online",
                 "profile": {
@@ -220,6 +220,23 @@ class ActivationWorkflowTests(unittest.TestCase):
         self.assertFalse(result["apply"])
         self.assertEqual(result["benchmark_node_id"], NODE_ID)
         self.assertEqual(client.calls, [("GET", "/v1/admin/inventory", None)])
+
+    def test_preview_rejects_agents_without_the_packaged_benchmark(self):
+        client = FakeActivationClient()
+        original_request = client.request
+
+        def request(method, path, payload=None):
+            value = original_request(method, path, payload)
+            if (method, path) == ("GET", "/v1/admin/inventory"):
+                value["nodes"][0]["agent_version"] = "0.3.25"
+            return value
+
+        client.request = request
+
+        with self.assertRaisesRegex(ValueError, "no node eligible"):
+            ActivationWorkflow(client).preview(
+                ActivationSpec.from_dict(_spec_document()), node_ids=None
+            )
 
     def test_apply_runs_registry_benchmark_recommend_prepare_apply_and_verify(self):
         client = FakeActivationClient()

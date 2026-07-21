@@ -279,6 +279,35 @@ class FailingReportAgentClient(FakeAgentClient):
 
 
 class AgentPreparationTests(unittest.TestCase):
+    def test_https_control_plane_is_the_default_local_artifact_origin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            agent = Agent(
+                {
+                    "server": "https://controller.example.test",
+                    "node_id": NODE_ID,
+                    "credential": "agent-secret",
+                    "state_file": str(root / "state.json"),
+                },
+                history_path=root / "history.json",
+            )
+            insecure = Agent(
+                {
+                    "server": "http://controller.example.test",
+                    "node_id": NODE_ID,
+                    "credential": "agent-secret",
+                    "verify_tls": False,
+                    "state_file": str(root / "insecure-state.json"),
+                },
+                history_path=root / "insecure-history.json",
+            )
+
+        self.assertEqual(
+            agent.executor.preparation_executor.origin.base_url,
+            "https://controller.example.test",
+        )
+        self.assertIsNone(insecure.executor.preparation_executor.origin)
+
     def model_executor(self, preparer=None, *, loader=None):
         return ArtifactPreparationExecutor(
             NODE_ID,

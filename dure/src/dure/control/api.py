@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import uuid
 from datetime import timedelta
 from functools import partial
+from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -22,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dure import __version__
+from dure.artifact_download import DEFAULT_MAX_CHUNK_BYTES
 from dure.model_store import MAX_TRACKED_BYTES
 from dure.task import MAX_BENCHMARK_INTEGER
 
@@ -136,6 +139,23 @@ from .rollout import (
     deployment_operation_detail,
     prepare_or_apply_rollback,
 )
+
+
+DEFAULT_ARTIFACT_CHUNK_ROOT = Path("/var/lib/dure/artifacts/chunks/sha256")
+ARTIFACT_CHUNK_READ_BYTES = 1024 * 1024
+ARTIFACT_RANGE = re.compile(r"bytes=([0-9]+)-")
+
+
+def _chunk_stream(descriptor: int, remaining: int):
+    try:
+        while remaining:
+            block = os.read(descriptor, min(ARTIFACT_CHUNK_READ_BYTES, remaining))
+            if not block:
+                break
+            remaining -= len(block)
+            yield block
+    finally:
+        os.close(descriptor)
 
 
 class StrictBody(BaseModel):
@@ -742,13 +762,22 @@ def _model_release_dict(session: Session, release: ModelRelease) -> dict:
     }
 
 
-def create_app(*, database_url: str | None = None, admin_token: str | None = None, create_schema: bool = False) -> FastAPI:
+def create_app(
+    *,
+    database_url: str | None = None,
+    admin_token: str | None = None,
+    create_schema: bool = False,
+    artifact_chunk_root: Path = DEFAULT_ARTIFACT_CHUNK_ROOT,
+) -> FastAPI:
+    if not isinstance(artifact_chunk_root, Path) or not artifact_chunk_root.is_absolute():
+        raise ValueError("artifact chunk root must be an absolute path")
     engine = make_engine(database_url)
     if create_schema:
         Base.metadata.create_all(engine)
     factory = make_session_factory(engine)
     app = FastAPI(title="Dure Control Plane", version=__version__)
     app.state.session_factory = factory
+    app.state.artifact_chunk_root = artifact_chunk_root
     expected_admin = admin_token or os.environ.get("DURE_ADMIN_TOKEN")
     get_session = partial(session_dependency, factory)
 
@@ -784,6 +813,94 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if node is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid node credential")
         return node
+
+    @app.api_route("/chunks/sha256/{digest}", methods=["GET", "HEAD"])
+    def artifact_chunk(digest: str, request: Request):
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact chunk not found")
+        root = app.state.artifact_chunk_root
+        descriptor = None
+        root_descriptor = None
+        try:
+            if root.resolve(strict=True) != root:
+                raise OSError("unsafe artifact root")
+            root_descriptor = os.open(
+                root,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            descriptor = os.open(
+                digest,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_descriptor,
+            )
+            metadata = os.fstat(descriptor)
+        except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "artifact chunk not found"
+            ) from None
+        finally:
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not 1 <= metadata.st_size <= DEFAULT_MAX_CHUNK_BYTES
+            or metadata.st_mode & 0o022
+        ):
+            os.close(descriptor)
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact chunk not found")
+
+        ranges = request.headers.getlist("range")
+        offset = 0
+        response_status = status.HTTP_200_OK
+        if ranges:
+            match = ARTIFACT_RANGE.fullmatch(ranges[0]) if len(ranges) == 1 else None
+            if match is None:
+                os.close(descriptor)
+                return Response(
+                    status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                    headers={"Content-Range": f"bytes */{metadata.st_size}"},
+                )
+            offset = int(match.group(1))
+            if offset >= metadata.st_size:
+                os.close(descriptor)
+                return Response(
+                    status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                    headers={"Content-Range": f"bytes */{metadata.st_size}"},
+                )
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            response_status = status.HTTP_206_PARTIAL_CONTENT
+
+        length = metadata.st_size - offset
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Length": str(length),
+            "ETag": f'"sha256:{digest}"',
+            "X-Content-Type-Options": "nosniff",
+        }
+        if response_status == status.HTTP_206_PARTIAL_CONTENT:
+            headers["Content-Range"] = (
+                f"bytes {offset}-{metadata.st_size - 1}/{metadata.st_size}"
+            )
+        if request.method == "HEAD":
+            os.close(descriptor)
+            return Response(
+                status_code=response_status,
+                headers=headers,
+                media_type="application/octet-stream",
+            )
+        return StreamingResponse(
+            _chunk_stream(descriptor, length),
+            status_code=response_status,
+            headers=headers,
+            media_type="application/octet-stream",
+        )
 
     @app.get("/health")
     def health():

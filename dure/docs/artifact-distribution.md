@@ -39,7 +39,9 @@
 - 검증 표식을 마지막에 기록한 뒤 `renameat2(RENAME_NOREPLACE)`로 활성화하는 `FULL_SNAPSHOT`·rank별 `STAGE` 준비기
 - 매니페스트별 시도 저널과 폐쇄형 상태·실패 코드
 
-모델 준비기는 GPU, Docker나 vLLM을 요구하지 않는 파일 계층입니다. 단위 테스트는 가짜 전송 계층을 사용하지만 실제 `ArtifactChunkDownloader`는 HTTPS 네트워크 원본을 사용합니다. Agent는 검증된 `TrustedHTTPSOrigin` 객체를 각 노드의 root 전용 설정에서만 구성하고, 중앙 task payload의 URL·host·header·token은 받지 않습니다. 현재 전송기는 인증 token, cookie와 사용자 지정 header를 지원하지 않으므로 별도 자격 증명 없이 접근 가능한 신뢰 HTTPS origin이 필요합니다.
+모델 준비기는 GPU, Docker나 vLLM을 요구하지 않는 파일 계층입니다. 단위 테스트는 가짜 전송 계층을 사용하지만 실제 `ArtifactChunkDownloader`는 HTTPS 네트워크 원본을 사용합니다. HTTPS 중앙 서버에 join한 Agent는 그 서버를 기본 `TrustedHTTPSOrigin`으로 사용하고 `/chunks/sha256/<digest>`에서 청크를 받습니다. 별도 origin은 각 노드의 root 전용 설정에서만 구성하며 중앙 task payload의 URL·host·header·token은 받지 않습니다. 현재 전송기는 인증 token, cookie와 사용자 지정 header를 지원하지 않으므로 별도 자격 증명 없이 접근 가능한 신뢰 HTTPS origin이 필요합니다.
+
+패키지형 서버는 `/var/lib/dure/artifacts/chunks/sha256`의 안전한 일반 파일만 같은 공개 HTTPS 경로로 제공합니다. 파일 이름은 64자리 소문자 SHA-256이어야 하고, symlink·hard link·group/other 쓰기 가능한 파일·크기 범위 밖 파일은 제공하지 않습니다. 중단된 다운로드를 위한 `Range: bytes=<offset>-`만 허용하며 immutable cache header를 반환합니다. 청크 내용은 Agent가 다시 SHA-256 검증하므로 중앙 DB 등록만으로 임의 바이트를 신뢰하지 않습니다. 이 공개 디렉터리에 credential, token 또는 비공개 데이터는 두지 않습니다.
 
 ## 현재 `STAGE` 생성·등록·소비 범위
 

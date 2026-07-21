@@ -1,0 +1,268 @@
+#!/usr/bin/python3
+"""Closed single-GPU vLLM benchmark entrypoint shipped by Dure."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+import uuid
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("run",))
+    parser.add_argument("--suite", required=True, choices=("dure-serving-slo-v1",))
+    parser.add_argument(
+        "--workload",
+        required=True,
+        choices=(
+            "short-chat-1k-128",
+            "long-chat-4k-256",
+            "max-context",
+            "quality-eval",
+        ),
+    )
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--artifact-revision", required=True)
+    parser.add_argument("--artifact-manifest-digest", required=True)
+    parser.add_argument("--quantization", required=True)
+    parser.add_argument("--input-tokens", required=True, type=int)
+    parser.add_argument("--output-tokens", required=True, type=int)
+    parser.add_argument("--concurrency", required=True, type=int)
+    parser.add_argument("--warmup-requests", required=True, type=int)
+    parser.add_argument("--request-count", required=True, type=int)
+    parser.add_argument("--duration-seconds", required=True, type=float)
+    parser.add_argument("--output-format", required=True, choices=("json-summary-v1",))
+    return parser
+
+
+def _p95(values: list[float]) -> float:
+    if not values:
+        raise RuntimeError("no successful latency measurements")
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def _gpu_headroom() -> float:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    total_text, used_text = result.stdout.strip().splitlines()[0].split(",", 1)
+    total = float(total_text.strip())
+    used = float(used_text.strip())
+    return max(0.0, min(100.0, 100.0 * (total - used) / total))
+
+
+async def _run(args: argparse.Namespace) -> dict[str, object]:
+    os.environ.update(
+        {
+            "HOME": "/tmp",
+            "USER": "dure-benchmark",
+            "LOGNAME": "dure-benchmark",
+            "HF_HOME": "/tmp/huggingface",
+            "VLLM_CONFIG_ROOT": "/tmp/vllm-config",
+            "VLLM_CACHE_ROOT": "/tmp/vllm-cache",
+            "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+    )
+
+    fixed_dimensions = {
+        "short-chat-1k-128": (1024, 128, 8),
+        "long-chat-4k-256": (4096, 256, 4),
+        "quality-eval": (1024, 256, 1),
+    }
+    if (
+        args.warmup_requests != 20
+        or args.request_count != 200
+        or args.duration_seconds != 900.0
+    ):
+        raise ValueError("measurement dimensions do not match benchmark v1")
+    expected = fixed_dimensions.get(args.workload)
+    if expected is not None and (
+        args.input_tokens,
+        args.output_tokens,
+        args.concurrency,
+    ) != expected:
+        raise ValueError("workload dimensions do not match benchmark v1")
+    if args.workload == "max-context" and (
+        args.input_tokens <= 0
+        or args.output_tokens != 256
+        or args.concurrency != 1
+    ):
+        raise ValueError("max-context dimensions do not match benchmark v1")
+    if args.quantization != "awq":
+        raise ValueError("benchmark v1 requires an AWQ model")
+
+    from transformers import AutoTokenizer
+    from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+    engine = AsyncLLMEngine.from_engine_args(
+        AsyncEngineArgs(
+            model=args.model,
+            tokenizer=args.model,
+            dtype="bfloat16",
+            max_model_len=args.input_tokens + args.output_tokens,
+            max_num_seqs=args.concurrency,
+            gpu_memory_utilization=0.70,
+            enforce_eager=True,
+            disable_log_stats=True,
+            trust_remote_code=False,
+        )
+    )
+    sampling = SamplingParams(
+        temperature=0.0,
+        max_tokens=args.output_tokens,
+        min_tokens=args.output_tokens,
+        ignore_eos=True,
+        seed=737,
+    )
+
+    filler_unit = tokenizer.encode(" neutral context", add_special_tokens=False)
+    if not filler_unit:
+        raise RuntimeError("tokenizer produced no filler tokens")
+
+    def prompt(index: int) -> tuple[list[int], str]:
+        expected = f"DURE-{index:04d}-OK"
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "This is a deterministic instruction-following check. "
+                    f"Begin the answer with exactly {expected}."
+                ),
+            }
+        ]
+        base = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        if len(base) > args.input_tokens:
+            raise RuntimeError("quality prompt exceeds the fixed input size")
+        needed = args.input_tokens - len(base)
+        filler = (filler_unit * math.ceil(needed / len(filler_unit)))[:needed]
+        tokens = filler + list(base)
+        if len(tokens) != args.input_tokens:
+            raise RuntimeError("quality prompt token count is not exact")
+        return tokens, expected
+
+    async def one(index: int) -> tuple[float, float, float, int, bool]:
+        tokens, expected = prompt(index)
+        started = time.perf_counter()
+        first = None
+        final = None
+        async for output in engine.generate(tokens, sampling, str(uuid.uuid4())):
+            if first is None:
+                first = time.perf_counter()
+            final = output
+        ended = time.perf_counter()
+        if first is None or final is None or not final.outputs:
+            raise RuntimeError("vLLM returned no output")
+        item = final.outputs[0]
+        count = len(item.token_ids)
+        if count != args.output_tokens:
+            raise RuntimeError("vLLM output token count is not exact")
+        ttft_ms = (first - started) * 1000.0
+        e2e_ms = (ended - started) * 1000.0
+        tpot_ms = max(0.000001, (e2e_ms - ttft_ms) / max(1, count - 1))
+        return ttft_ms, tpot_ms, e2e_ms, count, item.text.startswith(expected)
+
+    async def batch(start: int, count: int, *, tolerate_failure: bool):
+        return await asyncio.gather(
+            *(one(start + offset) for offset in range(count)),
+            return_exceptions=tolerate_failure,
+        )
+
+    for start in range(0, args.warmup_requests, args.concurrency):
+        await batch(
+            10000 + start,
+            min(args.concurrency, args.warmup_requests - start),
+            tolerate_failure=False,
+        )
+
+    ttft: list[float] = []
+    tpot: list[float] = []
+    e2e: list[float] = []
+    generated_tokens = 0
+    quality_hits = 0
+    successes = 0
+    measurement_started = time.perf_counter()
+    for start in range(0, args.request_count, args.concurrency):
+        results = await batch(
+            start,
+            min(args.concurrency, args.request_count - start),
+            tolerate_failure=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                continue
+            first_ms, per_token_ms, total_ms, count, quality_ok = result
+            ttft.append(first_ms)
+            tpot.append(per_token_ms)
+            e2e.append(total_ms)
+            generated_tokens += count
+            successes += 1
+            quality_hits += int(quality_ok)
+    measured = time.perf_counter() - measurement_started
+    if successes == 0:
+        raise RuntimeError("all measured requests failed")
+    if measured < args.duration_seconds:
+        await asyncio.sleep(args.duration_seconds - measured)
+    elapsed = time.perf_counter() - measurement_started
+
+    return {
+        "warmup_requests": args.warmup_requests,
+        "request_count": args.request_count,
+        "duration_seconds": elapsed,
+        "oom_count": 0,
+        "crash_count": args.request_count - successes,
+        "restart_count": 0,
+        "ttft_p95_ms": _p95(ttft),
+        "tpot_p95_ms": _p95(tpot),
+        "e2e_p95_ms": _p95(e2e),
+        "throughput_tps": generated_tokens / elapsed,
+        "success_rate": successes / args.request_count,
+        "vram_headroom_pct": _gpu_headroom(),
+        "quality_score": quality_hits / args.request_count,
+    }
+
+
+def main() -> int:
+    args = _parser().parse_args()
+    summary_fd = os.dup(sys.stdout.fileno())
+    with open("/tmp/dure-benchmark-runtime.log", "w", encoding="utf-8") as log:
+        os.dup2(log.fileno(), sys.stdout.fileno())
+        os.dup2(log.fileno(), sys.stderr.fileno())
+        try:
+            summary = asyncio.run(_run(args))
+        except Exception:
+            return 1
+    os.write(
+        summary_fd,
+        (json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
