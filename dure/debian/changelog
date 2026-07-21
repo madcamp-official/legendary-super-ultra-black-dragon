@@ -1,3 +1,11 @@
+dure (0.4.7) UNRELEASED; urgency=medium
+
+  * 이기종 GPU 풀에서도 노드당 한 GPU와 네 모델·TP=1 계약을 수용 검사합니다.
+  * 소규모 조합부터 100개 이상 노드까지 비중첩 Fleet 확장을 검증합니다.
+  * 결정론, 구조화 미배정 사유와 후보·탐색 안전 한도의 회귀를 고정합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:59:59 +0900
+
 dure (0.4.6) UNRELEASED; urgency=medium
 
   * 수락된 Fleet의 배포별 모델·이미지 준비와 명시적 적용을 추가합니다.
