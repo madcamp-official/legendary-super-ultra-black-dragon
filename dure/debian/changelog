@@ -1,3 +1,11 @@
+dure (0.4.9) UNRELEASED; urgency=medium
+
+  * vLLM V1 벤치마크의 비동기 스케줄링을 꺼 첫 요청 정지를 방지합니다.
+  * 벤치마크를 create/start 단계로 분리해 시간 초과 후 exact 컨테이너를 정리합니다.
+  * Docker 29의 stop --timeout 옵션을 사용해 폐기 경고를 제거합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 17:10:00 +0000
+
 dure (0.4.8) UNRELEASED; urgency=medium
 
   * 단일 GPU ACTIVE 벤치마크를 예열 2회와 측정 20회로 단축합니다.

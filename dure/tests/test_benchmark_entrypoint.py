@@ -106,6 +106,7 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
             ]
         )
         observed_prompts = []
+        observed_engine_args = []
 
         class FakeTokenizer:
             def encode(self, _text, *, add_special_tokens):
@@ -130,8 +131,8 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
                 return FakeTokenizer()
 
         class FakeAsyncEngineArgs:
-            def __init__(self, **_kwargs):
-                pass
+            def __init__(self, **kwargs):
+                observed_engine_args.append(kwargs)
 
         class FakeAsyncLLMEngine:
             @classmethod
@@ -171,6 +172,8 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
             asyncio.run(module._run(args))
 
         self.assertEqual(len(observed_prompts), 22)
+        self.assertEqual(len(observed_engine_args), 1)
+        self.assertIs(observed_engine_args[0]["async_scheduling"], False)
         sleep.assert_not_awaited()
         self.assertTrue(
             all(

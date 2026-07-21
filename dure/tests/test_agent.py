@@ -1248,7 +1248,7 @@ class AgentTaskExecutorTests(unittest.TestCase):
             if command[:3] == ("docker", "container", "inspect"):
                 inspect_count += 1
                 return 0, identity("running" if inspect_count < 3 else "exited"), ""
-            if command[:4] == ("docker", "stop", "--time", "30"):
+            if command[:4] == ("docker", "stop", "--timeout", "30"):
                 return 0, container_id, ""
             if command == ("docker", "rm", container_id):
                 return 0, container_id, ""
@@ -1268,7 +1268,7 @@ class AgentTaskExecutorTests(unittest.TestCase):
             raised.exception.failure_code, "BENCHMARK_PAYLOAD_REJECTED"
         )
         self.assertIn(
-            ("docker", "stop", "--time", "30", container_id), runner.calls
+            ("docker", "stop", "--timeout", "30", container_id), runner.calls
         )
         self.assertIn(("docker", "rm", container_id), runner.calls)
         self.assertFalse(any(call[0] == "nvidia-smi" for call in runner.calls))

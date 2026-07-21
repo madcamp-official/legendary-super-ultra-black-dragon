@@ -198,11 +198,19 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             if command[:3] == ("docker", "image", "inspect"):
                 return 0, "sha256:image", ""
             if command[:3] == ("docker", "container", "inspect"):
+                if any(call[:3] == ("docker", "start", "--attach") for call in runner.calls):
+                    return 0, container_identity(state="exited"), ""
+                if any(call[:2] == ("docker", "create") for call in runner.calls):
+                    return 0, container_identity(state="created"), ""
                 return 1, "", "not found"
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, "a" * 64, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 0, json.dumps(expected_metrics), ""
+            if command == ("docker", "rm", "a" * 64):
+                return 0, "a" * 64, ""
             raise AssertionError(f"unexpected command: {command}")
 
         runner = FakeRunner(response_factory=respond)
@@ -224,11 +232,12 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 "nccl_all_reduce_ok": None,
             },
         )
-        self.assertEqual(len(runner.calls), 6)
+        self.assertEqual(len(runner.calls), 10)
         self.assertEqual(runner.calls[3], BENCHMARK_CONTAINER_LIST)
         self.assertEqual(runner.calls[4], NVIDIA_COMPUTE_QUERY_COMMAND)
-        command = runner.calls[-1]
-        self.assertEqual(command[:2], ("docker", "run"))
+        command = next(call for call in runner.calls if call[:2] == ("docker", "create"))
+        self.assertEqual(command[:2], ("docker", "create"))
+        self.assertNotIn("--rm", command)
         pull = command.index("--pull")
         self.assertEqual(command[pull + 1], "never")
         logging = command.index("--log-driver")
@@ -290,7 +299,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertNotIn("stderr", serialized)
         self.assertEqual(
             runner.limited_output_calls,
-            [(command, MAX_BENCHMARK_OUTPUT_BYTES)],
+            [(("docker", "start", "--attach", "a" * 64), MAX_BENCHMARK_OUTPUT_BYTES)],
         )
         self.assertEqual(
             runner.limited_output_timeouts,
@@ -587,21 +596,28 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 return 0, "sha256:image", ""
             if command[:3] == ("docker", "container", "inspect"):
                 inspect_count += 1
+                states = ("running", "running", "exited", "created", "exited")
                 return (
                     0,
                     container_identity(
-                        state="running" if inspect_count < 3 else "exited",
-                        started_at="2000-01-01T00:00:00Z",
+                        state=states[inspect_count - 1],
+                        started_at=(
+                            "2000-01-01T00:00:00Z"
+                            if inspect_count <= 3
+                            else None
+                        ),
                     ),
                     "",
                 )
-            if command[:4] == ("docker", "stop", "--time", "30"):
+            if command[:4] == ("docker", "stop", "--timeout", "30"):
                 return 0, container_id, ""
             if command == ("docker", "rm", container_id):
                 return 0, container_id, ""
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, container_id, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 0, json.dumps(metrics()), ""
             raise AssertionError(f"unexpected command: {command}")
 
@@ -612,10 +628,10 @@ class BenchmarkRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["metrics"]["request_count"], 20)
         self.assertIn(
-            ("docker", "stop", "--time", "30", container_id), runner.calls
+            ("docker", "stop", "--timeout", "30", container_id), runner.calls
         )
         self.assertIn(("docker", "rm", container_id), runner.calls)
-        self.assertEqual(runner.calls[-1][:2], ("docker", "run"))
+        self.assertIn(("docker", "start", "--attach", container_id), runner.calls)
 
     def test_expired_container_is_cleaned_before_dynamic_memory_rejection(self):
         inspect_count = 0
@@ -634,7 +650,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                     ),
                     "",
                 )
-            if command[:4] == ("docker", "stop", "--time", "30"):
+            if command[:4] == ("docker", "stop", "--timeout", "30"):
                 return 0, container_id, ""
             if command == ("docker", "rm", container_id):
                 return 0, container_id, ""
@@ -647,7 +663,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             SafeBenchmarkRuntime(runner)(payload(), self.profile, self.cached_model)
 
         self.assertIn(
-            ("docker", "stop", "--time", "30", container_id), runner.calls
+            ("docker", "stop", "--timeout", "30", container_id), runner.calls
         )
         self.assertIn(("docker", "rm", container_id), runner.calls)
         self.assertFalse(
@@ -775,17 +791,24 @@ class BenchmarkRuntimeTests(unittest.TestCase):
     def test_retry_removes_only_the_exact_stopped_benchmark_container(self):
         expected_metrics = metrics()
         container_id = "a" * 64
+        inspect_count = 0
 
         def respond(command):
+            nonlocal inspect_count
             if command[:3] == ("docker", "image", "inspect"):
                 return 0, "sha256:image", ""
             if command[:3] == ("docker", "container", "inspect"):
-                return 0, container_identity(state="exited"), ""
+                inspect_count += 1
+                return 0, container_identity(
+                    state=("exited", "created", "exited")[inspect_count - 1]
+                ), ""
             if command == ("docker", "rm", container_id):
                 return 0, container_id, ""
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, container_id, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 0, json.dumps(expected_metrics), ""
             raise AssertionError(f"unexpected command: {command}")
 
@@ -796,23 +819,30 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertEqual(runner.calls[1], ("docker", "rm", container_id))
         self.assertEqual(runner.calls[3], BENCHMARK_CONTAINER_LIST)
         self.assertEqual(runner.calls[4], NVIDIA_COMPUTE_QUERY_COMMAND)
-        self.assertEqual(runner.calls[5][:2], ("docker", "run"))
+        self.assertIn(("docker", "start", "--attach", container_id), runner.calls)
         self.assertFalse(any(command[:2] == ("docker", "stop") for command in runner.calls))
 
     def test_retry_removes_exact_orphan_created_container_then_reruns(self):
         expected_metrics = metrics()
         container_id = "a" * 64
+        inspect_count = 0
 
         def respond(command):
+            nonlocal inspect_count
             if command[:3] == ("docker", "image", "inspect"):
                 return 0, "sha256:image", ""
             if command[:3] == ("docker", "container", "inspect"):
-                return 0, container_identity(state="created"), ""
+                inspect_count += 1
+                return 0, container_identity(
+                    state=("created", "created", "exited")[inspect_count - 1]
+                ), ""
             if command == ("docker", "rm", container_id):
                 return 0, container_id, ""
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, container_id, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 0, json.dumps(expected_metrics), ""
             raise AssertionError(f"unexpected command: {command}")
 
@@ -823,7 +853,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["metrics"]["request_count"], 20)
         self.assertIn(("docker", "rm", container_id), runner.calls)
-        self.assertEqual(runner.calls[-1][:2], ("docker", "run"))
+        self.assertIn(("docker", "start", "--attach", container_id), runner.calls)
         self.assertFalse(
             any(command[:2] == ("docker", "stop") for command in runner.calls)
         )
@@ -852,17 +882,25 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             if command[:3] == ("docker", "image", "inspect"):
                 return 0, "sha256:image", ""
             if command[:3] == ("docker", "container", "inspect"):
+                if any(call[:3] == ("docker", "start", "--attach") for call in runner.calls):
+                    return 0, container_identity(state="exited"), ""
+                if any(call[:2] == ("docker", "create") for call in runner.calls):
+                    return 0, container_identity(state="created"), ""
                 return 1, "", "not found"
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, "a" * 64, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 0, json.dumps(metrics()), ""
+            if command == ("docker", "rm", "a" * 64):
+                return 0, "a" * 64, ""
             raise AssertionError(f"unexpected command: {command}")
 
         runner = FakeRunner(response_factory=respond)
         SafeBenchmarkRuntime(runner)(payload(), self.profile, self.cached_model)
 
-        command = runner.calls[-1]
+        command = next(call for call in runner.calls if call[:2] == ("docker", "create"))
         gpus = command.index("--gpus")
         self.assertEqual(
             command[gpus + 1],
@@ -936,12 +974,16 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 inspect_count += 1
                 if inspect_count == 1:
                     return 1, "", "not found"
-                return 0, container_identity(state="running" if inspect_count == 2 else "exited"), ""
+                return 0, container_identity(
+                    state=("created" if inspect_count == 2 else "running" if inspect_count == 3 else "exited")
+                ), ""
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, "a" * 64, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 124, "", "command timed out"
-            if command[:4] == ("docker", "stop", "--time", "30"):
+            if command[:4] == ("docker", "stop", "--timeout", "30"):
                 return 0, "a" * 64, ""
             if command == ("docker", "rm", "a" * 64):
                 return 0, "a" * 64, ""
@@ -952,7 +994,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             SafeBenchmarkRuntime(runner)(payload(), self.profile, self.cached_model)
 
         self.assertIn(
-            ("docker", "stop", "--time", "30", "a" * 64), runner.calls
+            ("docker", "stop", "--timeout", "30", "a" * 64), runner.calls
         )
         self.assertIn(("docker", "rm", "a" * 64), runner.calls)
         self.assertFalse(any("--force" in command for command in runner.calls))
@@ -978,6 +1020,8 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 inspect_count += 1
                 if inspect_count == 1:
                     return 0, container_identity(state="exited"), ""
+                if inspect_count == 2:
+                    return 0, container_identity(state="created"), ""
                 return 1, "", "temporary daemon error"
             if command == ("docker", "rm", "a" * 64):
                 return 0, "a" * 64, ""
@@ -985,7 +1029,9 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 return 0, "sha256:image", ""
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, "a" * 64, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 124, "", "command timed out"
             raise AssertionError(f"unexpected command: {command}")
 
@@ -996,7 +1042,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         with self.assertRaises(BenchmarkRuntimeDeferred):
             SafeBenchmarkRuntime(runner)(payload(), self.profile, self.cached_model)
 
-        self.assertEqual(inspect_count, 2)
+        self.assertEqual(inspect_count, 3)
         self.assertIn(absence_check, runner.calls)
         self.assertFalse(
             any(command[:2] == ("docker", "stop") for command in runner.calls)
@@ -1016,10 +1062,14 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 inspect_count += 1
                 if inspect_count == 1:
                     return 1, "", "not found"
+                if inspect_count == 2:
+                    return 0, container_identity(state="created"), ""
                 return 0, container_identity(state="running", deployment="production"), ""
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            if command[:2] == ("docker", "run"):
+            if command[:2] == ("docker", "create"):
+                return 0, "a" * 64, ""
+            if command[:3] == ("docker", "start", "--attach"):
                 return 124, "", "command timed out"
             raise AssertionError(f"unexpected command: {command}")
 
@@ -1048,10 +1098,20 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                     if command[:3] == ("docker", "image", "inspect"):
                         return 0, "sha256:image", ""
                     if command[:3] == ("docker", "container", "inspect"):
+                        if any(call[:3] == ("docker", "start", "--attach") for call in runner.calls):
+                            return 0, container_identity(state="exited"), ""
+                        if any(call[:2] == ("docker", "create") for call in runner.calls):
+                            return 0, container_identity(state="created"), ""
                         return 1, "", "not found"
                     if command == BENCHMARK_CONTAINER_LIST:
                         return 0, "", ""
-                    return 0, json.dumps(summary), "raw secret log"
+                    if command[:2] == ("docker", "create"):
+                        return 0, "a" * 64, ""
+                    if command[:3] == ("docker", "start", "--attach"):
+                        return 0, json.dumps(summary), "raw secret log"
+                    if command == ("docker", "rm", "a" * 64):
+                        return 0, "a" * 64, ""
+                    raise AssertionError(f"unexpected command: {command}")
 
                 runner = FakeRunner(response_factory=respond)
                 with self.assertRaises(BenchmarkRuntimeError) as raised:
@@ -1071,13 +1131,24 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             if command[:3] == ("docker", "image", "inspect"):
                 return 0, "sha256:image", ""
             if command[:3] == ("docker", "container", "inspect"):
+                if any(call[:3] == ("docker", "start", "--attach") for call in runner.calls):
+                    return 0, container_identity(state="exited"), ""
+                if any(call[:2] == ("docker", "create") for call in runner.calls):
+                    return 0, container_identity(state="created"), ""
                 return 1, "", "not found"
             if command == BENCHMARK_CONTAINER_LIST:
                 return 0, "", ""
-            return 0, duplicate, ""
+            if command[:2] == ("docker", "create"):
+                return 0, "a" * 64, ""
+            if command[:3] == ("docker", "start", "--attach"):
+                return 0, duplicate, ""
+            if command == ("docker", "rm", "a" * 64):
+                return 0, "a" * 64, ""
+            raise AssertionError(f"unexpected command: {command}")
 
+        runner = FakeRunner(response_factory=duplicate_response)
         with self.assertRaisesRegex(BenchmarkRuntimeError, "valid summary"):
-            SafeBenchmarkRuntime(FakeRunner(response_factory=duplicate_response))(
+            SafeBenchmarkRuntime(runner)(
                 payload(), self.profile, self.cached_model
             )
 

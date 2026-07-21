@@ -694,7 +694,7 @@ class SafeBenchmarkRuntime:
         )
         self._ensure_selected_gpu_idle(gpu_uuid)
 
-        command = self._container_command(
+        create_command = self._container_command(
             payload,
             name=name,
             model_path=model_path,
@@ -709,15 +709,52 @@ class SafeBenchmarkRuntime:
                 "benchmark runner cannot enforce the output limit",
                 code="BENCHMARK_RUNTIME_UNAVAILABLE",
             )
+        created = self.runner.run(create_command, timeout=60)
+        if not created.ok:
+            self._cleanup_failed_container(payload, name=name)
+            raise BenchmarkRuntimeError("benchmark container creation failed")
+        container_id = created.stdout.strip()
+        if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            self._cleanup_failed_container(payload, name=name)
+            raise BenchmarkRuntimeError("benchmark container identity is invalid")
+        existing = self.runner.run(
+            [
+                "docker",
+                "container",
+                "inspect",
+                "--format",
+                BENCHMARK_CONTAINER_INSPECT_FORMAT,
+                name,
+            ],
+            timeout=10,
+        )
+        identity = (
+            _benchmark_container_identity(existing.stdout, payload)
+            if existing.ok
+            else None
+        )
+        if (
+            identity is None
+            or identity[0] != container_id
+            or identity[1] != "created"
+        ):
+            self._cleanup_failed_container(payload, name=name)
+            raise BenchmarkRuntimeError("benchmark container identity is invalid")
+
         result = limited_run(
-            command,
+            ["docker", "start", "--attach", container_id],
             timeout=payload.duration_seconds + BENCHMARK_CONTAINER_GRACE_SECONDS,
             max_output_bytes=MAX_BENCHMARK_OUTPUT_BYTES,
         )
         if not result.ok:
             self._cleanup_failed_container(payload, name=name)
             raise BenchmarkRuntimeError("benchmark container execution failed")
-        metrics = _validated_metrics(result.stdout, payload)
+        try:
+            metrics = _validated_metrics(result.stdout, payload)
+        except Exception:
+            self._cleanup_failed_container(payload, name=name)
+            raise
+        self._cleanup_failed_container(payload, name=name)
         return {
             "benchmark_id": payload.benchmark_id,
             "workload_id": payload.workload_id,
@@ -833,7 +870,7 @@ class SafeBenchmarkRuntime:
         container_id, state, _ = identity
         if state in {"running", "restarting", "paused"}:
             stopped = self.runner.run(
-                ["docker", "stop", "--time", "30", container_id], timeout=45
+                ["docker", "stop", "--timeout", "30", container_id], timeout=45
             )
             if not stopped.ok:
                 raise BenchmarkRuntimeDeferred(
@@ -900,8 +937,7 @@ class SafeBenchmarkRuntime:
         )
         command = [
             "docker",
-            "run",
-            "--rm",
+            "create",
             "--pull",
             "never",
             "--name",
