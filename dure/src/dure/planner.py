@@ -19,6 +19,12 @@ from .selector import InventoryNode, recommend_model
 MODELS: dict[str, ModelSpec] = STATIC_CATALOG.models
 _NETWORK_INTERFACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}")
 
+# Rank 0 hosts the embedding/lm_head tensors plus the Ray/vLLM driver process,
+# fixed overhead the other pipeline stages don't pay. Derate its effective
+# memory before proportional layer partitioning so it isn't assigned as many
+# transformer layers as a same-size GPU on a worker stage.
+HEAD_STAGE_OVERHEAD_FACTOR = 0.85
+
 
 class StrictRayPPTopologyError(ValueError):
     def __init__(
@@ -214,12 +220,28 @@ def _safe_id(value: str) -> str:
     return cleaned or "dure"
 
 
-def _layer_partitions(layer_count: int, stages: int) -> list[tuple[int, int]]:
-    base, extra = divmod(layer_count, stages)
+def _layer_partitions(layer_count: int, stages: int, weights: list[int] | None = None) -> list[tuple[int, int]]:
+    if weights is None or len(weights) != stages or sum(weights) <= 0:
+        weights = [1] * stages
+
+    # Largest-remainder method: give every stage at least one layer, then
+    # allocate the rest proportionally to GPU memory so a stage backed by a
+    # bigger GPU gets more layers than one backed by a smaller GPU.
+    total_weight = sum(weights)
+    remaining = layer_count - stages
+    if remaining < 0:
+        raise ValueError(f"layer_count ({layer_count}) must be >= stages ({stages})")
+
+    raw = [remaining * weight / total_weight for weight in weights]
+    sizes = [1 + int(share) for share in raw]
+    shortfall = layer_count - sum(sizes)
+    remainders = sorted(range(stages), key=lambda i: raw[i] - int(raw[i]), reverse=True)
+    for i in range(shortfall):
+        sizes[remainders[i % stages]] += 1
+
     partitions: list[tuple[int, int]] = []
     cursor = 0
-    for stage in range(stages):
-        size = base + (1 if stage < extra else 0)
+    for size in sizes:
         partitions.append((cursor, cursor + size - 1))
         cursor += size
     return partitions
@@ -239,6 +261,7 @@ def build_plan(
         raise ValueError(f"duplicate node profile(s): {', '.join(duplicates)}")
 
     healthy: list[tuple[NodeProfile, int]] = []
+    unused_gpu_warnings: list[str] = []
     for profile in profiles:
         node_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
         if node_gpus:
@@ -246,6 +269,12 @@ def build_plan(
             # until multi-GPU-per-node assignments are implemented explicitly.
             gpu = max(node_gpus, key=lambda item: item.memory_mib)
             healthy.append((profile, gpu.index))
+            leftover = [g for g in node_gpus if g.index != gpu.index]
+            if leftover:
+                unused_gpu_warnings.append(
+                    f"node {profile.node_id}: {len(leftover)} additional healthy GPU(s) "
+                    f"(index {', '.join(str(g.index) for g in leftover)}) not scheduled"
+                )
 
     if not healthy:
         return None
@@ -280,7 +309,14 @@ def build_plan(
         selected = eligible[:required_stages]
 
     stages = len(selected)
-    partitions = _layer_partitions(model.layer_count, stages)
+    weights = [_gpu_for(profile, gpu_index).memory_mib for profile, gpu_index in selected]
+    if weights:
+        # Rank 0 also carries the embedding/lm_head tensors and the Ray/vLLM
+        # driver process, which the other stages don't pay for. Discount its
+        # weight before the proportional split so it doesn't get assigned as
+        # many transformer layers as a same-size GPU on a worker stage.
+        weights[0] = int(weights[0] * HEAD_STAGE_OVERHEAD_FACTOR)
+    partitions = _layer_partitions(model.layer_count, stages, weights)
     head_profile = selected[0][0]
     head_ip = head_profile.network.addresses[0] if head_profile.network.addresses else "127.0.0.1"
     interface = (
@@ -305,6 +341,12 @@ def build_plan(
     warnings: list[str] = []
     if "@sha256:" not in image:
         warnings.append("Container image is unpinned; use an immutable digest before production")
+    selected_node_ids = {profile.node_id for profile, _gpu_index in selected}
+    warnings.extend(
+        warning
+        for warning in unused_gpu_warnings
+        if warning.split(":", 1)[0].removeprefix("node ") in selected_node_ids
+    )
     driver_versions = {
         _gpu_for(profile, gpu_index).driver_version for profile, gpu_index in selected
     }
