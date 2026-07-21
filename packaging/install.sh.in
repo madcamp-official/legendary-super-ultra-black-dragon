@@ -44,5 +44,7 @@ printf '%s\n' \
 apt-get update
 apt-get install -y dure
 
-echo 'Dure is installed. Run: dure doctor'
-
+echo 'Dure is installed.'
+echo 'GPU node: sudo dure bootstrap, review, then sudo dure bootstrap --apply'
+echo 'After runtime preparation: sudo dure doctor, then sudo dure join'
+echo 'CPU utility node: skip bootstrap and run sudo dure join'

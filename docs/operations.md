@@ -31,6 +31,46 @@ systemctl restart dure-server
 curl -fsS http://127.0.0.1:8081/health
 ```
 
+## GPU 노드 런타임 준비
+
+GPU 노드에는 Dure 패키지와 정상 동작하는 NVIDIA host driver가 먼저 있어야 합니다. 현재 bootstrap 지원 범위는 Ubuntu 22.04·24.04의 `amd64`·`arm64`입니다. 다만 공식 Dure APT 저장소는 아직 `amd64`만 게시합니다. `arm64`에서는 CLI·Agent 실행 파일과 함께 패키지의 `dure-agent.service`, `/etc/dure/dure-client.env`를 별도로 설치해야 하며 unit이 없으면 bootstrap을 차단합니다. CPU utility 노드는 Docker/NVIDIA runtime 준비를 건너뛸 수 있습니다.
+
+먼저 root 권한으로 읽기 전용 계획을 확인합니다. 이 단계는 APT 설정, Docker 설정과 서비스를 바꾸지 않습니다.
+
+```bash
+sudo dure bootstrap
+sudo dure bootstrap --json
+```
+
+검사는 OS·architecture, 기존 driver, Docker daemon, Toolkit 패키지 전체, Docker의 exact `nvidia` runtime, Dure가 사용하는 저장소·설정 경로와 예정 작업을 평가합니다. report에는 각 검사 코드·설명과 폐쇄형 예정 작업을 기록합니다. 다음 조건은 자동 복구하지 않고 차단합니다.
+
+- NVIDIA driver가 없거나 `nvidia-smi`가 GPU를 보고하지 않습니다.
+- Docker가 없는데 `docker.io`, `containerd`, `runc`, `podman-docker` 같은 충돌 패키지가 있습니다.
+- NVIDIA Toolkit이 일부 패키지나 실행 파일만 가진 부분 설치 상태이거나 네 패키지가 지원 고정 버전과 다릅니다.
+- 기존 Docker가 로컬 `/var/run/docker.sock`의 systemd `docker.service`가 아니거나 daemon에 연결할 수 없거나, 재부팅 뒤 `docker.service` 또는 `docker.socket` 기동이 유지됨을 증명할 수 없습니다.
+- Docker CLI가 없더라도 Docker CE 패키지 일부, `dockerd`, `docker.service`나 `/var/run/docker.sock`이 남아 있어 미설치를 증명할 수 없습니다.
+- Docker CLI 또는 Engine 버전이 GPU runtime과 `--pull never` 계약에 필요한 20.10보다 낮거나 버전을 해석할 수 없습니다.
+- Dure Agent systemd unit이 없거나 Agent가 활성 상태이거나 `/etc/dure/agent.json`이 이미 존재합니다.
+- APT key/source, `/etc/docker/daemon.json`, Dure backup 또는 그 부모가 예상과 다르거나 symbolic link입니다. 현재 `daemon.json` 없이 과거 backup만 남은 경우도 자동 해석하지 않습니다.
+
+검토 뒤 명시적으로 적용하고 다시 조사한 다음 노드를 등록합니다.
+
+```bash
+sudo dure bootstrap --apply
+sudo dure doctor
+sudo dure join
+```
+
+적용은 Docker 공식 Ubuntu stable 저장소와 NVIDIA 공식 stable 저장소의 고정 URL을 추가해 사용하고, bootstrap이 새로 사용하거나 Dure의 고정 경로에 이미 있는 keyring에 기대한 primary key 하나만 있는지 fingerprint로 검사합니다. key와 부모는 APT의 비권한 key reader가 읽고 통과할 수 있어야 합니다. 실행 명령은 고정된 system `PATH`와 C locale을 사용하고 호출 셸의 proxy·APT·GPG 환경 설정 및 curl 사용자 설정은 상속하지 않습니다. 폐쇄망이나 proxy 전용 환경은 신뢰된 시스템 APT 설정과 별도 오프라인 provisioning 절차를 먼저 준비해야 합니다. Docker 설치는 제거를 허용하지 않는 닫힌 패키지 목록을 사용하고, Toolkit 네 패키지는 `1.19.1-1`로 설치해 `/etc/apt/preferences.d/dure-nvidia-container-toolkit`에서 우선순위 1001로 고정합니다. pin 파일이 다르면 자동 덮어쓰지 않습니다. 기존 `daemon.json`은 NVIDIA 설정 전에 `/var/lib/dure/bootstrap/daemon.json.before-nvidia-ctk`에 root 전용으로 보존합니다. `nvidia-ctk` 설정이 실패하면 원래 내용·권한·소유자만 복원하고 Docker를 재시작하지 않습니다. Docker 재시작을 이미 시도한 뒤 실패하거나 runtime이 확인되지 않으면 설정을 복원하고 기존 설정으로 복구 재시작을 한 번 시도합니다.
+
+NVIDIA runtime을 처음 등록하면 Docker 재시작이 필요합니다. bootstrap은 사전 검사와 재시작 직전에 실행 중 컨테이너를 다시 조사합니다. 하나라도 있으면 기본 적용을 중단하므로 workload를 직접 확인하고 유지보수 시간을 확보한 경우에만 다음 승인을 추가합니다.
+
+```bash
+sudo dure bootstrap --apply --allow-docker-restart
+```
+
+이 승인은 특정 Dure 컨테이너가 아니라 해당 Docker daemon의 모든 실행 workload가 잠시 중단될 수 있음을 뜻합니다. bootstrap은 host firewall을 수정하지 않지만 Docker Engine 설치 자체가 netfilter 규칙과 forwarding 동작에 영향을 줄 수 있으므로 적용 전후 방화벽을 별도로 검증합니다. 사용자를 `docker` 그룹에 추가하지 않으므로 준비 직후 검증은 `sudo dure doctor`로 실행합니다. 이 명령은 NVIDIA driver, 모델, 이미지, 컨테이너, 배포와 Agent 자격 증명을 만들거나 바꾸지 않습니다. 미설정 패키지 Agent는 `/etc/dure/agent.json`이 없으면 시작되지 않고 `dure join`이 설정을 쓴 뒤 활성화합니다. bootstrap apply와 join은 `/run/lock/dure-host-setup.lock`을 공유하며, 등록이 먼저 시작됐거나 노드가 이미 등록·활성화된 경우 bootstrap은 별도의 drain 절차를 추측하지 않고 거부합니다.
+
 ## 노드 등록과 승인
 
 ```bash

@@ -13,6 +13,8 @@ git diff --check
 
 기본 패키지는 Ubuntu 22.04용 노드 패키지를 가볍게 유지하기 위해 외부 Python 의존성을 두지 않습니다. 중앙 제어면 의존성은 `server` 추가 의존성, 전체 테스트 의존성은 `test` 추가 의존성에 있습니다.
 
+host bootstrap 테스트는 임시 root와 `FakeRunner`만 사용하며 실제 GPU, Docker daemon, systemd, APT 저장소나 인터넷을 요구하지 않습니다. 기본 preview의 무변경성, NVIDIA driver 명령 부재, exact 공식 URL·primary key·패키지·version pin, 전송 중 signing key 출력 상한, APT 제거 금지, Agent/join lock, 충돌·부분 설치·unsafe 또는 APT가 통과할 수 없는 경로 거부, 재시작 직전 workload 재검사, 재시작 후 exact runtime 검사와 실패 뒤 `daemon.json` 복구를 정상·거부 경로로 함께 검증합니다. bootstrap을 중앙 task나 사용자 제공 셸·Docker 옵션 실행 경로와 연결하면 안 됩니다.
+
 로컬 controller 예시:
 
 ```bash

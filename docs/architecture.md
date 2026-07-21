@@ -19,6 +19,8 @@ Dure는 세 개의 협력 계층으로 구성됩니다.
 - root 권한 에이전트는 중앙 제어면에 외부 방향 폴링으로 연결하고, 미리 정의된 Python 작업만 실행합니다.
 - Ray는 신뢰된 포드 내부의 분산 실행 수단이며, 등록·인증·보안 경계가 아닙니다.
 
+패키지 설치와 노드 등록 사이의 `dure bootstrap`은 별도의 로컬 host 준비 계층입니다. 기본 preview와 root의 명시적 apply를 분리해 기존 NVIDIA driver를 검사하고 Docker Engine·NVIDIA Container Toolkit·Docker runtime만 준비합니다. 중앙 API, 작업 열거형과 Agent payload에는 연결되지 않으며 모델 다운로드, image pull, 컨테이너 실행·중지나 배포를 만들지 않습니다. 패키지 Agent는 `/etc/dure/agent.json`이 생기기 전에는 systemd 조건으로 시작되지 않습니다. bootstrap apply와 join은 같은 host setup lock을 사용하고, bootstrap은 등록 전·Agent 비활성 상태만 허용해 두 수명 주기 변경이 겹치지 않게 합니다.
+
 ## 노드 수명 주기
 
 패키지 설치 시 `/etc/dure/dure-client.env`에 중앙 제어면 주소가 제공됩니다. `sudo dure join`은 설치 ID와 `NodeProfile`을 `POST /v1/nodes/join`으로 보내며, 서버는 노드별 자격 증명을 발급하고 노드를 대기 상태로 기록합니다.

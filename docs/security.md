@@ -15,6 +15,7 @@
 | 권한 없는 노드의 작업 수신 | 새 join은 운영자 승인 전 pending | join rate limit과 네트워크 제한 |
 | 탈취된 node credential | 노드별 hash 저장과 개별 revoke | mTLS와 자동 rotation |
 | 중앙 제어면의 원격 셸화 | 폐쇄형 작업 열거형, 검증된 페이로드와 고정 `BENCHMARK` 실행기 | 호스트 작업 권한 분리 |
+| host bootstrap 공급망·서비스 중단 | 로컬 실행, 변경은 root 전용, 기본 preview, 명시적 apply, 고정 HTTPS 저장소·단일 primary key fingerprint·패키지 allowlist, 제거 금지, 재시작 직전 workload 재검사와 설정 복구 | 패키지 provenance·서명 투명성, 실제 host 수용 검사 |
 | 이미지 치환 | 중앙 계획은 OCI 다이제스트 요구, 준비 작업은 exact digest inspect·필요 시 pull·재inspect | 이미지 서명과 출처 검증 |
 | 모델 아티팩트 변경 | 리비전 고정 정책, 불변 정규 매니페스트, 중앙 준비의 콘텐츠 주소 청크·파일 SHA-256 재검증과 marker-last 캐시 활성화, 추천 apply의 exact evidence 게이트 | 게시자 서명과 provenance 검증 |
 | 오래되거나 손상된 캐시 재사용 | 현재 준비 성공만 만드는 `READY`, 완전한 probe의 강등, 검증 실패의 `CORRUPT` 투영, apply·start·restart·verify·rollback의 exact current-evidence 재검사 | 서명된 노드 증적과 원격 attestation |
@@ -43,6 +44,18 @@
 - 프롬프트와 자격 증명을 기록하지 않고 메타데이터와 오류만 수집합니다.
 - `dure admin diagnose`는 명시적 외부 처리입니다. 선택된 인벤토리가 운영자 컴퓨터의 Codex 제공자로 전송될 수 있지만 자격 증명, 컨테이너 환경 변수·명령, 프롬프트는 전송하지 않습니다.
 - PostgreSQL 백업, 자격 증명 폐기, 복구 절차를 실제로 검증합니다.
+
+## 로컬 host bootstrap의 신뢰 경계
+
+`dure bootstrap`은 중앙 제어면이나 Agent task가 호출할 수 없는 노드 로컬 CLI입니다. 새 원격 작업 종류, 임의 명령, Docker 인자, 환경 변수, mount 또는 host 경로를 받지 않습니다. 기본 실행은 읽기 전용이고 root의 명시적 `--apply`만 APT·파일·service를 변경합니다. 적용은 등록 전·Agent 비활성 노드에 한정하고 `/etc/dure/agent.json`이 있으면 거부합니다. bootstrap apply와 `dure join`은 `/run/lock/dure-host-setup.lock`을 함께 사용해 host 변경과 등록을 직렬화합니다.
+
+지원 대상은 Ubuntu 22.04·24.04의 `amd64`·`arm64`입니다. 기존 NVIDIA driver가 실제 GPU를 보고해야 하며 Dure는 driver와 CUDA host 설치를 변경하지 않습니다. Docker와 Toolkit 저장소 URL, source 내용, Docker 패키지 이름, Toolkit 버전과 네 패키지 이름은 코드에 고정됩니다. Toolkit 네 패키지는 `1.19.1-1` APT pin으로 묶습니다. 모든 외부 명령은 고정된 system `PATH`와 C locale만 전달받아 호출 프로세스의 `APT_CONFIG`, proxy, GPG 관련 환경 변수 등을 상속하지 않으며, key 다운로드는 curl 사용자 설정도 읽지 않습니다. bootstrap이 내려받는 key는 curl 출력이 1MiB를 넘는 즉시 프로세스를 종료하고, Dure의 고정 경로에서 발견한 key도 같은 크기 상한을 적용합니다. HTTPS redirect만 허용하며 별도 임시 GPG home의 colon 출력을 파싱해 기대한 primary fingerprint 하나만 허용합니다. key의 mode와 비권한 APT reader의 부모 경로 접근도 검사하므로 정상 key와 다른 primary key를 함께 신뢰하거나 root만 읽는 key를 등록하지 않습니다. APT 설치에는 제거 금지를 사용하고 알려진 Docker 충돌 패키지, Docker CLI 없이 남은 package·service·socket, Toolkit 부분 설치·pin 충돌이나 고정 버전 불일치를 자동 정리하지 않습니다.
+
+이 검사는 호스트의 모든 APT source와 이미 설치된 패키지의 provenance를 독립적으로 증명하지 않습니다. APT는 호스트가 이미 신뢰하는 다른 source도 함께 해석하므로 동일한 패키지 이름·버전을 제공하는 경쟁 source를 암호학적으로 배제하지 않으며, 기존 exact Toolkit 패키지가 과거 어느 source에서 설치됐는지도 확인하지 않습니다. 운영자는 신뢰 source 목록과 APT policy를 별도로 감사해야 합니다. bootstrap의 고정 URL·key·버전 검사는 전체 패키지 공급망 attestation을 대신하지 않습니다.
+
+기존 Docker를 재설정할 때는 로컬 rootful `/var/run/docker.sock`, 활성 systemd `docker.service`, 재부팅 뒤 service 또는 socket 활성화와 exact runtime JSON을 요구합니다. `nvidia` runtime path는 `nvidia-container-runtime` 또는 `/usr/bin/nvidia-container-runtime`만 허용하고 추가 runtime 인자를 거부합니다. 설정 파일과 부모의 symbolic link·비정상 JSON·고아 또는 충돌 backup을 변경 전에 거부합니다. `daemon.json`이 있으면 원래 bytes·mode·owner를 보존하고, 생성 설정이 `nvidia` runtime 밖의 기존 값을 바꾸면 적용하지 않습니다. `nvidia-ctk` 또는 Docker 재시작 실패 시 원본을 복원합니다. 재시작 직후 exact runtime을 다시 확인하며 실패하면 기존 설정과 service를 복구합니다. 실행 중 컨테이너는 사전 검사와 재시작 직전에 다시 확인하며 `--allow-docker-restart` 없이는 적용을 중단합니다. 검사를 통과해도 마지막 확인과 systemd 재시작 사이의 짧은 local race, host root·Docker daemon 침해, malicious APT mirror가 신뢰 key로 서명된 패키지를 제공하는 위험까지 방어하지는 않습니다.
+
+bootstrap 자체는 모델 다운로드, 이미지 pull, Docker run·stop, 배포 생성, `dure join` 또는 Agent 시작을 수행하지 않습니다. host firewall도 직접 변경하지 않지만 Docker 설치의 netfilter·forwarding 효과는 이 경계 밖이므로 운영자가 적용 전후 검증해야 합니다. 실제 GPU 컨테이너를 pull/run하는 자동 수용 시험도 수행하지 않으며, 준비 뒤 `sudo dure doctor`와 별도 보호된 수용 검사가 필요합니다.
 
 ## 아티팩트 매니페스트의 신뢰 경계
 

@@ -36,6 +36,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"dure {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    bootstrap = subparsers.add_parser(
+        "bootstrap",
+        help="Preview or explicitly install Docker and NVIDIA Container Toolkit",
+    )
+    bootstrap.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the closed installation plan after all preflight checks pass",
+    )
+    bootstrap.add_argument(
+        "--allow-docker-restart",
+        action="store_true",
+        help="Allow the required Docker restart after reviewing running containers",
+    )
+    bootstrap.add_argument(
+        "--json", action="store_true", help="Print the closed bootstrap report as JSON"
+    )
+
     doctor = subparsers.add_parser("doctor", help="Inspect node hardware and runtime")
     doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     doctor.add_argument("--output", type=Path, help="Write the profile to a JSON file")
@@ -262,6 +280,43 @@ def _print_checks(checks: list[CheckResult]) -> None:
         print(f"{marker} {check.name}: {check.detail}")
 
 
+def _bootstrap(args: argparse.Namespace) -> int:
+    from .bootstrap import Bootstrapper
+
+    report = Bootstrapper().run(
+        apply=args.apply,
+        allow_docker_restart=args.allow_docker_restart,
+    )
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        for check in report.checks:
+            marker = {
+                "PASS": "✓",
+                "ACTION_REQUIRED": "!",
+                "BLOCKED": "✗",
+            }.get(check.status, "!")
+            print(f"{marker} {check.code}: {check.detail}")
+        if report.actions:
+            print("Planned actions:")
+            for action in report.actions:
+                suffix = " (restarts Docker)" if action.requires_docker_restart else ""
+                print(f"- {action.action_id}: {action.description}{suffix}")
+        else:
+            print("Planned actions: none")
+        if report.executed_actions:
+            print("Executed actions: " + ", ".join(report.executed_actions))
+        if not args.apply and not report.blocked and report.actions:
+            print("Preview only; run sudo dure bootstrap --apply after review.")
+        if report.ready:
+            print("Bootstrap readiness: ready")
+        elif report.blocked:
+            print("Bootstrap readiness: blocked")
+        else:
+            print("Bootstrap readiness: changes required")
+    return 1 if report.blocked else 0
+
+
 def _doctor(args: argparse.Namespace) -> int:
     profile = NodeProbe().collect()
     if args.output:
@@ -400,7 +455,11 @@ def _verify(args: argparse.Namespace) -> int:
 def _join(args: argparse.Namespace) -> int:
     from .agent import join_control_plane
 
-    result = join_control_plane(server=args.server, insecure=args.insecure)
+    try:
+        result = join_control_plane(server=args.server, insecure=args.insecure)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(f"Joined node {result['node_id']} ({result['status']})")
     print("The agent is running and waiting for central approval.")
     return 0
@@ -649,6 +708,7 @@ def _admin(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     handlers = {
+        "bootstrap": _bootstrap,
         "doctor": _doctor,
         "plan": _plan,
         "init": _init,

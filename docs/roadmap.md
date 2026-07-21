@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
 기준일: 2026-07-21
-현재 누적 개발 브랜치: `version/0.3.20` (결정론적 `STAGE`·`FULL_SNAPSHOT` 선택, 중앙 캐시 수명 주기와 수동 보존 격리, 공식 병합 전 Draft)
+현재 누적 개발 브랜치: `version/0.3.21` (명시적 로컬 Docker·NVIDIA Toolkit bootstrap, 공식 병합 전 Draft)
 
 ## 방향과 원칙
 
@@ -33,8 +33,9 @@ v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR
 - `version/0.3.18`: vLLM 0.9.0 V0 Ray에 고정된 `VLLM_RAY_PP_V1`, 서버 UUID·RFC1918 주소 기반 pipeline rank 결합, 엄격한 컨테이너 identity와 source-pinned 실행 증적
 - `version/0.3.19`: exact `VALIDATED` variant의 rank별 준비·복합 cache identity·원자적 활성화, stage-local `sharded_state` 로더와 실제 GPU 수용 harness
 - `version/0.3.20`: exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`의 결정론적 선택, 불변 세대 결합, probe 기반 중앙 캐시 투영, 준비·배포·롤백 소비 게이트와 명시적 `QUARANTINED` 수명 주기
+- `version/0.3.21`: 기존 driver를 변경하지 않는 로컬 Docker Engine·NVIDIA Container Toolkit preview/apply, 충돌·재시작·설정 복구 안전 경계
 
-현재 누적 `version/0.3.20` 범위는 기존 추천·수락·준비·배포 경계와 legacy 계획 JSON 호환성을 유지하면서, `VLLM_RAY_PP_V1`의 exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`을 결정론적으로 평가합니다. 같은 품질·모델이면 실행 가능한 `STAGE`를 artifact-set digest 순으로 먼저 평가하지만, 각 후보는 자체 디스크·rank 조건을 통과해야 하고 수락 뒤 전달 방식을 바꾸지 않습니다. 런타임은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, 노드별 정상 GPU 한 장과 선택 세대가 고정한 exact 캐시를 요구합니다. 서버 UUID를 identity로 사용하고 head를 rank 0으로 고정하며 worker는 고유 RFC1918 IPv4 문자열 순으로 결합합니다. GCS 6379, worker 20000-21000, loopback API 8000과 backend·rank·component·stage identity 컨테이너 레이블도 고정합니다.
+현재 누적 `version/0.3.21` 범위는 기존 추천·수락·준비·배포 경계와 legacy 계획 JSON 호환성을 유지하면서, `VLLM_RAY_PP_V1`의 exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`을 결정론적으로 평가합니다. 같은 품질·모델이면 실행 가능한 `STAGE`를 artifact-set digest 순으로 먼저 평가하지만, 각 후보는 자체 디스크·rank 조건을 통과해야 하고 수락 뒤 전달 방식을 바꾸지 않습니다. 런타임은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, 노드별 정상 GPU 한 장과 선택 세대가 고정한 exact 캐시를 요구합니다. 서버 UUID를 identity로 사용하고 head를 rank 0으로 고정하며 worker는 고유 RFC1918 IPv4 문자열 순으로 결합합니다. GCS 6379, worker 20000-21000, loopback API 8000과 backend·rank·component·stage identity 컨테이너 레이블도 고정합니다. 0.3.21은 이 실행 계층 앞에 중앙과 분리된 로컬 bootstrap을 추가하며, GPU driver가 이미 정상인 Ubuntu 노드에서만 Docker와 NVIDIA Toolkit을 명시적으로 준비합니다.
 
 `pipeline-rank-contract`는 vLLM 버전, Ray 노드·GPU, Dure UUID custom resource와 API 시작 뒤 worker actor topology를 확인하고 고정된 vLLM 0.9.0 소스 정렬 규칙에서 binding을 도출합니다. Ray가 vLLM 내부 rank를 공개 필드로 직접 보고한 증거는 아닙니다. 실제 2·3노드 harness는 기본적으로 `NOT_RUN`·77이며 명시적 opt-in과 고정 설정·GPU·모델·runtime 전제가 모두 있어야 분산 load와 최소 추론을 시작합니다. harness는 UUID resource를 대조하지만 설정의 이미지 digest는 선언값이므로 신뢰된 wrapper의 별도 이미지 대조가 필요합니다. 이 Draft 범위는 실제 GPU 수용 검사 결과가 첨부되기 전 장기 안정성이나 이기종 driver 호환성을 증명하지 않습니다.
 

@@ -57,10 +57,15 @@ jobs:
 
       - name: Install Debian node package
         run: |
+          python3 -m pip uninstall -y dure
           sudo apt-get install -y "${{ steps.package.outputs.path }}"
           test "$(cat /usr/share/dure/build-commit)" = "$GITHUB_SHA"
+          /usr/bin/python3 -c 'import dure; assert dure.__file__.startswith("/usr/lib/python3/dist-packages/dure/"); import dure.bootstrap, dure.host_setup'
           /usr/bin/dure --version
+          /usr/bin/dure bootstrap --help >/dev/null
           /usr/bin/dure doctor --json >/dev/null
+          grep -Fx 'ConditionPathExists=/etc/dure/agent.json' \
+            /lib/systemd/system/dure-agent.service
 
       - name: Test signed APT repository
         run: scripts/test-apt-repo.sh "${{ steps.package.outputs.path }}"

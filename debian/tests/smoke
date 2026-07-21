@@ -3,4 +3,7 @@ set -eu
 test -r /usr/share/dure/build-commit
 grep -Eq '^[0-9a-f]{40,64}$' /usr/share/dure/build-commit
 dure --version
+python3 -c 'import dure.bootstrap'
+dure bootstrap --help >/dev/null
+grep -Fx 'ConditionPathExists=/etc/dure/agent.json' /lib/systemd/system/dure-agent.service
 dure doctor --json >/dev/null

@@ -30,6 +30,12 @@ from .cache_quarantine import (
 )
 from .command import SubprocessRunner
 from .http import APIError, JSONClient
+from .host_setup import (
+    HOST_SETUP_LOCK_PATH,
+    HostSetupLockError,
+    acquire_host_setup_lock,
+    release_host_setup_lock,
+)
 from .model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_VERIFICATION_VERSION,
@@ -412,42 +418,53 @@ def join_control_plane(
     client_config: Path = DEFAULT_CLIENT_CONFIG,
     runner=None,
     start_service: bool = True,
+    setup_lock_path: Path = HOST_SETUP_LOCK_PATH,
 ) -> dict:
     if os.geteuid() != 0:
         raise PermissionError("dure join must run as root")
-    resolved_server, resolved_insecure = resolve_join_settings(
-        server=server, insecure=insecure, client_config=client_config
-    )
-    install = _read_json(config_path)
-    if {"node_id", "credential", "server"} <= set(install):
+    try:
+        lock_descriptor = acquire_host_setup_lock(
+            setup_lock_path,
+            require_root_owner=setup_lock_path == HOST_SETUP_LOCK_PATH,
+        )
+    except HostSetupLockError as exc:
+        raise RuntimeError(f"dure join cannot start: {exc}") from exc
+    try:
+        resolved_server, resolved_insecure = resolve_join_settings(
+            server=server, insecure=insecure, client_config=client_config
+        )
+        install = _read_json(config_path)
+        if {"node_id", "credential", "server"} <= set(install):
+            if start_service:
+                _enable_agent_service(runner)
+            return {"node_id": install["node_id"], "status": "already-joined"}
+        install_id = install.get("install_id") or secrets.token_hex(16)
+        profile = NodeProbe(runner).collect()
+        client = JSONClient(resolved_server, verify_tls=not resolved_insecure)
+        response = client.request(
+            "POST",
+            "/v1/nodes/join",
+            {"install_id": install_id, "agent_version": __version__, "profile": profile.to_dict()},
+        )
+        _atomic_json(
+            config_path,
+            {
+                "server": resolved_server,
+                "node_id": response["node_id"],
+                "credential": response["credential"],
+                "install_id": install_id,
+                "verify_tls": not resolved_insecure,
+                "state_file": str(DEFAULT_STATE),
+            },
+        )
         if start_service:
-            _enable_agent_service(runner)
-        return {"node_id": install["node_id"], "status": "already-joined"}
-    install_id = install.get("install_id") or secrets.token_hex(16)
-    profile = NodeProbe(runner).collect()
-    client = JSONClient(resolved_server, verify_tls=not resolved_insecure)
-    response = client.request(
-        "POST",
-        "/v1/nodes/join",
-        {"install_id": install_id, "agent_version": __version__, "profile": profile.to_dict()},
-    )
-    _atomic_json(
-        config_path,
-        {
-            "server": resolved_server,
-            "node_id": response["node_id"],
-            "credential": response["credential"],
-            "install_id": install_id,
-            "verify_tls": not resolved_insecure,
-            "state_file": str(DEFAULT_STATE),
-        },
-    )
-    if start_service:
-        try:
-            _enable_agent_service(runner)
-        except RuntimeError as exc:
-            raise RuntimeError(f"node joined, but {exc}") from exc
-    return {"node_id": response["node_id"], "status": response.get("status", "pending")}
+            try:
+                _enable_agent_service(runner)
+            except RuntimeError as exc:
+                raise RuntimeError(f"node joined, but {exc}") from exc
+        return {"node_id": response["node_id"], "status": response.get("status", "pending")}
+    finally:
+        release_host_setup_lock(lock_descriptor)
 
 
 class TaskExecutor:

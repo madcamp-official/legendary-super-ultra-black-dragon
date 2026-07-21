@@ -6,7 +6,7 @@
 
 - [루트 README](../README.md): 설치, 로컬 CLI, 중앙 관리의 빠른 시작
 - [아키텍처](architecture.md): 로컬 CLI·에이전트·중앙 제어면의 경계와 작업 프로토콜
-- [운영 절차](operations.md): 서버 운영, 노드 승인, 세대별 적용·검증·롤백과 장애 복구
+- [운영 절차](operations.md): GPU host bootstrap, 서버 운영, 노드 승인, 세대별 적용·검증·롤백과 장애 복구
 - [보안 모델](security.md): 현재 통제와 공개 전 보안 강화 과제
 - [vLLM 다중 노드 rank 결합 결정 기록](adr-vllm-multinode-rank-binding.md): `VLLM_RAY_PP_V1`의 고정 소스 계약과 검증 한계
 

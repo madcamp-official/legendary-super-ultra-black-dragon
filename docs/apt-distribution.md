@@ -16,17 +16,30 @@ Dure APT 서명 키 fingerprint는 다음과 같습니다.
 E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01
 ```
 
-installer는 공개 서명 키를 `/usr/share/keyrings`에 설치하고, deb822 source를 `/etc/apt/sources.list.d`에 만들며, `apt-get update` 뒤에 Dure를 설치합니다.
+APT 저장소 등록 installer는 공개 서명 키를 `/usr/share/keyrings`에 설치하고, deb822 source를 `/etc/apt/sources.list.d`에 만들며, `apt-get update` 뒤에 Dure를 설치합니다. 현재 저장소와 installer는 `amd64` 전용입니다.
 
-등록 이후에는 일반 APT 명령을 사용합니다.
+이 installer는 Docker, NVIDIA Container Toolkit이나 driver를 설치하지 않고 Agent를 등록하지도 않습니다. GPU 노드는 Dure 설치 뒤 별도 로컬 preview와 명시적 apply를 수행합니다.
+
+```bash
+sudo dure bootstrap
+sudo dure bootstrap --apply
+sudo dure doctor
+sudo dure join
+```
+
+bootstrap 엔진 자체는 Ubuntu 22.04·24.04의 `amd64`·`arm64`를 지원하지만, 공식 APT에서 `arm64` Dure 패키지를 게시하려면 저장소 생성·Release metadata·통합 테스트를 함께 확장해야 합니다. 그 전의 별도 설치는 CLI·Agent 실행 파일만이 아니라 `dure-agent.service`와 `/etc/dure/dure-client.env`까지 제공해야 합니다.
+
+등록 이후 Dure만 업그레이드할 때는 패키지 범위를 제한합니다.
 
 ```bash
 sudo apt install dure
 sudo apt update
-sudo apt upgrade
+sudo apt install --only-upgrade dure
 ```
 
-bootstrap script를 실행하지 않으려면 저장소를 수동으로 등록할 수 있습니다.
+호스트 전체 `apt upgrade`는 Docker CE를 함께 갱신하고 daemon을 재시작할 수 있는 별도 유지보수 작업입니다. 실행 workload와 방화벽 영향을 검토하고 유지보수 시간에 수행합니다. bootstrap이 설치한 NVIDIA Container Toolkit 네 패키지는 검증 버전 pin을 유지하며, 다른 버전이 필요하면 pin과 Dure 지원 범위를 먼저 갱신해 검증합니다.
+
+APT 저장소 등록 installer를 실행하지 않으려면 저장소를 수동으로 등록할 수 있습니다.
 
 ```bash
 curl -fsSL https://chek737.github.io/dure/dure-archive-keyring.gpg \

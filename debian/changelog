@@ -1,3 +1,11 @@
+dure (0.3.21) UNRELEASED; urgency=medium
+
+  * Docker Engine과 NVIDIA Container Toolkit의 로컬 명시적 준비 기능을 추가합니다.
+  * 드라이버 불변, 패키지 충돌, 서명 키와 Docker 재시작 안전 검사를 추가합니다.
+  * 노드 등록 전 미설정 Agent 시작을 막고 설치·복구 절차를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 18:00:00 +0900
+
 dure (0.3.20) UNRELEASED; urgency=medium
 
   * 추천 시 정확한 STAGE 또는 FULL 전달 방식을 선택하고 세대에 고정합니다.

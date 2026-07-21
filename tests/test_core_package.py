@@ -25,11 +25,22 @@ class CorePackageTests(unittest.TestCase):
 
     def test_node_cli_and_agent_import_without_third_party_packages(self):
         result = self._run_without_site_packages(
-            "import dure.agent, dure.cli, dure.diagnostics; print(dure.__version__)"
+            "import dure.agent, dure.bootstrap, dure.cli, dure.diagnostics; "
+            "print(dure.__version__)"
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "0.3.20")
+        self.assertEqual(result.stdout.strip(), "0.3.21")
+
+    def test_agent_service_waits_for_joined_node_config(self):
+        unit = (REPOSITORY_ROOT / "packaging" / "dure-agent.service").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            unit.count("ConditionPathExists=/etc/dure/agent.json"),
+            1,
+        )
 
     def test_packaged_control_plane_uses_production_https(self):
         values = {}
