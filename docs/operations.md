@@ -118,11 +118,135 @@ dure admin verify <deployment-id> --nodes <ray-head-node-id> --api
 
 - 요청 노드가 계획의 전체 배정 노드와 정확히 같습니다.
 - 모든 노드의 검증 task가 성공합니다.
-- 모든 대상 노드의 Agent가 0.3.12 이상입니다.
+- 모든 대상 노드가 backend별 최소 버전을 충족합니다. legacy는 Agent 0.3.12 이상,
+  `VLLM_RAY_PP_V1`은 0.3.18 이상입니다.
+- `VLLM_RAY_PP_V1`은 전체 노드의 정확한 `pipeline-rank-contract`와 head의 API
+  검증까지 성공합니다.
 
 일부 노드만 검증하거나 다중 노드 배포에서 전체 배정 집합이 아닌 Ray head만 `--api` 검증한 결과는 상태 조회에는 남지만 `verified_at`을 만들지 않습니다. 기존 수동 복구 경로에서 발생한 구 Agent의 성공 결과도 롤백 증거로 승격하지 않습니다.
 
 새 Ray·API 컨테이너에는 `dure.deployment`, `dure.generation`, `dure.node` 레이블이 모두 있어야 합니다. 시작·검증·중지 전에 실제 컨테이너의 세 레이블을 다시 확인합니다. 0.3.12 이전 컨테이너에 `dure.node`가 없는 경우에만 정확한 배포 ID와 세대가 모두 일치할 때 제한적으로 관리할 수 있습니다. 노드 레이블이 존재하면서 다르거나 배포·세대 레이블이 없거나 다르면 컨테이너를 중지·제거·재사용하지 않습니다.
+
+## `VLLM_RAY_PP_V1` 다중 노드 운영
+
+중앙 추천을 수락해 만드는 2·3노드 pipeline 세대는 `VLLM_RAY_PP_V1` 폐쇄형 실행 계약을 사용합니다. 기존 로컬 `dure plan` JSON과 legacy backend에는 이 계약을 소급 적용하지 않습니다. 운영자가 backend 이름이나 rank를 CLI 인자로 직접 주입하는 명령은 없으며, 중앙 추천·수락이 저장 인벤토리와 등록된 런타임을 검증해 계획에 고정합니다.
+
+적용 전에 다음 조건을 모두 확인합니다.
+
+- 런타임은 정확히 vLLM 0.9.0 V0 executor를 포함한 OCI digest 고정 이미지입니다.
+- `TP=1`, `PP=2` 또는 `PP=3`이며 각 물리 노드에는 정상 GPU가 정확히 한 장 있습니다.
+- assignment는 hostname이 아니라 서버가 발급한 canonical UUID를 사용합니다.
+- 각 노드는 서로 다른 canonical RFC1918 IPv4를 가지며 head가 rank 0, worker는 IPv4 문자열 오름차순입니다.
+- 각 노드의 계획 주소가 최신 probe의 `default_interface_addresses`에 정확히 하나
+  존재하고 모든 노드의 기본 network interface 이름이 같습니다.
+- 모든 노드에 `/var/lib/dure/models/sha256-<manifesthex>` 경로와 marker digest가
+  정확히 일치하는 검증된 `FULL_SNAPSHOT`과 digest 고정 이미지가 준비돼 있습니다.
+  `STAGE`는 아직 허용하지 않습니다.
+- 대상 노드가 모두 승인·온라인이고 Agent가 0.3.18 이상입니다. 비중지 작업은 일부 노드만 골라 실행할 수 없습니다.
+
+일반 추천·준비·적용 명령을 그대로 사용합니다.
+
+```bash
+dure admin probe --nodes <node-a> <node-b> [<node-c>]
+dure admin deployment recommend --nodes <node-a> <node-b> [<node-c>] \
+  --objective quality-first
+dure admin recommendation show <recommendation-id>
+dure admin recommendation accept <recommendation-id>
+
+dure admin deployment prepare <deployment-id> --request-id <request-uuid>
+dure admin deployment prepare <deployment-id> \
+  --request-id <request-uuid> --apply
+dure admin deployment preparation <preparation-id>
+
+dure admin apply <deployment-id> --nodes <node-a> <node-b> [<node-c>] --serve
+dure admin verify <deployment-id> \
+  --nodes <node-a> <node-b> [<node-c>] --api
+```
+
+엄격한 backend에서는 API가 head에서만 실행되더라도 `verify --api` 요청에 전체 배정 노드를 넣습니다. worker는 API HTTP 검사를 생략하지만 자신의 Ray·rank 계약을 검증하고, head만 loopback API까지 검사합니다. 기존 legacy 운영 예시의 head 단독 `verify --api`를 `VLLM_RAY_PP_V1`에 사용하면 전체 노드 집합 게이트에서 거부됩니다.
+
+엄격한 backend의 직접 `apply`, `start`, `restart` 요청은 실제 API readiness까지
+증명하도록 `--serve`가 필요하고 직접 `verify`는 `--api`가 필요합니다. controller가
+관리하는 단계형 apply·rollback은 내부적으로 먼저 모든 노드에 `serve=false`로 Ray를
+준비한 뒤 head 전용 API 단계를 이어가므로 이 직접 요청 게이트와 구분합니다.
+`VLLM_RAY_PP_V1` rollback 요청 자체에는 `--serve`가 필수이며, API actor 증적 없이
+복구한 대상을 새 `verified_at` 세대로 승격할 수 없습니다.
+
+엄격한 backend의 네트워크 값은 다음으로 고정됩니다.
+
+| 용도 | 주소·포트 | 운영 경계 |
+|---|---|---|
+| Ray GCS | head의 RFC1918 IPv4, TCP `6379` | 신뢰 LAN·사설 오버레이에서만 허용 |
+| Ray worker | 각 계획 IPv4, TCP `20000-21000` | 노드 집합 사이만 허용 |
+| vLLM API | head의 `127.0.0.1:8000` | loopback 전용, 외부 제공은 인증된 역방향 프록시 사용 |
+
+Ray 컨테이너는 계획의 `--node-ip-address`와 `VLLM_HOST_IP`를 사용하고 서버 UUID에서 계산한 `dure_node_<uuidhex>` custom resource를 게시합니다. `dure.runtime-contract` 레이블은 이미지·모델 mount·GPU·network·entrypoint·고정 환경·명령의 정규 SHA-256이며 시작·재사용·readiness에서 정확히 비교합니다. 긴급 `STOP`은 준비 경로 손상에도 작동하도록 다른 exact identity 레이블로 대상을 제한하되 이 digest를 재계산하지 않습니다. 임의 Ray 포트나 vLLM Docker 인자를 task payload로 전달할 수 없습니다. GCS·worker 범위를 공용 인터넷에 열지 말고 host firewall에서 정확한 노드 주소만 허용합니다.
+
+각 노드의 `VERIFY` 결과에는 기존 `host-gpu`, `container-gpu` 검사와 함께 blocking `pipeline-rank-contract`가 있어야 합니다. 이 검사는 정확한 vLLM 0.9.0, 살아 있는 Ray 노드·GPU, 주소별 Dure UUID custom resource와 계획 binding을 대조하고, API 시작 뒤 검사에서는 worker actor 토폴로지도 요구합니다. 결과 JSON의 rank는 Ray가 공개한 내부 pipeline rank 필드가 아니라, 고정된 vLLM 0.9.0 소스 규칙에서 도출한 기대 binding입니다. 따라서 이를 “runtime rank 직접 관측”으로 보고하거나 다른 vLLM 버전에 재사용하지 않습니다.
+
+### 실제 2·3노드 GPU 수용 검사
+
+단위 테스트는 실제 GPU, driver, NCCL과 분산 model load를 요구하지 않습니다. 운영 배포 전 신뢰된 2대 또는 3대 노드에서 `scripts/acceptance-vllm-ray-pp.py`를 별도로 실행합니다. harness는 명령행 인자를 받지 않고 다음 고정 경로만 읽습니다.
+
+```text
+/etc/dure/acceptance-vllm-ray-pp-v1.json
+```
+
+설정은 root가 소유하고 group/world writable이 아니어야 합니다. 다음 폐쇄형 필드 외의 command, 환경 변수 묶음, Docker 인자, mount 또는 host path를 넣지 않습니다. 실제 값은 생성된 계획과 digest 고정 레지스트리 값에서 복사해 서로 대조합니다.
+
+```json
+{
+  "schema_version": 1,
+  "backend": "VLLM_RAY_PP_V1",
+  "vllm_version": "0.9.0",
+  "validation_run_id": "11111111-1111-4111-8111-111111111111",
+  "deployment_id": "22222222-2222-4222-8222-222222222222",
+  "generation": 1,
+  "runtime_image": "registry.example/vllm@sha256:<64-hex>",
+  "model_manifest_digest": "sha256:<64-hex>",
+  "ordered_bindings": [
+    {
+      "node_id": "33333333-3333-4333-8333-333333333333",
+      "runtime_address": "10.20.0.10",
+      "pipeline_rank": 0,
+      "runtime_rank": 0
+    },
+    {
+      "node_id": "44444444-4444-4444-8444-444444444444",
+      "runtime_address": "10.20.0.11",
+      "pipeline_rank": 1,
+      "runtime_rank": 1
+    }
+  ]
+}
+```
+
+검사 환경은 `/models/model`에 같은 매니페스트의 검증된 `FULL_SNAPSHOT`을 읽기 전용으로 제공하고 vLLM 0.9.0과 Ray를 미리 설치해야 합니다. 다음 명령은 실제 이미지 digest와 고정 mount를 먼저 검증한 신뢰된 wrapper **안에서** 실행합니다. harness가 허용하는 opt-in은 하나뿐입니다.
+
+```bash
+DURE_RUN_VLLM_RAY_PP_ACCEPTANCE=1 \
+  python3 scripts/acceptance-vllm-ray-pp.py
+```
+
+기본 실행, opt-in 누락, 설정·GPU·고정 runtime·모델 전제 조건 부족은 `NOT_RUN`과 종료 코드 `77`입니다. 이는 통과가 아닙니다. preflight 뒤 실제 Ray 연결·분산 load가 시작된 후의 오류는 `FAILED`와 종료 코드 `1`이며 `NOT_RUN`으로 낮추지 않습니다. `PASSED`는 실제 executor topology, worker 배치와 고정 최소 추론까지 성공한 실행에만 사용합니다.
+
+설정의 `runtime_image` digest는 harness가 읽는 선언값입니다. 스크립트는 Ray node의 `dure_node_<uuidhex>` custom resource와 주소를 설정의 `node_id`에 다시 결합하지만, 현재 프로세스의 OCI manifest digest 자체를 독립적으로 읽을 수는 없습니다. 따라서 운영자는 이 스크립트를 신뢰된 digest 고정 wrapper 안에서 실행하고 wrapper가 실제 이미지 digest, 중앙 계획과 설정을 대조한 기록을 함께 보존해야 합니다. 성공 결과도 `runtime_image_declared`와 `runtime_image_attested=false`를 구분합니다. 현재 Dure는 이 attested wrapper를 자동 생성하거나 원격 실행하지 않습니다. wrapper 기록이 없는 `PASSED`는 공급망 증적이 아닙니다. harness는 컨테이너 생성·중지·교체나 driver 설치를 수행하는 배포 명령이 아니며, controller가 수집한 각 노드의 `pipeline-rank-contract`와 별도 운영 적용·검증을 대신하지 않습니다.
+
+### 실행 실패 대응
+
+| 실패 지점 | Dure의 기본 처리 | 운영자 조치 |
+|---|---|---|
+| UUID·주소·GPU 수·계획·Agent 버전 불일치 | 컨테이너 시작 전 차단 | 최신 probe와 계획을 다시 비교하고 임의로 rank나 JSON을 고치지 않습니다. |
+| `FULL_SNAPSHOT` marker·경로·이미지 digest 불일치 | 새 컨테이너 시작 차단 | 정확한 준비 operation을 다시 확인하고 오염된 캐시를 덮어쓰거나 자동 삭제하지 않습니다. |
+| Ray join·노드 수·GPU 수·actor topology 불일치 | `pipeline-rank-contract` 실패, 다음 단계 차단 | 방화벽·주소·중복 Ray process·노드 상태를 조사하고 실패 노드를 격리합니다. |
+| vLLM load·최소 추론·API 실패 | operation 또는 GPU harness를 `FAILED`로 보존 | 고정 image와 모델 계약, 메모리, driver/CUDA 호환성을 조사한 뒤 명시적으로 재시도합니다. |
+| driver 또는 host CUDA 불일치 | 자동 수정하지 않고 실패 | 지원 조합으로 host를 수동 정비하거나 해당 노드를 후보에서 제외합니다. Dure가 driver를 변경하도록 권한을 넓히지 않습니다. |
+| 고정 port가 다른 process에 점유됨 | 시작 뒤 container restart/readiness 실패로 차단 | `6379`, `20000-21000`, `8000` 점유자를 확인하고 정확한 Dure label의 새 세대만 중지한 뒤 재시도합니다. 현재 별도 port 점유 preflight는 없습니다. |
+| 반복 실패·신뢰 상실 노드 | 자동 재배정하지 않음 | `dure admin credential revoke <node-id>`로 task 수신을 격리하고 조사 후 credential 회전·설정 갱신·재승인을 별도로 수행합니다. |
+
+사전 검사 실패는 실행 중인 이전 세대에 손대지 않습니다. 전환이 이미 시작된 뒤의 부분 실패는 같은 GPU에서 이전 컨테이너가 계속 실행됨을 보장하지 않으므로 operation 상태와 실제 컨테이너를 먼저 확인합니다. 원인을 해결한 뒤 같은 전체 노드 입력으로 실패 단계를 명시적으로 재시도하거나, 조건을 충족한 검증된 직전 세대에 `deployment rollback ... --apply`를 수행합니다. 자동 failover·자동 rollback은 없으며 롤백도 새 다운로드나 image pull을 하지 않습니다.
+
+여기서 노드 격리는 credential revoke를 뜻합니다. 오염된 모델 캐시의 공식 `QUARANTINED` 상태·이동 명령은 아직 구현되지 않았고 probe 기반 캐시 투영과 함께 후속 PR로 계획돼 있습니다. 운영자가 캐시 경로를 임의 삭제하면 준비 증적과 실제 호스트 상태가 달라질 수 있으므로 참조 관계를 확인하지 않은 자동 삭제를 금지합니다.
 
 ## 모델 레지스트리 운영
 
@@ -175,7 +299,7 @@ variant 등록 시 source manifest, runtime digest, vLLM, exporter build digest,
 
 synthetic fixture 검사는 빠진 rank, 잘못된 파일, tensor 누락과 digest 변조를 찾는 개발 게이트일 뿐 승격 증적이 아닙니다. 실제 GPU 검증의 전제 조건이 없으면 결과를 `NOT_RUN`으로 기록하며 성공으로 바꾸거나 생략하지 않습니다. 정확한 variant에 결합된 최신 `GPU_EXPORT_LOAD/PASSED`만 `DRAFT → VALIDATED`를 허용합니다. 새 validation run 증적은 `DRAFT`에서만 추가할 수 있습니다. 이미 등록한 동일 run의 정확한 네트워크 재전송은 `VALIDATED`나 `REVOKED` 뒤에도 기존 결과를 반환하지만, 두 상태에서 새 run을 추가하는 요청은 거부합니다. 검증 뒤 신뢰 문제가 발견되면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 전환하고 수정된 계약은 새 `DRAFT` variant에서 검증합니다. `REVOKED`는 되돌리지 않습니다.
 
-번들 `scripts/acceptance-vllm-stage-builder.py`는 현재 `PP=1`에서만 export·native load·최소 추론을 검증합니다. opt-in이나 GPU·고정 runtime 같은 전제 조건이 없고 `PP>1`이면 `NOT_RUN`과 종료 코드 77이어야 합니다. 이 결과를 성공으로 취급하지 않습니다. PP>1 variant는 구조적 빌드·등록이 가능해도 모든 rank를 실제 load하고 attest한 별도 신뢰 검증이 없으면 `DRAFT`로 유지합니다. Dure가 직접 제공하는 PP>1 load/rank attestation은 후속 PR6~7 범위입니다.
+번들 `scripts/acceptance-vllm-stage-builder.py`는 현재 `PP=1`에서만 export·native load·최소 추론을 검증합니다. opt-in이나 GPU·고정 runtime 같은 전제 조건이 없고 `PP>1`이면 `NOT_RUN`과 종료 코드 77이어야 합니다. 이 결과를 성공으로 취급하지 않습니다. PP>1 variant는 구조적 빌드·등록이 가능해도 모든 stage rank를 실제 load하고 attest한 별도 신뢰 검증이 없으면 `DRAFT`로 유지합니다. 0.3.18의 `FULL_SNAPSHOT` rank 수용 검사는 이 stage 증적을 대신하지 않으며 stage-local loader는 다음 PR 범위입니다.
 
 현재 중앙 운영은 다음 관리자 인증 API를 사용합니다. 전용 `dure admin` 하위 명령은 아직 없습니다.
 
@@ -377,7 +501,7 @@ dure admin recommendation accept <recommendation-id> \
 
 `serve=true`인 중앙 apply는 전체 배정 노드 집합에만 허용됩니다. 첫 `APPLY` 단계는 모든 노드에 `serve=false`를 보내 Ray만 준비하고, 모든 노드가 성공한 뒤 Ray head 한 대에만 `START_API`, `VERIFY_API`를 차례로 큐잉합니다. 서로 다른 계보라도 같은 노드를 포함하는 활성 operation이나 배포 task가 있으면 새 작업을 거부하므로 한 GPU에서 두 전환이 교차 실행되지 않습니다.
 
-전체 `VERIFY`가 롤백 증거가 되려면 각 노드가 `host-gpu`, `container-gpu`, `ray-cluster` 검사를 모두 보고해야 하며 API 검증을 요청한 head는 `vllm-api`도 보고해야 합니다. API 시작 단계는 별도의 `vllm-api-start`와 `vllm-api` 결과를 모두 요구합니다. 필수 검사 누락, 이름 중복, 잘못된 결과 모양은 성공 응답으로 취급하지 않고 task를 `TASK_RESULT_INVALID`로 실패시키며 기존 `verified_at`을 제거합니다.
+전체 `VERIFY`가 롤백 증거가 되려면 legacy backend의 각 노드는 `host-gpu`, `container-gpu`, `ray-cluster`를 보고해야 합니다. `VLLM_RAY_PP_V1`은 `ray-cluster` 대신 폐쇄형 `pipeline-rank-contract`를 보고하고 전체 노드가 Agent 0.3.18 이상이어야 하며, head는 `vllm-api`도 성공해야 합니다. API 시작 단계는 별도의 `vllm-api-start`와 `vllm-api` 결과를 모두 요구합니다. 엄격한 결과는 필요한 검사 이름 집합과 정확히 같아야 하므로 필수 검사 누락·중복·알 수 없는 추가 검사·과도한 detail·잘못된 정규 JSON을 성공으로 취급하지 않습니다. 이런 task는 `TASK_RESULT_INVALID`로 실패하며 기존 `verified_at`을 제거합니다.
 
 ## 세대 조회와 명시적 롤백
 
@@ -404,6 +528,9 @@ dure admin deployment rollback <latest-deployment-id> \
 
 API는 `POST /v1/admin/deployments/{source_id}/rollback`에 다음과 같은 닫힌 본문을 받습니다. `apply`와 `serve`는 엄격한 불리언이며 기본값은 `false`입니다. 응답은 operation 상세, 이번 호출로 만든 task 목록과 `changed` 여부를 포함합니다.
 
+아래 `serve=false` 예시는 legacy backend에만 적용됩니다. `VLLM_RAY_PP_V1`은 준비
+요청부터 `serve=true`가 필수이고 `START_API → VERIFY_API`도 선택 단계가 아닙니다.
+
 ```json
 {
   "node_ids": ["<node-uuid>"],
@@ -418,7 +545,8 @@ API는 `POST /v1/admin/deployments/{source_id}/rollback`에 다음과 같은 닫
 - 대상은 소스의 `previous_generation_id`가 직접 가리키는 세대이며 상태가 `VERIFIED`이고 `verified_at`이 있습니다.
 - 소스와 대상의 전체 배정 노드와 토폴로지가 정확히 같습니다.
 - 요청한 중복 없는 정규 UUID 목록이 전체 배정 노드 집합과 정확히 같습니다.
-- 모든 노드가 승인 상태이고 최근 30초 안에 온라인으로 관측됐으며 Agent가 0.3.12 이상입니다.
+- 모든 노드가 승인 상태이고 최근 30초 안에 온라인으로 관측됐으며 legacy는 Agent
+  0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상입니다.
 - 소스와 대상 이미지가 OCI 다이제스트로 고정돼 있습니다.
 - 추천으로 만든 대상 세대라면 모든 노드의 정확한 모델·이미지 준비 증적이 성공 상태입니다.
 - 같은 계보에 이미 적용 중인 다른 변경이 없습니다.
@@ -432,9 +560,9 @@ START_TARGET (serve=false)
     ↓ 모든 노드 성공
 VERIFY_TARGET
     ↓ 모든 노드 성공
-선택적 START_API (Ray head)
+legacy에서 선택적, 엄격 backend에서 필수 START_API (Ray head)
     ↓
-선택적 VERIFY_API (Ray head)
+legacy에서 선택적, 엄격 backend에서 필수 VERIFY_API (Ray head)
 ```
 
 한 단계에서 일부 노드가 실패하거나 취소되면 다음 단계로 넘어가지 않습니다. 실행 중 task가 남아 있는 동안에는 재시도를 거부합니다. 원인을 해결한 뒤 같은 입력으로 `--apply`를 다시 지정하면 현재 단계의 실패 노드만 새 시도 번호로 큐잉합니다. 이미 성공한 노드는 반복하지 않고 과거 시도의 늦은 claim·완료·실패 보고는 현재 시도와 맞지 않으므로 무시합니다.
@@ -442,6 +570,10 @@ VERIFY_TARGET
 롤백 task는 항상 `accept_model_download=false`, `pull_image=false`를 사용합니다. 추천으로 만든 대상은 과거에 성공한 exact-path 모델·이미지 준비 증적을 다시 사용하며 새 준비 task를 만들지 않습니다. 대상 모델 캐시와 다이제스트 이미지가 모든 노드에 이미 있어야 하며 롤백이 다운로드나 이미지 내려받기를 대신하지 않습니다. 동일 GPU에서 소스 컨테이너를 중지하고 대상 컨테이너를 다시 생성하므로 중단 시간이 생길 수 있고 블루·그린 전환이 아닙니다. 이 흐름은 다중 노드 네트워크·NCCL 시험이나 24시간 복구 검증을 수행하지 않으므로 실제 GPU 환경의 별도 수용 검사를 계속 진행해야 합니다.
 
 ## 업그레이드와 복구
+
+0.3.18에는 데이터베이스 migration이 없습니다. controller를 먼저 업그레이드한 뒤 Agent를 작은 batch로 0.3.18 이상에 올리고 새 heartbeat의 `agent_version`, UUID와 사설 주소를 확인합니다. 기존 local/legacy 계획은 계속 사용할 수 있지만 `VLLM_RAY_PP_V1` 비중지 작업은 전체 배정 노드가 0.3.18 이상일 때만 만듭니다. 전체 노드 업그레이드와 `FULL_SNAPSHOT` 준비가 끝나기 전에 엄격한 다중 노드 apply를 시작하지 않습니다.
+
+업그레이드 뒤 실제 2·3노드 수용 검사 설정을 계획에서 새로 만들고 기본 실행이 `NOT_RUN`·77인지 먼저 확인합니다. 실제 GPU opt-in 결과가 `PASSED`가 아니면 이를 CI 통과로 바꾸지 말고 기존 검증 세대를 유지합니다. Dure 패키지는 NVIDIA driver를 바꾸지 않으므로 각 노드의 driver와 digest 고정 vLLM 이미지 호환성은 운영자가 별도 점검합니다.
 
 0.3.17에서는 PostgreSQL을 백업하고 controller 코드와 migration 0009를 먼저 적용합니다. stage variant 테이블과 기존 매니페스트·모델·런타임 외래 키를 확인한 뒤 서버를 시작합니다. 이 migration과 DRAFT 등록은 실행 중인 컨테이너나 노드 캐시를 변경하지 않습니다. 기본 Debian Agent에는 builder heavy dependency가 추가되지 않으므로 stage 생성이 필요하면 운영 환경과 분리한 digest 고정 OCI builder를 별도로 준비합니다. 실제 GPU 검증이 `NOT_RUN`이면 배포 가능으로 해석하지 말고 `DRAFT`를 유지합니다.
 

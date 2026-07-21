@@ -553,15 +553,22 @@ class NodeProbe:
 
     def _probe_network(self) -> NetworkProfile:
         addresses: list[str] = []
+        addresses_by_interface: dict[str, list[str]] = {}
         default_interface = None
         if self.runner.exists("ip"):
             address_result = self.runner.run(["ip", "-j", "address", "show"], timeout=5)
             if address_result.ok:
                 try:
                     for interface in json.loads(address_result.stdout):
+                        interface_name = interface.get("ifname")
                         for info in interface.get("addr_info", []):
                             if info.get("family") == "inet" and info.get("local") != "127.0.0.1":
-                                addresses.append(info["local"])
+                                address = info["local"]
+                                addresses.append(address)
+                                if type(interface_name) is str:
+                                    addresses_by_interface.setdefault(
+                                        interface_name, []
+                                    ).append(address)
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
             route_result = self.runner.run(["ip", "-j", "route", "show", "default"], timeout=5)
@@ -572,4 +579,12 @@ class NodeProbe:
                         default_interface = routes[0].get("dev")
                 except (json.JSONDecodeError, TypeError):
                     pass
-        return NetworkProfile(default_interface=default_interface, addresses=addresses)
+        return NetworkProfile(
+            default_interface=default_interface,
+            addresses=addresses,
+            default_interface_addresses=(
+                addresses_by_interface.get(default_interface, [])
+                if type(default_interface) is str
+                else []
+            ),
+        )

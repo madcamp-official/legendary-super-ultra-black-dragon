@@ -114,6 +114,44 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result.gpus, [])
         self.assertIn("No CUDA-capable NVIDIA GPU detected", result.issues)
 
+    def test_network_probe_binds_addresses_to_the_default_interface(self):
+        address_command = ("ip", "-j", "address", "show")
+        route_command = ("ip", "-j", "route", "show", "default")
+        runner = FakeRunner(
+            executables={"ip"},
+            responses={
+                address_command: CommandResult(
+                    address_command,
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "ifname": "docker0",
+                                "addr_info": [
+                                    {"family": "inet", "local": "172.17.0.1"}
+                                ],
+                            },
+                            {
+                                "ifname": "ens3",
+                                "addr_info": [
+                                    {"family": "inet", "local": "10.0.0.12"}
+                                ],
+                            },
+                        ]
+                    ),
+                ),
+                route_command: CommandResult(
+                    route_command, 0, json.dumps([{"dev": "ens3"}])
+                ),
+            },
+        )
+
+        network = NodeProbe(runner).collect().network
+
+        self.assertEqual(network.default_interface, "ens3")
+        self.assertEqual(network.addresses, ["172.17.0.1", "10.0.0.12"])
+        self.assertEqual(network.default_interface_addresses, ["10.0.0.12"])
+
     def test_detects_installed_models_and_llm_workloads(self):
         with tempfile.TemporaryDirectory() as temporary:
             model_root = Path(temporary) / "models"

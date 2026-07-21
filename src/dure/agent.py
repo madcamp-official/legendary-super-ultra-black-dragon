@@ -30,6 +30,11 @@ from .model_cache import (
 )
 from .models import DeploymentPlan, InstalledModelProfile, NodeProfile
 from .orchestrator import InitOrchestrator
+from .pipeline_runtime import (
+    is_strict_pipeline_plan,
+    validate_strict_pipeline_node,
+    validate_strict_pipeline_plan,
+)
 from .probe import DURE_MODEL_ROOT, NodeProbe
 from .readiness import ReadinessVerifier
 from .runtime import ContainerRuntime
@@ -539,6 +544,12 @@ class TaskExecutor:
             raise ValueError("node is not assigned to deployment")
         if "@sha256:" not in plan.image:
             raise ValueError("central deployment image is not digest-pinned")
+        if is_strict_pipeline_plan(plan):
+            validate_strict_pipeline_plan(
+                plan,
+                require_manifest_cache_path=(kind != TaskType.STOP_DEPLOYMENT),
+                validate_model_path=(kind != TaskType.STOP_DEPLOYMENT),
+            )
         return payload, plan, assignment
 
     def execute(self, task: dict) -> dict:
@@ -596,14 +607,48 @@ class TaskExecutor:
             result = self.benchmark_executor(benchmark, profile, cached_model)
             return _validated_benchmark_result(benchmark, result)
         payload, plan, assignment = self._deployment_task(task, kind)
+        if kind == TaskType.STOP_DEPLOYMENT and is_strict_pipeline_plan(plan):
+            # STOP remains available when probing the GPU, network, cache, or
+            # NVIDIA runtime is impossible.  The strict backend is Docker-only
+            # and stop_deployment independently verifies every exact label.
+            check = ContainerRuntime(self.runner, "docker").stop_deployment(
+                plan.deployment_id,
+                generation=plan.generation,
+                node_id=self.node_id,
+                plan=plan,
+                assignment=assignment,
+            )
+            if not check.ok:
+                raise RuntimeError(check.detail)
+            store = StateStore(self.state_path or DEFAULT_STATE)
+            state = store.load()
+            state.phase = "PLANNED"
+            state.detail = "Deployment containers are stopped"
+            store.save(state)
+            return {"checks": [check.to_dict()]}
         profile = self._profile()
+        if is_strict_pipeline_plan(plan) and kind != TaskType.STOP_DEPLOYMENT:
+            validate_strict_pipeline_node(
+                plan, assignment, profile, require_model_cache=True
+            )
         if kind == TaskType.VERIFY:
             verifier = ReadinessVerifier(
                 self.runner,
                 profile.runtime.engine or "docker",
                 node_id=self.node_id,
             )
-            checks = [verifier.host_gpu(profile), verifier.container_gpu(plan), verifier.ray_cluster(plan)]
+            checks = [verifier.host_gpu(profile), verifier.container_gpu(plan, assignment)]
+            if is_strict_pipeline_plan(plan):
+                checks.append(
+                    verifier.pipeline_rank_contract(
+                        plan,
+                        assignment,
+                        profile,
+                        require_actors=bool(payload.get("api")),
+                    )
+                )
+            else:
+                checks.append(verifier.ray_cluster(plan))
             if payload.get("api") and assignment.role == "ray-head":
                 checks.append(verifier.api(plan=plan))
             if not all(item.ok for item in checks):
@@ -615,6 +660,8 @@ class TaskExecutor:
                 plan.deployment_id,
                 generation=plan.generation,
                 node_id=self.node_id,
+                plan=plan if is_strict_pipeline_plan(plan) else None,
+                assignment=assignment if is_strict_pipeline_plan(plan) else None,
             )
             if not check.ok:
                 raise RuntimeError(check.detail)
@@ -629,6 +676,8 @@ class TaskExecutor:
                 plan.deployment_id,
                 generation=plan.generation,
                 node_id=self.node_id,
+                plan=plan if is_strict_pipeline_plan(plan) else None,
+                assignment=assignment if is_strict_pipeline_plan(plan) else None,
             )
             if not stopped.ok:
                 raise RuntimeError(stopped.detail)

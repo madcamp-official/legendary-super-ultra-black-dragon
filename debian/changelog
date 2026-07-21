@@ -1,3 +1,11 @@
+dure (0.3.18) UNRELEASED; urgency=medium
+
+  * vLLM 0.9.0 Ray pipeline의 결정론적 노드 UUID·rank 결합을 추가합니다.
+  * 엄격한 2·3노드 FULL_SNAPSHOT 실행·준비 검증과 실패 안전 중지를 추가합니다.
+  * 실제 GPU 수용 검사 도구와 운영·보안·복구 절차를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 06:08:18 +0900
+
 dure (0.3.17) UNRELEASED; urgency=medium
 
   * vLLM 단계 아티팩트 variant와 rank별 불변 매니페스트를 추가합니다.

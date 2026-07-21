@@ -12,13 +12,23 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from dure.artifact_prepare import validate_digest_pinned_runtime_image
 from dure.catalog import (
     CatalogEntry,
     ModelCatalog,
     NetworkEvidenceBinding,
     PlacementProfile,
 )
-from dure.models import DeploymentPlan, ModelSpec, NodeAssignment, NodeProfile
+from dure.model_cache import MODEL_CACHE_KIND_FULL_SNAPSHOT
+from dure.models import (
+    VLLM_RAY_PP_BACKEND,
+    VLLM_RAY_PP_RUNTIME_VERSION,
+    DeploymentPlan,
+    ModelSpec,
+    NodeAssignment,
+    NodeProfile,
+)
+from dure.planner import StrictRayPPTopologyError, strict_vllm_ray_pp_order
 from dure.selector import InventoryNode, recommend_model
 from dure.task import (
     TaskStatus,
@@ -47,7 +57,7 @@ from .models import (
 from .service import aware, node_status
 
 
-POLICY_VERSION = "central-quality-within-slo-v2"
+POLICY_VERSION = "central-quality-within-slo-v3"
 PROFILE_MAX_AGE = timedelta(seconds=90)
 NETWORK_EVIDENCE_MAX_AGE = timedelta(hours=24)
 GENERATION_NAMESPACE = uuid.UUID("74ebf646-2d77-4fcf-8524-1777a274eb93")
@@ -352,6 +362,14 @@ def _active_catalog(
             "placement_profile_id": placement.profile_id,
             "runtime_image": runtime.image,
         }
+        if placement.node_count > 1:
+            context.update(
+                {
+                    "execution_backend": VLLM_RAY_PP_BACKEND,
+                    "runtime_vllm_version": runtime.vllm_version,
+                    "model_cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                }
+            )
         contexts[candidate_id] = context
         snapshot.append(
             {
@@ -510,6 +528,110 @@ def _inventory_nodes(
     return inventory
 
 
+def _strict_candidate_rejections(
+    *,
+    context: dict[str, Any],
+    entry: CatalogEntry,
+    node_ids: list[str],
+    inventory_by_id: dict[str, InventoryNode],
+) -> list[dict[str, Any]]:
+    """Close unsupported strict runtime candidates before selection."""
+
+    rejections: list[dict[str, Any]] = []
+
+    def reject(code: str, detail: str, affected: list[str] | None = None) -> None:
+        rejections.append(
+            {
+                "code": code,
+                "detail": detail,
+                "node_ids": sorted(affected if affected is not None else node_ids),
+            }
+        )
+
+    placement = entry.placement
+    if context.get("runtime_vllm_version") != VLLM_RAY_PP_RUNTIME_VERSION:
+        reject(
+            "STRICT_RUNTIME_VERSION",
+            f"엄격한 다중 노드 실행은 vLLM {VLLM_RAY_PP_RUNTIME_VERSION}만 지원합니다.",
+        )
+    if (
+        placement.node_count not in {2, 3}
+        or placement.tensor_parallel_size != 1
+        or placement.pipeline_parallel_size != placement.node_count
+        or entry.model.layer_count < placement.node_count
+    ):
+        reject(
+            "STRICT_TOPOLOGY",
+            "엄격한 다중 노드 실행은 TP=1인 2·3단계 one-node-per-rank만 지원합니다.",
+        )
+    if entry.model.quantization != "awq":
+        reject(
+            "STRICT_QUANTIZATION",
+            "엄격한 다중 노드 실행은 검증된 AWQ 모델만 지원합니다.",
+        )
+    try:
+        validate_digest_pinned_runtime_image(context.get("runtime_image"))
+    except ValueError:
+        reject(
+            "STRICT_RUNTIME_IMAGE",
+            "엄격한 다중 노드 런타임 이미지는 OCI SHA-256 digest로 고정해야 합니다.",
+        )
+
+    profiles = [
+        inventory_by_id[node_id].profile
+        for node_id in node_ids
+        if node_id in inventory_by_id
+        and inventory_by_id[node_id].profile is not None
+    ]
+    if len(profiles) != placement.node_count or len(node_ids) != placement.node_count:
+        reject(
+            "STRICT_NODE_SET",
+            "엄격한 다중 노드 후보에 필요한 정확한 프로필 집합이 없습니다.",
+        )
+        return rejections
+
+    try:
+        strict_vllm_ray_pp_order(
+            profiles,
+            head_node_id=node_ids[0],
+            minimum_gpu_memory_mib=placement.min_gpu_memory_mib,
+        )
+    except StrictRayPPTopologyError as exc:
+        if exc.reason in {
+            "HEALTHY_GPU_COUNT",
+            "GPU_MEMORY_INSUFFICIENT",
+            "GPU_INDEX_INVALID",
+        }:
+            code = "STRICT_GPU_TOPOLOGY"
+        elif exc.reason in {
+            "PRIVATE_IPV4_REQUIRED",
+            "PRIVATE_IPV4_AMBIGUOUS",
+            "DUPLICATE_RUNTIME_ADDRESS",
+            "DEFAULT_INTERFACE_REQUIRED",
+            "DEFAULT_INTERFACE_ADDRESS_REQUIRED",
+            "DEFAULT_INTERFACE_ADDRESS_MISMATCH",
+        }:
+            code = "STRICT_NETWORK"
+        else:
+            code = "STRICT_NODE_SET"
+        reject(code, str(exc), list(exc.node_ids))
+
+    interfaces = [profile.network.default_interface for profile in profiles]
+    if (
+        any(
+            type(value) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}", value) is None
+            for value in interfaces
+        )
+        or len(set(interfaces)) != 1
+    ):
+        reject(
+            "STRICT_NETWORK",
+            "엄격한 다중 노드의 기본 네트워크 인터페이스는 명시적이고 모두 같아야 합니다.",
+        )
+    return rejections
+
+
 def evaluate_deployment_recommendation(
     session: Session,
     *,
@@ -543,13 +665,29 @@ def evaluate_deployment_recommendation(
         )
 
     candidates = []
+    entries_by_id = {entry.candidate_id: entry for entry in catalog.entries}
+    inventory_by_id = {item.node_id: item for item in inventory}
     for evaluation in result.evaluations:
+        context = contexts[evaluation.candidate_id]
+        candidate_node_ids = list(evaluation.node_ids)
+        strict_rejections: list[dict[str, Any]] = []
+        if context.get("execution_backend") == VLLM_RAY_PP_BACKEND:
+            candidate_node_ids = sorted(candidate_node_ids)
+            strict_rejections = _strict_candidate_rejections(
+                context=context,
+                entry=entries_by_id[evaluation.candidate_id],
+                node_ids=candidate_node_ids,
+                inventory_by_id=inventory_by_id,
+            )
         candidate = {
-            **contexts[evaluation.candidate_id],
+            **context,
             "quality_rank": evaluation.quality_rank,
-            "feasible": evaluation.feasible,
-            "node_ids": list(evaluation.node_ids),
-            "rejections": [item.to_dict() for item in evaluation.rejections],
+            "feasible": evaluation.feasible and not strict_rejections,
+            "node_ids": candidate_node_ids,
+            "rejections": [
+                *(item.to_dict() for item in evaluation.rejections),
+                *strict_rejections,
+            ],
         }
         if evaluation.network_evidence_id is not None:
             candidate.update(
@@ -567,9 +705,15 @@ def evaluate_deployment_recommendation(
             candidate
             for candidate in candidates
             if candidate["candidate_id"] == result.selected_candidate_id
+            and candidate["feasible"]
         ),
         None,
     )
+    if selected is None:
+        selected = next(
+            (candidate for candidate in candidates if candidate["feasible"]),
+            None,
+        )
     core = {
         "objective": objective,
         "selection_mode": "all_online" if all_online else "explicit_nodes",
@@ -802,7 +946,7 @@ def _layer_partitions(layer_count: int, stages: int) -> list[tuple[int, int]]:
 
 def _network_interface(profiles: list[NodeProfile]) -> str:
     interfaces = [profile.network.default_interface or "eth0" for profile in profiles]
-    if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,31}", value) is None for value in interfaces):
+    if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}", value) is None for value in interfaces):
         raise RecommendationNotAcceptableError(
             "selected node has an invalid network interface",
             code="GENERATION_NETWORK_INVALID",
@@ -880,8 +1024,10 @@ def _build_generation_plan(
     node_ids = selected.get("node_ids")
     if (
         not isinstance(node_ids, list)
+        or any(type(node_id) is not str for node_id in node_ids)
         or len(node_ids) != len(set(node_ids))
         or len(node_ids) != placement.node_count
+        or node_ids != sorted(node_ids)
     ):
         raise RecommendationNotAcceptableError(
             "selected node assignment does not match the placement profile",
@@ -920,19 +1066,94 @@ def _build_generation_plan(
         profiles.append(profile)
 
     partitions = _layer_partitions(artifact.layer_count, placement.node_count)
-    assignments = [
-        NodeAssignment(
-            node_id=profile.node_id,
-            gpu_index=_best_gpu_index(profile, placement.min_gpu_memory_mib),
-            rank=rank,
-            pipeline_rank=rank,
-            layer_start=partitions[rank][0],
-            layer_end=partitions[rank][1],
-            role="ray-head" if rank == 0 else "ray-worker",
-        )
-        for rank, profile in enumerate(profiles)
-    ]
-    head_ip = _ray_head_ip(profiles[0], multi_node=len(profiles) > 1)
+    multi_node = len(profiles) > 1
+    execution_backend: str | None = None
+    runtime_vllm_version: str | None = None
+    model_cache_kind: str | None = None
+    if multi_node:
+        if selected.get("execution_backend") != VLLM_RAY_PP_BACKEND:
+            raise RecommendationNotAcceptableError(
+                "multi-node generation is not bound to a supported execution backend",
+                code="GENERATION_BACKEND_UNSUPPORTED",
+            )
+        if (
+            selected.get("runtime_vllm_version") != runtime.vllm_version
+            or runtime.vllm_version != VLLM_RAY_PP_RUNTIME_VERSION
+        ):
+            raise RecommendationNotAcceptableError(
+                f"{VLLM_RAY_PP_BACKEND} requires vLLM "
+                f"{VLLM_RAY_PP_RUNTIME_VERSION}",
+                code="GENERATION_RUNTIME_UNSUPPORTED",
+                details={"vllm_version": runtime.vllm_version},
+            )
+        if selected.get("model_cache_kind") != MODEL_CACHE_KIND_FULL_SNAPSHOT:
+            raise RecommendationNotAcceptableError(
+                f"{VLLM_RAY_PP_BACKEND} requires a verified "
+                f"{MODEL_CACHE_KIND_FULL_SNAPSHOT} model cache",
+                code="GENERATION_MODEL_CACHE_UNSUPPORTED",
+            )
+        try:
+            bindings = strict_vllm_ray_pp_order(
+                profiles,
+                head_node_id=node_ids[0],
+                minimum_gpu_memory_mib=placement.min_gpu_memory_mib,
+            )
+        except StrictRayPPTopologyError as exc:
+            if exc.reason == "GPU_MEMORY_INSUFFICIENT":
+                code = "GENERATION_GPU_UNAVAILABLE"
+            elif exc.reason == "HEALTHY_GPU_COUNT":
+                code = "GENERATION_GPU_TOPOLOGY_UNSUPPORTED"
+            elif exc.reason in {
+                "PRIVATE_IPV4_REQUIRED",
+                "PRIVATE_IPV4_AMBIGUOUS",
+                "DUPLICATE_RUNTIME_ADDRESS",
+                "DEFAULT_INTERFACE_REQUIRED",
+                "DEFAULT_INTERFACE_ADDRESS_REQUIRED",
+                "DEFAULT_INTERFACE_ADDRESS_MISMATCH",
+            }:
+                code = "GENERATION_NETWORK_UNSUPPORTED"
+            else:
+                code = "GENERATION_PLACEMENT_INVALID"
+            raise RecommendationNotAcceptableError(
+                str(exc),
+                code=code,
+                details={"reason": exc.reason, "node_ids": list(exc.node_ids)},
+            ) from exc
+        ordered_profiles = [item.profile for item in bindings]
+        assignments = [
+            NodeAssignment(
+                node_id=binding.profile.node_id,
+                gpu_index=binding.gpu_index,
+                rank=rank,
+                pipeline_rank=rank,
+                layer_start=partitions[rank][0],
+                layer_end=partitions[rank][1],
+                role="ray-head" if rank == 0 else "ray-worker",
+                expected_runtime_rank=rank,
+                runtime_address=binding.runtime_address,
+            )
+            for rank, binding in enumerate(bindings)
+        ]
+        head_ip = bindings[0].runtime_address
+        execution_backend = VLLM_RAY_PP_BACKEND
+        runtime_vllm_version = runtime.vllm_version
+        model_cache_kind = MODEL_CACHE_KIND_FULL_SNAPSHOT
+    else:
+        ordered_profiles = profiles
+        assignments = [
+            NodeAssignment(
+                node_id=profiles[0].node_id,
+                gpu_index=_best_gpu_index(
+                    profiles[0], placement.min_gpu_memory_mib
+                ),
+                rank=0,
+                pipeline_rank=0,
+                layer_start=partitions[0][0],
+                layer_end=partitions[0][1],
+                role="ray-head",
+            )
+        ]
+        head_ip = _ray_head_ip(profiles[0], multi_node=False)
     plan = DeploymentPlan(
         deployment_id=deployment_id,
         generation=generation,
@@ -948,22 +1169,34 @@ def _build_generation_plan(
         image=runtime.image,
         pipeline_parallel_size=placement.pipeline_parallel_size,
         tensor_parallel_size=placement.tensor_parallel_size,
-        ray_head_node_id=profiles[0].node_id,
+        ray_head_node_id=ordered_profiles[0].node_id,
         ray_head_address=f"{head_ip}:6379",
-        network_interface=_network_interface(profiles),
+        network_interface=_network_interface(ordered_profiles),
         model_revision=artifact.revision,
         model_path=(
-            f"/var/lib/dure/models/{artifact.model_id}--{artifact.revision}"
+            f"/var/lib/dure/models/sha256-{artifact.manifest_digest.removeprefix('sha256:')}"
+            if multi_node
+            else f"/var/lib/dure/models/{artifact.model_id}--{artifact.revision}"
         ),
         assignments=assignments,
         max_model_len=artifact.default_max_model_len,
         warnings=(
             ["Network bandwidth and RTT must be verified before serving traffic"]
-            if len(profiles) > 1
+            if multi_node
             else []
         ),
+        execution_backend=execution_backend,
+        runtime_vllm_version=runtime_vllm_version,
+        model_cache_kind=model_cache_kind,
     )
-    return plan.to_dict()
+    try:
+        return plan.to_dict()
+    except ValueError as exc:
+        raise RecommendationNotAcceptableError(
+            "generated deployment plan violates its execution contract",
+            code="GENERATION_PLAN_INVALID",
+            details={"reason": str(exc)},
+        ) from exc
 
 
 def _previous_generation(

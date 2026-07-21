@@ -19,6 +19,7 @@ from dure.control.models import (
     DeploymentRecommendationRecord,
     Node,
     NodeProfileRecord,
+    RuntimeRelease,
     Task,
     utcnow,
 )
@@ -27,9 +28,15 @@ from dure.control.recommendation import (
     _lock_recommendation_inputs,
     _ray_head_ip,
 )
+from dure.model_cache import MODEL_CACHE_KIND_FULL_SNAPSHOT
+from dure.models import (
+    VLLM_RAY_PP_BACKEND,
+    VLLM_RAY_PP_RUNTIME_VERSION,
+    DeploymentPlan,
+)
 
 from .helpers import profile
-from .test_recommendation import _add_node, _add_release
+from .test_recommendation import PIPELINE_OVERRIDES, _add_node, _add_release
 
 
 class RecommendationAcceptanceTests(unittest.TestCase):
@@ -66,12 +73,56 @@ class RecommendationAcceptanceTests(unittest.TestCase):
             )
             return node.id, release.id, placement.id
 
+    def _seed_pipeline_candidate(
+        self,
+        key: str,
+        *,
+        addresses: list[str] | None = None,
+        extra_healthy_gpu: bool = False,
+        vllm_version: str = VLLM_RAY_PP_RUNTIME_VERSION,
+    ) -> tuple[list[str], str, str]:
+        with self.factory() as session:
+            now = utcnow()
+            nodes = [_add_node(session, f"node-{key}-{index}", now=now) for index in range(3)]
+            ordered_nodes = sorted(nodes, key=lambda item: item.id)
+            runtime_addresses = addresses or ["10.0.0.9", "10.0.0.2", "10.0.0.11"]
+            for index, (node, address) in enumerate(
+                zip(ordered_nodes, runtime_addresses)
+            ):
+                record = session.get(NodeProfileRecord, node.id)
+                changed = copy.deepcopy(record.profile)
+                changed["network"]["addresses"] = [address]
+                changed["network"]["default_interface_addresses"] = [address]
+                if extra_healthy_gpu and index == 1:
+                    second_gpu = copy.deepcopy(changed["gpus"][0])
+                    second_gpu["index"] = 1
+                    second_gpu["uuid"] += "-second"
+                    changed["gpus"].append(second_gpu)
+                record.profile = changed
+                record.updated_at = now
+            session.commit()
+            release, placement = _add_release(
+                session,
+                key,
+                quality_rank=100,
+                placement_overrides=PIPELINE_OVERRIDES,
+                evidence_nodes=nodes,
+            )
+            if vllm_version != VLLM_RAY_PP_RUNTIME_VERSION:
+                runtime = session.get(RuntimeRelease, release.runtime_id)
+                runtime.vllm_version = vllm_version
+                session.commit()
+            return [node.id for node in ordered_nodes], release.id, placement.id
+
     def _recommend(self, node_id: str) -> dict:
+        return self._recommend_nodes([node_id])
+
+    def _recommend_nodes(self, node_ids: list[str]) -> dict:
         response = self.client.post(
             "/v1/admin/deployment-recommendations",
             headers=self.admin,
             json={
-                "node_ids": [node_id],
+                "node_ids": node_ids,
                 "all_online": False,
                 "objective": "quality-first",
             },
@@ -215,6 +266,100 @@ class RecommendationAcceptanceTests(unittest.TestCase):
                 session.scalar(select(func.count()).select_from(BenchmarkRun)),
                 0,
             )
+
+    def test_multinode_accept_binds_deterministic_strict_runtime_ranks_without_tasks(self):
+        node_ids, release_id, placement_id = self._seed_pipeline_candidate("strict")
+        recommendation = self._recommend_nodes(list(reversed(node_ids)))
+
+        response = self._accept(recommendation["id"])
+
+        self.assertEqual(response.status_code, 200, response.text)
+        selected = recommendation["selected"]
+        self.assertEqual(selected["execution_backend"], VLLM_RAY_PP_BACKEND)
+        self.assertEqual(
+            selected["runtime_vllm_version"], VLLM_RAY_PP_RUNTIME_VERSION
+        )
+        self.assertEqual(
+            selected["model_cache_kind"], MODEL_CACHE_KIND_FULL_SNAPSHOT
+        )
+        self.assertEqual(selected["model_release_id"], release_id)
+        self.assertEqual(selected["placement_id"], placement_id)
+        plan = response.json()["deployment"]["plan"]
+        self.assertEqual(plan["execution_backend"], VLLM_RAY_PP_BACKEND)
+        self.assertEqual(
+            plan["runtime_vllm_version"], VLLM_RAY_PP_RUNTIME_VERSION
+        )
+        self.assertEqual(plan["model_cache_kind"], MODEL_CACHE_KIND_FULL_SNAPSHOT)
+        self.assertRegex(
+            plan["model_path"],
+            r"^/var/lib/dure/models/sha256-[0-9a-f]{64}$",
+        )
+        self.assertEqual(plan["ray_head_node_id"], node_ids[0])
+        self.assertEqual(plan["ray_head_address"], "10.0.0.9:6379")
+        self.assertEqual(
+            [item["node_id"] for item in plan["assignments"]],
+            [node_ids[0], node_ids[2], node_ids[1]],
+        )
+        self.assertEqual(
+            [item["runtime_address"] for item in plan["assignments"]],
+            ["10.0.0.9", "10.0.0.11", "10.0.0.2"],
+        )
+        self.assertEqual(
+            [item["expected_runtime_rank"] for item in plan["assignments"]],
+            [0, 1, 2],
+        )
+        self.assertEqual(DeploymentPlan.from_dict(plan).to_dict(), plan)
+        with self.factory() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
+
+    def test_multinode_recommendation_rejects_unsupported_runtime_topologies(self):
+        cases = (
+            (
+                "public-ip",
+                {
+                    "addresses": ["10.0.0.9", "203.0.113.20", "10.0.0.11"],
+                },
+                "STRICT_NETWORK",
+            ),
+            (
+                "duplicate-ip",
+                {
+                    "addresses": ["10.0.0.9", "10.0.0.2", "10.0.0.2"],
+                },
+                "STRICT_NETWORK",
+            ),
+            (
+                "two-gpus",
+                {"extra_healthy_gpu": True},
+                "STRICT_GPU_TOPOLOGY",
+            ),
+            (
+                "wrong-vllm",
+                {"vllm_version": "0.9.1"},
+                "STRICT_RUNTIME_VERSION",
+            ),
+        )
+        for key, options, expected_code in cases:
+            with self.subTest(key=key):
+                node_ids, _, placement_id = self._seed_pipeline_candidate(
+                    key, **options
+                )
+                recommendation = self._recommend_nodes(node_ids)
+                self.assertIsNone(recommendation["selected"])
+                candidate = next(
+                    item
+                    for item in recommendation["candidates"]
+                    if item["placement_id"] == placement_id
+                )
+                codes = {
+                    item["code"]
+                    for item in candidate["rejections"]
+                }
+                self.assertIn(expected_code, codes)
+                response = self._accept(recommendation["id"])
+                self.assert_error_code(
+                    response, 409, "RECOMMENDATION_NOT_FEASIBLE"
+                )
 
     def test_postgresql_accept_locks_evidence_registry_and_inventory_tables(self):
         session = Mock()

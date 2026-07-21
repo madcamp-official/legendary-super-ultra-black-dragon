@@ -105,8 +105,14 @@ def _add_node(
     session.add(node)
     session.flush()
     if stored_profile is not None:
+        address_seed = hashlib.sha256(name.encode("utf-8")).digest()
+        address = (
+            f"10.{address_seed[0]}.{address_seed[1]}."
+            f"{(address_seed[2] % 254) + 1}"
+        )
         value = profile(
             "agent-reported-id",
+            address=address,
             compute_capability=compute_capability,
         ).to_dict()
         if stored_profile != "valid":
@@ -489,7 +495,7 @@ class RecommendationServiceTests(unittest.TestCase):
                 selected["network_evidence_registered_at"],
                 aware(evidence.created_at).isoformat(),
             )
-            self.assertEqual(result["policy_version"], "central-quality-within-slo-v2")
+            self.assertEqual(result["policy_version"], "central-quality-within-slo-v3")
 
     def test_multinode_evidence_for_a_different_node_set_is_rejected(self):
         with self.factory() as session:

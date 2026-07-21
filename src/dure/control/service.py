@@ -19,7 +19,8 @@ from dure.artifact_manifest import (
     canonical_artifact_manifest as parse_canonical_artifact_manifest,
 )
 from dure.artifact_prepare import validate_digest_pinned_runtime_image
-from dure.models import DeploymentPlan, NodeProfile
+from dure.models import DeploymentPlan, NodeProfile, VLLM_RAY_PP_BACKEND
+from dure.pipeline_runtime import validate_strict_pipeline_plan
 from dure.task import (
     MAX_BENCHMARK_CONTEXT_TOKENS,
     MAX_BENCHMARK_INTEGER,
@@ -68,6 +69,7 @@ from .rollout import (
     cancel_operation_task,
     claim_operation_task,
     finish_operation_task,
+    valid_deployment_task_success_result,
 )
 
 
@@ -78,6 +80,16 @@ MODEL_RELEASE_TRANSITIONS = {
     "DEPRECATED": {"REVOKED"},
     "REVOKED": set(),
 }
+STRICT_RAY_AGENT_VERSION = (0, 3, 18)
+
+
+def _agent_supports_strict_ray(value: str) -> bool:
+    if type(value) is not str:
+        return False
+    matched = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", value)
+    if matched is None:
+        return False
+    return tuple(int(part) for part in matched.groups()) >= STRICT_RAY_AGENT_VERSION
 QUANTIZATIONS = {"awq", "gptq", "fp8", "fp16", "bf16", "int8"}
 GPU_ARCHITECTURES = {"ampere", "ada", "hopper", "blackwell"}
 TOPOLOGIES = {"single-gpu", "pipeline"}
@@ -966,7 +978,18 @@ def save_deployment(
     session: Session, plan_data: dict, *, accept_model_download: bool, pull_image: bool
 ) -> Deployment:
     plan = DeploymentPlan.from_dict(plan_data)
-    if "@sha256:" not in plan.image:
+    strict_ray = plan.execution_backend == VLLM_RAY_PP_BACKEND
+    if strict_ray:
+        validate_strict_pipeline_plan(
+            plan, require_manifest_cache_path=False
+        )
+        try:
+            validate_digest_pinned_runtime_image(plan.image)
+        except ValueError as exc:
+            raise ValueError(
+                "strict Ray deployments require an exact OCI digest-pinned image"
+            ) from exc
+    elif "@sha256:" not in plan.image:
         raise ValueError("central deployments require an OCI digest-pinned image")
     if not plan.assignments:
         raise ValueError("deployment has no assignments")
@@ -975,11 +998,19 @@ def save_deployment(
     for assignment in plan.assignments:
         if session.get(Node, assignment.node_id) is not None:
             continue
+        if strict_ray:
+            raise ValueError(
+                "strict Ray deployment assignments require server-issued node UUIDs"
+            )
         matches = list(session.scalars(select(Node).where(Node.hostname == assignment.node_id, Node.approved.is_(True))))
         if len(matches) != 1:
             raise ValueError(f"unknown or ambiguous node assignment: {assignment.node_id}")
         assignment.node_id = matches[0].id
     if plan.ray_head_node_id not in {item.node_id for item in plan.assignments}:
+        if strict_ray:
+            raise ValueError(
+                "strict Ray deployment head requires a server-issued node UUID"
+            )
         head = next((item for item in plan.assignments if item.role == "ray-head"), None)
         if head is None:
             raise ValueError("deployment has no Ray head assignment")
@@ -2034,6 +2065,85 @@ def create_tasks(
             if effective_plan
             else set()
         )
+        strict_ray = False
+        if type(effective_plan) is dict and "execution_backend" in effective_plan:
+            if effective_plan.get("execution_backend") != VLLM_RAY_PP_BACKEND:
+                raise DeploymentRolloutConflictError(
+                    "deployment execution backend is not supported",
+                    code="DEPLOYMENT_PLAN_INVALID",
+                )
+            try:
+                strict_plan = DeploymentPlan.from_dict(effective_plan)
+                validate_strict_pipeline_plan(
+                    strict_plan,
+                    require_manifest_cache_path=(
+                        task_type != TaskType.STOP_DEPLOYMENT
+                    ),
+                    validate_model_path=(
+                        task_type != TaskType.STOP_DEPLOYMENT
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment contract is invalid",
+                    code="DEPLOYMENT_PLAN_INVALID",
+                ) from exc
+            strict_ray = True
+        if strict_ray:
+            requested = set(dict.fromkeys(node_ids))
+            if (
+                task_type
+                in {
+                    TaskType.APPLY_DEPLOYMENT,
+                    TaskType.START_DEPLOYMENT,
+                    TaskType.RESTART_DEPLOYMENT,
+                }
+                and options.get("serve") is not True
+            ) or (
+                task_type == TaskType.VERIFY
+                and options.get("api") is not True
+            ):
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment operations require live vLLM API verification",
+                    code="DEPLOYMENT_STRICT_RUNTIME_ATTESTATION_REQUIRED",
+                )
+            if task_type != TaskType.STOP_DEPLOYMENT and (
+                requested != assignments or len(node_ids) != len(requested)
+            ):
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment operation requires the complete assigned node set",
+                    code="DEPLOYMENT_STRICT_NODE_SET_MISMATCH",
+                    details={
+                        "expected_node_ids": sorted(assignments),
+                        "requested_node_ids": sorted(requested),
+                    },
+                )
+            unavailable = sorted(
+                node_id
+                for node_id in requested
+                if (node := locked_nodes.get(node_id)) is None
+                or not node.approved
+                or node_status(node.last_seen, utcnow()) != "online"
+            )
+            if task_type != TaskType.STOP_DEPLOYMENT and unavailable:
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment requires every assigned node to be approved and online",
+                    code="DEPLOYMENT_STRICT_NODE_UNAVAILABLE",
+                    details={"node_ids": unavailable},
+                )
+            unsupported = sorted(
+                node_id
+                for node_id in requested
+                if (node := locked_nodes.get(node_id)) is not None
+                and node.approved
+                and not _agent_supports_strict_ray(node.agent_version)
+            )
+            if unsupported:
+                raise DeploymentRolloutConflictError(
+                    "strict Ray deployment requires Dure Agent 0.3.18 or newer",
+                    code="DEPLOYMENT_STRICT_AGENT_TOO_OLD",
+                    details={"node_ids": unsupported},
+                )
         for node_id in dict.fromkeys(node_ids):
             node = locked_nodes.get(node_id)
             if node is None or not node.approved:
@@ -2299,9 +2409,25 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
             return True
         if task.status != TaskStatus.RUNNING.value:
             return False
-        task.status = TaskStatus.FAILED.value if error else TaskStatus.SUCCEEDED.value
-        task.result = result
-        task.error = error
+        terminal_error = error
+        terminal_result = result
+        plan = task.payload.get("plan") if type(task.payload) is dict else None
+        if (
+            terminal_error is None
+            and task.type in DEPLOYMENT_TASK_TYPE_VALUES
+            and type(plan) is dict
+            and plan.get("execution_backend") == VLLM_RAY_PP_BACKEND
+            and not valid_deployment_task_success_result(task, result)
+        ):
+            terminal_error = "TASK_RESULT_INVALID"
+            terminal_result = None
+        task.status = (
+            TaskStatus.FAILED.value
+            if terminal_error is not None
+            else TaskStatus.SUCCEEDED.value
+        )
+        task.result = terminal_result
+        task.error = terminal_error
         task.lease_until = None
         node = session.get(Node, node_id)
         if node is not None:

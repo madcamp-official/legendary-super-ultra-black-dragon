@@ -64,7 +64,7 @@ python3 -m pip wheel . --no-deps --no-build-isolation -w /tmp/dure-wheel-check
 - 추천 수락 테스트는 실제 `PASSED` 증적과 승격 게이트를 거친 `ACTIVE` 릴리스를 사용하고, 상태 직접 변경으로 게이트를 우회하지 않습니다.
 - 추천 수락으로 만든 세대는 다운로드·pull 플래그가 항상 거짓이어야 하며, 명시적 apply 전에는 task나 호스트 변경이 없어야 합니다.
 - `APPLY`·`VERIFY` operation은 전체 상태, 노드별 상태와 task 시도 번호를 함께 검증합니다. 성공 경로뿐 아니라 부분 실패, 취소, 실패 노드 재시도와 이전 시도의 늦은 claim·완료 거부를 테스트합니다.
-- `verified_at`은 계획의 정확한 전체 노드가 모두 성공하고 모든 노드 Agent가 0.3.12 이상일 때만 기록되는지 검증합니다. 부분 노드와 다중 노드 배포에서 전체 배정 집합을 충족하지 않는 Ray head 전용 API 검증은 증거를 만들면 안 됩니다.
+- `verified_at`은 계획의 정확한 전체 노드가 모두 성공하고 legacy Agent는 0.3.12 이상, `VLLM_RAY_PP_V1` Agent는 0.3.18 이상이며 엄격한 rank·API 검증까지 통과할 때만 기록되는지 검증합니다. 부분 노드와 전체 배정 집합을 충족하지 않는 Ray head 전용 API 검증은 증거를 만들면 안 됩니다.
 - 롤백 테스트는 기본 준비에서 task가 0개인지, `apply=true`에서만 시작하는지, 직접 직전 검증 세대·동일 전체 노드·동일 토폴로지·승인·온라인·다이제스트 이미지 조건을 모두 확인합니다.
 - 롤백 단계는 `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET`과 선택적 `START_API → VERIFY_API`를 순서대로 검증하고, 각 단계의 모든 노드가 성공하기 전에 다음 task를 만들면 안 됩니다.
 - 호스트 명령 테스트는 `dure.deployment`, `dure.generation`, `dure.node`가 모두 정확히 일치하는 컨테이너만 조작하는지 확인합니다. `dure.node`가 없는 레거시 호환은 배포와 세대가 모두 일치할 때만 허용하고 다른 레이블 불일치는 항상 거부합니다.
