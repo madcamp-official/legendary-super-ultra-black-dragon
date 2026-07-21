@@ -32,10 +32,9 @@ from .models import (
 
 
 BENCHMARK_SUITE_ID = "dure-serving-slo-v1"
-BENCHMARK_POLICY_VERSION = "benchmark-gate-v1"
+BENCHMARK_POLICY_VERSION = "benchmark-gate-v2"
 MIN_WARMUP_REQUESTS = 20
 MIN_MEASURED_REQUESTS = 200
-MIN_MEASURED_SECONDS = 900
 MIN_QUALITY_SCORE = 0.80
 GPU_COMPUTE_CAPABILITY_ARCHITECTURES = {
     "8.0": "ampere",
@@ -325,8 +324,8 @@ def _failure_codes(
         failures.append("RUNTIME_RESTART")
     if warmup_requests < MIN_WARMUP_REQUESTS:
         failures.append("WARMUP_COUNT")
-    if request_count < MIN_MEASURED_REQUESTS and duration_seconds < MIN_MEASURED_SECONDS:
-        failures.append("MEASUREMENT_WINDOW")
+    if request_count < MIN_MEASURED_REQUESTS:
+        failures.append("MEASURED_REQUEST_COUNT")
     if quality_score < MIN_QUALITY_SCORE:
         failures.append("QUALITY_SCORE")
     for value, missing_code, exceeded_code, limit in (

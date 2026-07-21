@@ -1,3 +1,10 @@
+dure (0.3.31) UNRELEASED; urgency=medium
+
+  * ACTIVE 승격의 15분 최소 측정 조건을 제거하고 200회 실측을 유지합니다.
+  * 고정 요청 처리가 끝나면 벤치마크 결과를 즉시 반환합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:58:00 +0900
+
 dure (0.3.30) UNRELEASED; urgency=medium
 
   * 실제 quality-eval 처리 시간을 수용하도록 벤치마크 실행·정리 여유를 늘립니다.

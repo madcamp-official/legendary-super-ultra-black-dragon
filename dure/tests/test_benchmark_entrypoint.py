@@ -159,17 +159,19 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
         vllm.AsyncLLMEngine = FakeAsyncLLMEngine
         vllm.SamplingParams = FakeSamplingParams
 
+        sleep = mock.AsyncMock()
         with (
             mock.patch.dict(
                 sys.modules,
                 {"transformers": transformers, "vllm": vllm},
             ),
             mock.patch.object(module, "_gpu_headroom", return_value=50.0),
-            mock.patch.object(module.asyncio, "sleep", new=mock.AsyncMock()),
+            mock.patch.object(module.asyncio, "sleep", new=sleep),
         ):
             asyncio.run(module._run(args))
 
         self.assertEqual(len(observed_prompts), 220)
+        sleep.assert_not_awaited()
         self.assertTrue(
             all(
                 set(prompt) == {"prompt_token_ids"}

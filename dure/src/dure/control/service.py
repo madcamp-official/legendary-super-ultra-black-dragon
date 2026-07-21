@@ -22,6 +22,7 @@ from dure.artifact_prepare import validate_digest_pinned_runtime_image
 from dure.models import DeploymentPlan, NodeProfile, VLLM_RAY_PP_BACKEND
 from dure.pipeline_runtime import validate_strict_pipeline_plan
 from dure.task import (
+    BENCHMARK_DURATION_SECONDS,
     MAX_BENCHMARK_CONTEXT_TOKENS,
     MAX_BENCHMARK_INTEGER,
     BenchmarkTaskPayload,
@@ -31,7 +32,6 @@ from .benchmark import (
     BENCHMARK_POLICY_VERSION,
     BENCHMARK_SUITE_ID,
     MIN_MEASURED_REQUESTS,
-    MIN_MEASURED_SECONDS,
     MIN_WARMUP_REQUESTS,
     BenchmarkIdentityMismatchError,
     BenchmarkNotFoundError,
@@ -1522,7 +1522,7 @@ def _benchmark_workload(artifact: ModelArtifact, workload_id: str) -> dict:
         "concurrency": concurrency,
         "warmup_requests": MIN_WARMUP_REQUESTS,
         "request_count": MIN_MEASURED_REQUESTS,
-        "duration_seconds": float(MIN_MEASURED_SECONDS),
+        "duration_seconds": BENCHMARK_DURATION_SECONDS,
     }
 
 

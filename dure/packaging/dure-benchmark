@@ -225,11 +225,8 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
             generated_tokens += count
             successes += 1
             quality_hits += int(quality_ok)
-    measured = time.perf_counter() - measurement_started
     if successes == 0:
         raise RuntimeError("all measured requests failed")
-    if measured < args.duration_seconds:
-        await asyncio.sleep(args.duration_seconds - measured)
     elapsed = time.perf_counter() - measurement_started
 
     return {
