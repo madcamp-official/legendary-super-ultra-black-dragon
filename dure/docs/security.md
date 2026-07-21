@@ -18,6 +18,7 @@
 | host bootstrap 공급망·서비스 중단 | 로컬 실행, 변경은 root 전용, 기본 preview, 명시적 apply, 고정 HTTPS 저장소·단일 primary key fingerprint·패키지 allowlist, 제거 금지, 재시작 직전 workload 재검사와 설정 복구 | 패키지 provenance·서명 투명성, 실제 host 수용 검사 |
 | 이미지 치환 | 중앙 계획은 OCI 다이제스트 요구, 준비 작업은 exact digest inspect·필요 시 pull·재inspect | 이미지 서명과 출처 검증 |
 | 모델 아티팩트 변경 | 리비전 고정 정책, 불변 정규 매니페스트, 중앙 준비의 콘텐츠 주소 청크·파일 SHA-256 재검증과 marker-last 캐시 활성화, 추천 apply의 exact evidence 게이트 | 게시자 서명과 provenance 검증 |
+| 미검증 자동 프로필의 배포 유입 | 네 모델 allowlist, `TP=1`·`PP=node_count` DB 제약, 버전 고정 spec digest, DRAFT 생성과 ACTIVE 추천 필터 | qualification 증적 서명과 정책 승인 분리 |
 | 오래되거나 손상된 캐시 재사용 | 현재 준비 성공만 만드는 `READY`, 완전한 probe의 강등, 검증 실패의 `CORRUPT` 투영, apply·start·restart·verify·rollback의 exact current-evidence 재검사 | 서명된 노드 증적과 원격 attestation |
 | 참조 중인 캐시의 위험한 정리 | 읽기 전용 보수적 참조 투영, preview 기본값, exact final 하나의 원자적 보존 이동, 자동 삭제·eviction 금지 | CAS 청크 단위 참조 수집과 보존 만료 정책 |
 | stage 출력 치환·rank 혼합 | source·runtime·exporter·토폴로지와 rank별 매니페스트를 결합한 variant identity, 완전한 rank 집합 검사와 실제 GPU export/load 승격 게이트 | 서명된 빌더 provenance와 투명성 로그 |

@@ -60,6 +60,7 @@ from dure.control.service import (
     create_model_artifact,
     create_model_release,
     create_runtime_release,
+    generate_auto_placement_profiles,
     prepare_benchmark_run,
 )
 
@@ -1696,6 +1697,53 @@ class MigrationTests(unittest.TestCase):
             {"promotion_evidence_ids", "promotion_evidence_digest"}
             <= release_columns
         )
+        placement_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("placement_profiles")
+        }
+        self.assertTrue(
+            {
+                "max_model_len",
+                "max_concurrency",
+                "origin",
+                "status",
+                "spec_digest",
+            }
+            <= set(placement_columns)
+        )
+        self.assertTrue(
+            all(
+                not placement_columns[name]["nullable"]
+                for name in (
+                    "max_model_len",
+                    "max_concurrency",
+                    "origin",
+                    "status",
+                )
+            )
+        )
+        placement_checks = {
+            item["name"]
+            for item in inspector.get_check_constraints("placement_profiles")
+        }
+        self.assertTrue(
+            {
+                "ck_placement_context_positive",
+                "ck_placement_concurrency_positive",
+                "ck_placement_origin",
+                "ck_placement_status",
+                "ck_placement_auto_tp1",
+                "ck_placement_auto_pp_nodes",
+            }
+            <= placement_checks
+        )
+        self.assertIn(
+            "ix_placement_profiles_status",
+            {
+                item["name"]
+                for item in inspector.get_indexes("placement_profiles")
+            },
+        )
         recommendation_columns = {
             item["name"]: item
             for item in inspector.get_columns("deployment_recommendations")
@@ -2072,12 +2120,12 @@ class MigrationTests(unittest.TestCase):
             revision_module._append_only_guard_downgrade_sql("postgresql"),
         )
 
-    def test_migration_history_has_single_0010_head(self):
+    def test_migration_history_has_single_0011_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0010"])
+            self.assertEqual(heads, ["0011"])
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2086,6 +2134,58 @@ class MigrationTests(unittest.TestCase):
             command.upgrade(config(url), "head")
 
             self.assert_benchmark_head(url)
+
+    def test_0011_rejects_auto_tp_drift_and_destructive_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'profile-lifecycle.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                artifact = create_model_artifact(
+                    session,
+                    model_id="qwen2.5-72b-awq",
+                    repository="Qwen/Qwen2.5-72B-Instruct-AWQ",
+                    revision="a" * 40,
+                    manifest_digest="sha256:" + "b" * 64,
+                    quantization="awq",
+                    size_mib=39670,
+                    default_max_model_len=8192,
+                    layer_count=80,
+                    license_id="apache-2.0",
+                )
+                runtime = create_runtime_release(
+                    session,
+                    version="vllm-0.9.0",
+                    image="registry.example/vllm@sha256:" + "c" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+                release = create_model_release(
+                    session,
+                    artifact_id=artifact.id,
+                    runtime_id=runtime.id,
+                    quality_rank=72,
+                )
+                generate_auto_placement_profiles(
+                    session, release_id=release.id, apply=True
+                )
+                placement = session.scalar(
+                    select(PlacementProfileRecord).where(
+                        PlacementProfileRecord.release_id == release.id,
+                        PlacementProfileRecord.pipeline_parallel_size == 2,
+                    )
+                )
+                placement.tensor_parallel_size = 2
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+            with self.assertRaisesRegex(RuntimeError, "downgrade 0011"):
+                command.downgrade(migration_config, "0010")
+            engine.dispose()
 
     def test_true_0009_upgrade_and_empty_round_trip_preserve_stage_registry(self):
         with tempfile.TemporaryDirectory() as temporary:

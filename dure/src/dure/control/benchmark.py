@@ -688,7 +688,10 @@ def _qualifying_evidence_ids(session: Session, release: ModelRelease) -> list[st
     placements = list(
         session.scalars(
             select(PlacementProfileRecord)
-            .where(PlacementProfileRecord.release_id == release.id)
+            .where(
+                PlacementProfileRecord.release_id == release.id,
+                PlacementProfileRecord.status == "ACTIVE",
+            )
             .order_by(PlacementProfileRecord.id)
         )
     )

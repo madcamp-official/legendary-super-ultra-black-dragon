@@ -89,6 +89,7 @@ from .service import (
     list_artifact_caches,
     prepare_or_apply_artifact_cache_quarantine,
     add_placement_profile,
+    generate_auto_placement_profiles,
     RegistryConflictError,
     prepare_benchmark_run,
     register_artifact_manifest,
@@ -343,6 +344,8 @@ class PlacementProfileCreate(StrictBody):
     min_disk_free_mib: int = Field(gt=0)
     pipeline_parallel_size: int = Field(gt=0)
     tensor_parallel_size: int = Field(gt=0)
+    max_model_len: int | None = Field(default=None, gt=0)
+    max_concurrency: int = Field(default=1, gt=0)
     requires_network_evidence: bool
     requires_nccl: bool
     min_bandwidth_mbps: int | None = None
@@ -358,6 +361,10 @@ class PlacementProfileCreate(StrictBody):
 
 class ModelReleaseTransition(StrictBody):
     status: str
+
+
+class PlacementProfileGenerate(StrictBody):
+    apply: StrictBool = False
 
 
 class DeploymentRecommendationCreate(StrictBody):
@@ -705,6 +712,11 @@ def _placement_dict(record: PlacementProfileRecord) -> dict:
             "min_disk_free_mib",
             "pipeline_parallel_size",
             "tensor_parallel_size",
+            "max_model_len",
+            "max_concurrency",
+            "origin",
+            "status",
+            "spec_digest",
             "requires_network_evidence",
             "requires_nccl",
             "min_bandwidth_mbps",
@@ -1382,6 +1394,27 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if release is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "model release not found")
         return {"release": _model_release_dict(session, release)}
+
+    @app.post(
+        "/v1/admin/model-releases/{release_id}/placements/generate",
+        dependencies=[Depends(admin_auth)],
+    )
+    def model_release_placements_generate(
+        release_id: str,
+        body: PlacementProfileGenerate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            result = generate_auto_placement_profiles(
+                session,
+                release_id=release_id,
+                apply=body.apply,
+            )
+        except RegistryConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"generation": result}
 
     @app.post(
         "/v1/admin/model-releases/{release_id}/placements",

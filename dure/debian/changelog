@@ -1,3 +1,11 @@
+dure (0.3.27) UNRELEASED; urgency=medium
+
+  * 네 Qwen2.5 AWQ 모델의 TP=1 자동 배치 프로필 생성기를 추가합니다.
+  * 배치 프로필에 독립 상태, origin, spec digest와 실행 한도를 저장합니다.
+  * 변경 없는 미리보기와 명시적 원자 적용 API를 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 19:35:00 +0900
+
 dure (0.3.26) UNRELEASED; urgency=medium
 
   * 노드 수 상한 없는 읽기 전용 GPU 풀 스냅샷을 추가합니다.

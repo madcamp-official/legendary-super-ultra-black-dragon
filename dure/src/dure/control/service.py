@@ -21,6 +21,12 @@ from dure.artifact_manifest import (
 from dure.artifact_prepare import validate_digest_pinned_runtime_image
 from dure.models import DeploymentPlan, NodeProfile, VLLM_RAY_PP_BACKEND
 from dure.pipeline_runtime import validate_strict_pipeline_plan
+from dure.profile_generator import (
+    AUTO_PROFILE_ORIGIN,
+    PLACEMENT_PROFILE_STATUSES,
+    generate_auto_placement_profile_specs,
+)
+from dure.resource_pool import FLEET_MODEL_IDS, FLEET_TENSOR_PARALLEL_SIZE
 from dure.task import (
     MAX_BENCHMARK_CONTEXT_TOKENS,
     MAX_BENCHMARK_INTEGER,
@@ -969,6 +975,12 @@ def add_placement_profile(
     min_success_rate: float,
     min_vram_headroom_pct: float,
     min_throughput_tps: float,
+    max_model_len: int | None = None,
+    max_concurrency: int = 1,
+    origin: str = "MANUAL",
+    status: str = "ACTIVE",
+    spec_digest: str | None = None,
+    _commit: bool = True,
 ) -> PlacementProfileRecord:
     release = session.scalar(
         select(ModelRelease).where(ModelRelease.id == release_id).with_for_update()
@@ -977,6 +989,9 @@ def add_placement_profile(
         raise ValueError("unknown model release")
     if release.status != "DRAFT":
         raise ValueError("placement profiles can only be added to DRAFT releases")
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    if artifact is None:
+        raise ValueError("unknown model artifact")
     if re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,99}", profile_id) is None:
         raise ValueError("invalid placement profile_id")
     if topology not in TOPOLOGIES:
@@ -1011,6 +1026,58 @@ def add_placement_profile(
         raise ValueError("success and VRAM thresholds are out of range")
     if min_throughput_tps <= 0:
         raise ValueError("throughput SLO must be positive")
+    if max_model_len is None:
+        max_model_len = artifact.default_max_model_len
+    if max_model_len <= 0 or max_model_len > artifact.default_max_model_len:
+        raise ValueError("max_model_len exceeds the immutable model contract")
+    if max_concurrency <= 0:
+        raise ValueError("max_concurrency must be positive")
+    if origin not in {"MANUAL", AUTO_PROFILE_ORIGIN}:
+        raise ValueError("unknown placement profile origin")
+    if status not in PLACEMENT_PROFILE_STATUSES:
+        raise ValueError("unknown placement profile status")
+    if origin == AUTO_PROFILE_ORIGIN:
+        if artifact.model_id not in FLEET_MODEL_IDS:
+            raise ValueError("automatic profiles support only the Fleet model allowlist")
+        if tensor_parallel_size != FLEET_TENSOR_PARALLEL_SIZE:
+            raise ValueError("automatic profiles require TP=1")
+        if pipeline_parallel_size != node_count:
+            raise ValueError("automatic profiles require PP=node_count")
+        if status != "DRAFT":
+            raise ValueError("automatic profiles must be created as DRAFT")
+    elif status != "ACTIVE":
+        raise ValueError("manual profiles must be created as ACTIVE")
+    if spec_digest is None:
+        canonical_spec = {
+            "model_id": artifact.model_id,
+            "profile_id": profile_id,
+            "topology": topology,
+            "node_count": node_count,
+            "min_gpu_memory_mib": min_gpu_memory_mib,
+            "min_disk_free_mib": min_disk_free_mib,
+            "pipeline_parallel_size": pipeline_parallel_size,
+            "tensor_parallel_size": tensor_parallel_size,
+            "max_model_len": max_model_len,
+            "max_concurrency": max_concurrency,
+            "requires_network_evidence": requires_network_evidence,
+            "requires_nccl": requires_nccl,
+            "min_bandwidth_mbps": min_bandwidth_mbps,
+            "max_rtt_ms": max_rtt_ms,
+            "max_packet_loss_pct": max_packet_loss_pct,
+            "max_ttft_p95_ms": max_ttft_p95_ms,
+            "max_tpot_p95_ms": max_tpot_p95_ms,
+            "max_e2e_p95_ms": max_e2e_p95_ms,
+            "min_success_rate": min_success_rate,
+            "min_vram_headroom_pct": min_vram_headroom_pct,
+            "min_throughput_tps": min_throughput_tps,
+            "origin": origin,
+        }
+        encoded = json.dumps(
+            canonical_spec, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        spec_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", spec_digest) is None:
+        raise ValueError("placement spec_digest must be canonical SHA-256")
     if session.scalar(
         select(PlacementProfileRecord.id).where(
             PlacementProfileRecord.release_id == release_id,
@@ -1027,6 +1094,11 @@ def add_placement_profile(
         min_disk_free_mib=min_disk_free_mib,
         pipeline_parallel_size=pipeline_parallel_size,
         tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        max_concurrency=max_concurrency,
+        origin=origin,
+        status=status,
+        spec_digest=spec_digest,
         requires_network_evidence=requires_network_evidence,
         requires_nccl=requires_nccl,
         min_bandwidth_mbps=min_bandwidth_mbps,
@@ -1046,8 +1118,88 @@ def add_placement_profile(
         session.rollback()
         raise RegistryConflictError("placement profile already exists") from exc
     audit(session, "admin", "placement_profile.create", record.id, "success")
-    session.commit()
+    if _commit:
+        session.commit()
     return record
+
+
+def generate_auto_placement_profiles(
+    session: Session,
+    *,
+    release_id: str,
+    apply: bool,
+) -> dict[str, object]:
+    """Preview or atomically persist the closed automatic profile set."""
+
+    if type(apply) is not bool:
+        raise ValueError("apply must be a boolean")
+    release = session.scalar(
+        select(ModelRelease).where(ModelRelease.id == release_id).with_for_update()
+    )
+    if release is None:
+        raise ValueError("unknown model release")
+    if release.status != "DRAFT":
+        raise ValueError("automatic profiles require a DRAFT model release")
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    if artifact is None:
+        raise ValueError("unknown model artifact")
+    specs = generate_auto_placement_profile_specs(artifact.model_id)
+    existing = {
+        record.profile_id: record
+        for record in session.scalars(
+            select(PlacementProfileRecord).where(
+                PlacementProfileRecord.release_id == release.id,
+                PlacementProfileRecord.profile_id.in_(
+                    [spec.profile_id for spec in specs]
+                ),
+            )
+        )
+    }
+    profile_results: list[dict[str, object]] = []
+    missing = []
+    for spec in specs:
+        record = existing.get(spec.profile_id)
+        if record is None:
+            state = "MISSING"
+            missing.append(spec)
+        elif (
+            record.origin == AUTO_PROFILE_ORIGIN
+            and record.spec_digest == spec.spec_digest
+        ):
+            state = "EXISTS"
+        else:
+            raise RegistryConflictError(
+                f"placement profile identity conflicts: {spec.profile_id}"
+            )
+        profile_results.append({**spec.to_dict(), "state": state})
+
+    created_profile_ids: list[str] = []
+    if apply:
+        for spec in missing:
+            record = add_placement_profile(
+                session,
+                release_id=release.id,
+                _commit=False,
+                **spec.create_kwargs(),
+            )
+            created_profile_ids.append(record.profile_id)
+        audit(
+            session,
+            "admin",
+            "placement_profile.generate",
+            release.id,
+            "success",
+            created_profile_ids=created_profile_ids,
+        )
+        session.commit()
+
+    return {
+        "release_id": release.id,
+        "model_id": artifact.model_id,
+        "apply": apply,
+        "profiles": profile_results,
+        "created_profile_ids": created_profile_ids,
+    }
 
 
 def transition_model_release(
@@ -1072,7 +1224,8 @@ def transition_model_release(
     if target_status in {"VALIDATED", "ACTIVE"}:
         placement = session.scalar(
             select(PlacementProfileRecord.id).where(
-                PlacementProfileRecord.release_id == release.id
+                PlacementProfileRecord.release_id == release.id,
+                PlacementProfileRecord.status == "ACTIVE",
             )
         )
         if placement is None:

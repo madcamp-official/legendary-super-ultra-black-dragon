@@ -300,3 +300,84 @@ class ControlAPITests(unittest.TestCase):
         listed = self.client.get("/v1/admin/model-releases", headers=self.admin)
         self.assertEqual(listed.json()["releases"][0]["status"], "VALIDATED")
         self.assertEqual(listed.json()["releases"][0]["placements"][0]["profile_id"], "single-24g")
+
+    def test_automatic_placement_generation_is_previewed_and_idempotent(self):
+        artifact = self.client.post(
+            "/v1/admin/model-artifacts",
+            headers=self.admin,
+            json={
+                "model_id": "qwen2.5-72b-awq",
+                "repository": "Qwen/Qwen2.5-72B-Instruct-AWQ",
+                "revision": "a" * 40,
+                "manifest_digest": "sha256:" + "b" * 64,
+                "quantization": "awq",
+                "size_mib": 39670,
+                "default_max_model_len": 8192,
+                "layer_count": 80,
+                "license_id": "apache-2.0",
+            },
+        ).json()["artifact"]
+        runtime = self.client.post(
+            "/v1/admin/runtime-releases",
+            headers=self.admin,
+            json={
+                "version": "vllm-0.9.0",
+                "image": "registry.example/vllm@sha256:" + "c" * 64,
+                "vllm_version": "0.9.0",
+                "cuda_version": "12.8",
+                "gpu_architectures": ["ampere", "hopper"],
+            },
+        ).json()["runtime"]
+        release = self.client.post(
+            "/v1/admin/model-releases",
+            headers=self.admin,
+            json={
+                "artifact_id": artifact["id"],
+                "runtime_id": runtime["id"],
+                "quality_rank": 72,
+            },
+        ).json()["release"]
+        path = (
+            f"/v1/admin/model-releases/{release['id']}/placements/generate"
+        )
+
+        self.assertEqual(self.client.post(path, json={}).status_code, 401)
+        preview = self.client.post(path, headers=self.admin, json={})
+
+        self.assertEqual(preview.status_code, 200, preview.text)
+        generation = preview.json()["generation"]
+        self.assertFalse(generation["apply"])
+        self.assertEqual(
+            [item["pipeline_parallel_size"] for item in generation["profiles"]],
+            [1, 2, 3],
+        )
+        self.assertTrue(
+            all(item["state"] == "MISSING" for item in generation["profiles"])
+        )
+        detail = self.client.get(
+            f"/v1/admin/model-releases/{release['id']}", headers=self.admin
+        )
+        self.assertEqual(detail.json()["release"]["placements"], [])
+
+        applied = self.client.post(
+            path, headers=self.admin, json={"apply": True}
+        )
+        repeated = self.client.post(
+            path, headers=self.admin, json={"apply": True}
+        )
+
+        self.assertEqual(applied.status_code, 200, applied.text)
+        self.assertEqual(len(applied.json()["generation"]["created_profile_ids"]), 3)
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json()["generation"]["created_profile_ids"], [])
+        stored = self.client.get(
+            f"/v1/admin/model-releases/{release['id']}", headers=self.admin
+        ).json()["release"]["placements"]
+        self.assertEqual(len(stored), 3)
+        self.assertTrue(all(item["origin"] == "AUTO" for item in stored))
+        self.assertTrue(all(item["status"] == "DRAFT" for item in stored))
+        self.assertTrue(all(item["tensor_parallel_size"] == 1 for item in stored))
+        self.assertEqual(
+            self.client.post(path, headers=self.admin, json={"apply": 1}).status_code,
+            422,
+        )

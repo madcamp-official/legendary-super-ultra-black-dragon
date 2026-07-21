@@ -879,6 +879,24 @@ class PlacementProfileRecord(Base):
         CheckConstraint("min_disk_free_mib > 0", name="ck_placement_disk_positive"),
         CheckConstraint("pipeline_parallel_size > 0", name="ck_placement_pp_positive"),
         CheckConstraint("tensor_parallel_size > 0", name="ck_placement_tp_positive"),
+        CheckConstraint("max_model_len > 0", name="ck_placement_context_positive"),
+        CheckConstraint("max_concurrency > 0", name="ck_placement_concurrency_positive"),
+        CheckConstraint(
+            "origin IN ('MANUAL', 'AUTO')",
+            name="ck_placement_origin",
+        ),
+        CheckConstraint(
+            "status IN ('DRAFT', 'QUALIFYING', 'VALIDATED', 'ACTIVE', 'REVOKED')",
+            name="ck_placement_status",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR tensor_parallel_size = 1",
+            name="ck_placement_auto_tp1",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR pipeline_parallel_size = node_count",
+            name="ck_placement_auto_pp_nodes",
+        ),
         CheckConstraint(
             "max_packet_loss_pct IS NULL OR (max_packet_loss_pct >= 0 AND max_packet_loss_pct <= 100)",
             name="ck_placement_packet_loss_range",
@@ -902,6 +920,7 @@ class PlacementProfileRecord(Base):
         CheckConstraint(
             "max_rtt_ms IS NULL OR max_rtt_ms >= 0", name="ck_placement_rtt_nonnegative"
         ),
+        Index("ix_placement_profiles_status", "status"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     release_id: Mapped[str] = mapped_column(ForeignKey("model_releases.id", ondelete="CASCADE"), nullable=False)
@@ -912,6 +931,11 @@ class PlacementProfileRecord(Base):
     min_disk_free_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     pipeline_parallel_size: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     tensor_parallel_size: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    max_model_len: Mapped[int] = mapped_column(Integer, default=8192, nullable=False)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    origin: Mapped[str] = mapped_column(String(20), default="MANUAL", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE", nullable=False)
+    spec_digest: Mapped[str | None] = mapped_column(String(71))
     requires_network_evidence: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     requires_nccl: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     min_bandwidth_mbps: Mapped[int | None] = mapped_column(Integer)

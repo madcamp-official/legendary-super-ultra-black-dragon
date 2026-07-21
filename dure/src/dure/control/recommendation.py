@@ -570,7 +570,10 @@ def _active_catalog(
             PlacementProfileRecord,
             PlacementProfileRecord.release_id == ModelRelease.id,
         )
-        .where(ModelRelease.status == "ACTIVE")
+        .where(
+            ModelRelease.status == "ACTIVE",
+            PlacementProfileRecord.status == "ACTIVE",
+        )
         .order_by(
             ModelRelease.quality_rank.desc(),
             ModelArtifact.model_id,
@@ -642,6 +645,11 @@ def _active_catalog(
             "min_disk_free_mib": placement.min_disk_free_mib,
             "pipeline_parallel_size": placement.pipeline_parallel_size,
             "tensor_parallel_size": placement.tensor_parallel_size,
+            "max_model_len": placement.max_model_len,
+            "max_concurrency": placement.max_concurrency,
+            "origin": placement.origin,
+            "status": placement.status,
+            "spec_digest": placement.spec_digest,
             "requires_network_evidence": placement.requires_network_evidence,
             "requires_nccl": placement.requires_nccl,
             "min_bandwidth_mbps": placement.min_bandwidth_mbps,
