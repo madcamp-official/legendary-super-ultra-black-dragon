@@ -474,6 +474,7 @@ class NodeAssignment:
     runtime_address: str | None = None
     stage_manifest_digest: str | None = None
     stage_tensor_keys_digest: str | None = None
+    gpu_uuid: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -482,6 +483,7 @@ class NodeAssignment:
             "runtime_address",
             "stage_manifest_digest",
             "stage_tensor_keys_digest",
+            "gpu_uuid",
         ):
             if value[key] is None:
                 value.pop(key)
@@ -624,6 +626,12 @@ class DeploymentPlan:
             runtime_addresses.append(canonical_private_ipv4(assignment.runtime_address))
             if type(assignment.gpu_index) is not int or assignment.gpu_index < 0:
                 raise ValueError("gpu_index must be a non-negative integer")
+            if assignment.gpu_uuid is not None and (
+                type(assignment.gpu_uuid) is not str
+                or not assignment.gpu_uuid.startswith("GPU-")
+                or len(assignment.gpu_uuid) > 128
+            ):
+                raise ValueError("gpu_uuid must be a bounded NVIDIA GPU UUID")
             if stage_mode and (
                 type(assignment.stage_manifest_digest) is not str
                 or _SHA256_DIGEST.fullmatch(assignment.stage_manifest_digest) is None

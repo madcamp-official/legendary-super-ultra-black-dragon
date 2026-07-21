@@ -260,7 +260,7 @@ dure admin verify <deployment-id> --nodes <ray-head-node-id> --api
 적용 전에 다음 조건을 모두 확인합니다.
 
 - 런타임은 정확히 vLLM 0.9.0 V0 executor를 포함한 OCI digest 고정 이미지입니다.
-- `TP=1`, `PP=2` 또는 `PP=3`이며 각 물리 노드에는 정상 GPU가 정확히 한 장 있습니다.
+- `TP=1`, `PP=2` 또는 `PP=3`이며 각 물리 노드에는 계획이 선택한 정상 GPU index·UUID가 정확히 한 쌍 있습니다. 다른 정상 GPU가 있어도 이 배포에는 노출하지 않습니다.
 - assignment는 hostname이 아니라 서버가 발급한 canonical UUID를 사용합니다.
 - 각 노드는 서로 다른 canonical RFC1918 IPv4를 가지며 head가 rank 0, worker는 IPv4 문자열 오름차순입니다.
 - 각 노드의 계획 주소가 최신 probe의 `default_interface_addresses`에 정확히 하나

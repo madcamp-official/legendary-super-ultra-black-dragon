@@ -455,6 +455,12 @@ class RecommendationAcceptanceTests(unittest.TestCase):
             [item["expected_runtime_rank"] for item in plan["assignments"]],
             [0, 1, 2],
         )
+        self.assertTrue(
+            all(
+                item["gpu_uuid"].startswith("GPU-")
+                for item in plan["assignments"]
+            )
+        )
         self.assertEqual(DeploymentPlan.from_dict(plan).to_dict(), plan)
         with self.factory() as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
@@ -576,11 +582,6 @@ class RecommendationAcceptanceTests(unittest.TestCase):
                 "STRICT_NETWORK",
             ),
             (
-                "two-gpus",
-                {"extra_healthy_gpu": True},
-                "STRICT_GPU_TOPOLOGY",
-            ),
-            (
                 "wrong-vllm",
                 {"vllm_version": "0.9.1"},
                 "STRICT_RUNTIME_VERSION",
@@ -618,6 +619,24 @@ class RecommendationAcceptanceTests(unittest.TestCase):
                     self.assert_error_code(
                         response, 409, "RECOMMENDATION_NOT_FEASIBLE"
                     )
+
+    def test_multinode_recommendation_binds_one_gpu_on_a_multi_gpu_node(self):
+        node_ids, _, _ = self._seed_pipeline_candidate(
+            "two-gpus", extra_healthy_gpu=True
+        )
+
+        recommendation = self._recommend_nodes(node_ids)
+        response = self._accept(recommendation["id"])
+
+        self.assertIsNotNone(recommendation["selected"])
+        self.assertEqual(response.status_code, 200, response.text)
+        assignments = response.json()["deployment"]["plan"]["assignments"]
+        self.assertEqual(len(assignments), 3)
+        self.assertEqual(len({item["node_id"] for item in assignments}), 3)
+        self.assertTrue(all(item["gpu_index"] == 0 for item in assignments))
+        self.assertTrue(
+            all(item["gpu_uuid"].startswith("GPU-") for item in assignments)
+        )
 
     def test_postgresql_accept_locks_evidence_registry_and_inventory_tables(self):
         session = Mock()

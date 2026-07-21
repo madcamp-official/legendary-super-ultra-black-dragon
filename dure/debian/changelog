@@ -1,3 +1,11 @@
+dure (0.3.26) UNRELEASED; urgency=medium
+
+  * 노드 수 상한 없는 읽기 전용 GPU 풀 스냅샷을 추가합니다.
+  * 노드마다 선택한 GPU index와 UUID 한 쌍을 계획과 런타임에 고정합니다.
+  * 다중 GPU 노드에서도 선택하지 않은 GPU를 배포에 노출하지 않습니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 19:10:00 +0900
+
 dure (0.3.25) UNRELEASED; urgency=medium
 
   * 단일 GPU 릴리스의 등록·준비·벤치마크·승격·추천·배포·검증을 자동화합니다.

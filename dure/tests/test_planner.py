@@ -122,6 +122,11 @@ class PlannerTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         assert plan is not None
         self.assertEqual(plan.assignments[0].gpu_index, 2)
+        self.assertEqual(plan.assignments[0].gpu_uuid, "GPU-gpu-2")
+        self.assertEqual(
+            DeploymentPlan.from_dict(plan.to_dict()).assignments[0].gpu_uuid,
+            "GPU-gpu-2",
+        )
 
     def test_72b_requires_three_eligible_gpus(self):
         with self.assertRaisesRegex(ValueError, "requires 3"):
@@ -321,6 +326,29 @@ class PlannerTests(unittest.TestCase):
                 self.assertEqual(
                     [item.profile.node_id for item in bindings], expected
                 )
+
+    def test_strict_ray_pp_order_selects_one_gpu_by_memory_then_uuid(self):
+        head = profile(
+            "00000000-0000-4000-8000-000000000010", address="10.0.0.9"
+        )
+        worker = profile(
+            "00000000-0000-4000-8000-000000000020", address="10.0.0.10"
+        )
+        lower_memory = copy.deepcopy(worker.gpus[0])
+        lower_memory.index = 3
+        lower_memory.uuid = "GPU-lower-memory"
+        lower_memory.memory_mib -= 1024
+        same_memory = copy.deepcopy(worker.gpus[0])
+        same_memory.index = 2
+        same_memory.uuid = "GPU-00000000-0000-4000-8000-000000000019"
+        worker.gpus.extend([lower_memory, same_memory])
+
+        bindings = strict_vllm_ray_pp_order(
+            [head, worker], head_node_id=head.node_id
+        )
+
+        self.assertEqual(bindings[1].gpu_index, 2)
+        self.assertEqual(bindings[1].gpu_uuid, same_memory.uuid)
 
     def test_strict_ray_pp_order_rejects_ambiguous_or_unbound_default_addresses(self):
         head = profile(

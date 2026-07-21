@@ -100,7 +100,7 @@ SHA-256과 OCI digest는 선택한 바이트의 동일성을 고정하지만 게
 
 `VLLM_RAY_PP_V1`은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, `PP=2/3`, 노드별 정상 GPU 한 장과 검증된 `FULL_SNAPSHOT` 또는 exact rank `STAGE`를 지원합니다. 새 backend는 별도 필드가 없는 기존 계획 JSON과 legacy 실행에 영향을 주지 않습니다. 반대로 엄격한 필드 일부만 legacy 계획에 섞거나 알 수 없는 backend·vLLM·cache kind를 지정하면 실행 전에 거부합니다.
 
-중앙 계획은 hostname을 실행 identity로 사용하지 않고 서버가 발급한 canonical UUID를 직접 배정합니다. head는 rank 0으로 고정하고 worker는 중복 없는 canonical RFC1918 IPv4 문자열 순으로 정렬합니다. 계획의 rank·layer 범위·노드·주소 집합은 빈틈없이 연속이어야 하며, 각 노드 Agent는 현재 probe에서 같은 UUID, `default_interface_addresses`에 정확히 결합된 계획 주소, 모든 노드에서 같은 기본 interface, 정상 GPU 정확히 한 장, cache kind에 맞는 exact marker와 Docker NVIDIA runtime을 다시 확인합니다. 비중지 작업은 전체 배정 집합과 0.3.18 이상 Agent를 요구하고 `STAGE`는 0.3.19 이상이어야 합니다.
+중앙 계획은 hostname을 실행 identity로 사용하지 않고 서버가 발급한 canonical UUID를 직접 배정합니다. head는 rank 0으로 고정하고 worker는 중복 없는 canonical RFC1918 IPv4 문자열 순으로 정렬합니다. 계획의 rank·layer 범위·노드·주소 집합은 빈틈없이 연속이어야 하며, 각 노드 Agent는 현재 probe에서 같은 UUID, `default_interface_addresses`에 정확히 결합된 계획 주소, 모든 노드에서 같은 기본 interface, 계획에 고정된 정상 GPU index·UUID 한 쌍, cache kind에 맞는 exact marker와 Docker NVIDIA runtime을 다시 확인합니다. 정상 GPU가 여러 장인 호스트에서도 선택되지 않은 GPU는 컨테이너에 노출하지 않습니다. 비중지 작업은 전체 배정 집합과 0.3.18 이상 Agent를 요구하고 `STAGE`는 0.3.19 이상이어야 합니다.
 
 Ray 실행 입력도 폐쇄돼 있습니다. GCS `6379`, worker `20000-21000`, API `127.0.0.1:8000`, `--node-ip-address`, `VLLM_HOST_IP`, Ray backend와 TP/PP 값은 코드의 고정 계약에서 생성합니다. 중앙 task가 임의 명령, 포트, Docker 인자, 환경 변수, mount나 host path를 주입할 수 없습니다. 다만 host network를 사용하는 Ray 컨테이너는 별도 network namespace 격리를 제공하지 않으므로, RFC1918 검사만으로 보안을 충족한다고 보아서는 안 됩니다. host firewall과 사설 overlay가 실제 접근 제어 경계입니다.
 
