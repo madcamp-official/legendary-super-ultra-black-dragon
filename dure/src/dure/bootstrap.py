@@ -237,6 +237,9 @@ class Bootstrapper:
         apply: bool = False,
         allow_docker_restart: bool = False,
     ) -> BootstrapReport:
+        # Applying the reviewed bootstrap plan includes its required Docker
+        # restart. The legacy flag remains accepted for CLI compatibility.
+        allow_docker_restart = apply or allow_docker_restart
         report = BootstrapReport(
             apply=apply,
             allow_docker_restart=allow_docker_restart,
@@ -418,20 +421,22 @@ class Bootstrapper:
             running = self._running_container_count(report)
             if running is None:
                 return report
-            if running and not allow_docker_restart:
+            if running:
                 report.checks.append(
                     BootstrapCheck(
-                        "DOCKER_RESTART_BLOCKED",
-                        "BLOCKED",
-                        f"Docker restart would affect {running} running container(s); review them and add --allow-docker-restart",
-                    )
-                )
-            elif running:
-                report.checks.append(
-                    BootstrapCheck(
-                        "DOCKER_RESTART_APPROVED",
+                        "DOCKER_RESTART_APPROVED"
+                        if allow_docker_restart
+                        else "DOCKER_RESTART_PLANNED",
                         "ACTION_REQUIRED",
-                        f"Operator explicitly allowed a Docker restart with {running} running container(s)",
+                        (
+                            f"Bootstrap apply includes a Docker restart affecting "
+                            f"{running} running container(s)"
+                            if allow_docker_restart
+                            else (
+                                f"Docker restart will affect {running} running container(s); "
+                                "review them before running --apply"
+                            )
+                        ),
                     )
                 )
 
@@ -1563,10 +1568,6 @@ class Bootstrapper:
                             if line.strip()
                         ]
                     )
-                    if running and not report.allow_docker_restart:
-                        raise BootstrapExecutionError(
-                            f"Docker workload changed after preflight; {running} running container(s) now require --allow-docker-restart"
-                        )
                     self._require_pre_join_boundary()
                     restart_attempted = True
                     self._run_required(

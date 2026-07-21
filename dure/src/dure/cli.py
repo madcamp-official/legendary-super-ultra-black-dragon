@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 import time
 import uuid
@@ -17,9 +19,105 @@ from .runtime import read_plan, write_plan
 from .state import StateStore
 
 
+ADMIN_ENV_KEYS = frozenset({"DURE_SERVER", "DURE_ADMIN_TOKEN"})
+ADMIN_ENV_MAX_BYTES = 64 * 1024
+
+
+def _parse_admin_env_file(path: Path, *, required: bool) -> dict[str, str]:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        if required:
+            raise ValueError(f"admin env file does not exist: {path}") from None
+        return {}
+    except OSError as exc:
+        raise ValueError(f"admin env file is not a safe readable file: {path}: {exc}") from exc
+
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"admin env file must be a regular file: {path}")
+        content = os.read(descriptor, ADMIN_ENV_MAX_BYTES + 1)
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"could not read admin env file: {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+    if len(content) > ADMIN_ENV_MAX_BYTES:
+        raise ValueError(f"admin env file exceeds {ADMIN_ENV_MAX_BYTES} bytes: {path}")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"admin env file is not valid UTF-8: {path}") from exc
+
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[7:].lstrip()
+        if "=" not in stripped:
+            if stripped.startswith("DURE_"):
+                raise ValueError(f"invalid Dure setting in {path}:{line_number}")
+            continue
+        key, raw_value = stripped.split("=", 1)
+        key = key.strip()
+        if key not in ADMIN_ENV_KEYS:
+            continue
+        if key in values:
+            raise ValueError(f"duplicate {key} in admin env file: {path}")
+        raw_value = raw_value.strip()
+        if raw_value[:1] in {"'", '"'}:
+            quote = raw_value[0]
+            if len(raw_value) < 2 or raw_value[-1] != quote:
+                raise ValueError(f"unterminated quoted {key} in {path}:{line_number}")
+            raw_value = raw_value[1:-1]
+        if not raw_value:
+            raise ValueError(f"{key} must not be empty in admin env file: {path}")
+        values[key] = raw_value
+
+    if not values and not required:
+        return {}
+    missing = sorted(ADMIN_ENV_KEYS - values.keys())
+    if missing:
+        raise ValueError(
+            f"admin env file must define DURE_SERVER and DURE_ADMIN_TOKEN together: {path}"
+        )
+    if metadata.st_uid != os.geteuid():
+        raise ValueError(f"admin env file must be owned by the current user: {path}")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise ValueError(f"admin env file must not be accessible by group or others: {path}")
+    return values
+
+
+def _admin_env_values(explicit_path: Path | None) -> dict[str, str]:
+    if explicit_path is not None:
+        return _parse_admin_env_file(explicit_path, required=True)
+    working_directory = Path.cwd()
+    for candidate in (working_directory / "dure" / ".env", working_directory / ".env"):
+        values = _parse_admin_env_file(candidate, required=False)
+        if values:
+            return values
+    return {}
+
+
 def _add_admin_connection(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--server", default=None, help="Control plane URL (or DURE_SERVER)")
     parser.add_argument("--token", default=None, help="Admin token (or DURE_ADMIN_TOKEN)")
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        help="Read DURE_SERVER and DURE_ADMIN_TOKEN from this owner-only dotenv file",
+    )
 
 
 def _canonical_uuid_argument(value: str) -> str:
@@ -48,7 +146,7 @@ def _parser() -> argparse.ArgumentParser:
     bootstrap.add_argument(
         "--allow-docker-restart",
         action="store_true",
-        help="Allow the required Docker restart after reviewing running containers",
+        help="Compatibility flag; --apply already includes the required Docker restart",
     )
     bootstrap.add_argument(
         "--json", action="store_true", help="Print the closed bootstrap report as JSON"
@@ -525,7 +623,6 @@ def _gpu_node_ids_from_inventory(
 
 
 def _admin(args: argparse.Namespace) -> int:
-    import os
     from .agent import resolve_join_settings
     from .http import JSONClient
 
@@ -533,10 +630,27 @@ def _admin(args: argparse.Namespace) -> int:
         configured_server, _ = resolve_join_settings()
     except ValueError:
         configured_server = None
-    server = args.server or os.environ.get("DURE_SERVER") or configured_server
-    token = args.token or os.environ.get("DURE_ADMIN_TOKEN")
+    configured_admin = (
+        {}
+        if args.env_file is None and args.server and args.token
+        else _admin_env_values(args.env_file)
+    )
+    server = (
+        args.server
+        or configured_admin.get("DURE_SERVER")
+        or os.environ.get("DURE_SERVER")
+        or configured_server
+    )
+    token = (
+        args.token
+        or configured_admin.get("DURE_ADMIN_TOKEN")
+        or os.environ.get("DURE_ADMIN_TOKEN")
+    )
     if not server or not token:
-        raise ValueError("--server and --token (or DURE_SERVER and DURE_ADMIN_TOKEN) are required")
+        raise ValueError(
+            "--server and --token, a secure .env file, or "
+            "DURE_SERVER and DURE_ADMIN_TOKEN are required"
+        )
     client = JSONClient(server, token)
     if args.admin_command == "nodes":
         values = client.request("GET", "/v1/admin/nodes")["nodes"]

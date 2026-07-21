@@ -36,6 +36,7 @@
 
 - 개발 목적이 아닌 모든 에이전트 연결에는 HTTPS를 사용합니다.
 - `DURE_ADMIN_TOKEN`, 데이터베이스 자격 증명, APT 서명 키, 모델 자격 증명을 Git 밖에 보관합니다.
+- 관리자 CLI의 dotenv는 현재 사용자만 읽을 수 있게 두고 token을 셸 이력, 로그나 지원 요청에 출력하지 않습니다.
 - 가능하면 join과 중앙 제어면 종단점을 신뢰된 LAN 또는 사설 오버레이로 제한합니다.
 - 노드를 승인하기 전 호스트명, GPU 인벤토리, 주소, 소유자를 검토합니다.
 - 배포 이미지와 모델 리비전을 고정하고 Ray 포드 전체에서 같은 검증 런타임을 사용합니다.
@@ -45,6 +46,12 @@
 - `dure admin diagnose`는 명시적 외부 처리입니다. 선택된 인벤토리가 운영자 컴퓨터의 Codex 제공자로 전송될 수 있지만 자격 증명, 컨테이너 환경 변수·명령, 프롬프트는 전송하지 않습니다.
 - PostgreSQL 백업, 자격 증명 폐기, 복구 절차를 실제로 검증합니다.
 
+## 관리자 CLI credential 파일의 신뢰 경계
+
+`dure admin`은 현재 작업 디렉터리의 `dure/.env`, `.env` 또는 명시적 `--env-file`에서 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`만 읽을 수 있습니다. 파일을 shell로 source하지 않으므로 command substitution, 변수 확장과 임의 shell 문법을 실행하지 않습니다. 두 설정은 같은 파일에 모두 있어야 하며, 파일 설정을 사용하기로 한 뒤 프로세스 환경의 token이나 server와 섞지 않습니다. 명시적 `--server`·`--token`만 개별 값을 덮어쓸 수 있습니다.
+
+credential 파일은 64KiB 이하의 현재 사용자 소유 regular file이어야 하고 group·other 접근 비트가 없어야 합니다. final-component symlink, 비일반 파일, 중복·빈 값, 불완전한 Dure 설정과 잘못된 UTF-8은 네트워크 요청 전에 거부합니다. 자동 발견은 Dure 설정이 없는 일반 dotenv를 credential 파일로 사용하지 않으며 `.env`는 저장소의 ignore 규칙에 포함됩니다. 그러나 ignore는 secret 저장소나 접근 통제가 아니므로 파일을 commit, artifact, backup 또는 지원 자료에 포함하지 않아야 합니다. 현재 작업 디렉터리는 설정 발견 입력이므로 신뢰하지 않는 디렉터리에서 관리자 명령을 실행하지 말고, 자동 발견을 피하려면 신뢰 경로를 `--env-file`로 명시합니다.
+
 ## 로컬 host bootstrap의 신뢰 경계
 
 `dure bootstrap`은 중앙 제어면이나 Agent task가 호출할 수 없는 노드 로컬 CLI입니다. 새 원격 작업 종류, 임의 명령, Docker 인자, 환경 변수, mount 또는 host 경로를 받지 않습니다. 기본 실행은 읽기 전용이고 root의 명시적 `--apply`만 APT·파일·service를 변경합니다. 적용은 등록 전·Agent 비활성 노드에 한정하고 credential을 포함한 `/etc/dure/agent.json`이 있으면 거부합니다. `dure unjoin`이 남긴 root 소유 regular file에 유일한 문자열 `install_id`만 있을 때는 권한이 없는 설치 identity로 검증해 허용하며, 추가 필드·손상·link·쓰기 가능한 파일은 계속 차단합니다. bootstrap apply, `dure join`과 `dure unjoin`은 `/run/lock/dure-host-setup.lock`을 함께 사용해 host 변경과 등록 해제를 직렬화합니다.
@@ -53,7 +60,7 @@
 
 이 검사는 호스트의 모든 APT source와 이미 설치된 패키지의 provenance를 독립적으로 증명하지 않습니다. APT는 호스트가 이미 신뢰하는 다른 source도 함께 해석하므로 동일한 패키지 이름·버전을 제공하는 경쟁 source를 암호학적으로 배제하지 않으며, 기존 exact Toolkit 패키지가 과거 어느 source에서 설치됐는지도 확인하지 않습니다. 운영자는 신뢰 source 목록과 APT policy를 별도로 감사해야 합니다. bootstrap의 고정 URL·key·버전 검사는 전체 패키지 공급망 attestation을 대신하지 않습니다.
 
-기존 Docker를 재설정할 때는 로컬 rootful `/var/run/docker.sock`, 활성 systemd `docker.service`, 재부팅 뒤 service 또는 socket 활성화와 exact runtime JSON을 요구합니다. `nvidia` runtime path는 `nvidia-container-runtime` 또는 `/usr/bin/nvidia-container-runtime`만 허용하고 추가 runtime 인자를 거부합니다. 설정 파일과 부모의 symbolic link·비정상 JSON·고아 또는 충돌 backup을 변경 전에 거부합니다. `daemon.json`이 있으면 원래 bytes·mode·owner를 보존하고, 생성 설정이 `nvidia` runtime 밖의 기존 값을 바꾸면 적용하지 않습니다. `nvidia-ctk` 또는 Docker 재시작 실패 시 원본을 복원합니다. 재시작 직후 exact runtime을 다시 확인하며 실패하면 기존 설정과 service를 복구합니다. 실행 중 컨테이너는 사전 검사와 재시작 직전에 다시 확인하며 `--allow-docker-restart` 없이는 적용을 중단합니다. 검사를 통과해도 마지막 확인과 systemd 재시작 사이의 짧은 local race, host root·Docker daemon 침해, malicious APT mirror가 신뢰 key로 서명된 패키지를 제공하는 위험까지 방어하지는 않습니다.
+기존 Docker를 재설정할 때는 로컬 rootful `/var/run/docker.sock`, 활성 systemd `docker.service`, 재부팅 뒤 service 또는 socket 활성화와 exact runtime JSON을 요구합니다. `nvidia` runtime path는 `nvidia-container-runtime` 또는 `/usr/bin/nvidia-container-runtime`만 허용하고 추가 runtime 인자를 거부합니다. 설정 파일과 부모의 symbolic link·비정상 JSON·고아 또는 충돌 backup을 변경 전에 거부합니다. `daemon.json`이 있으면 원래 bytes·mode·owner를 보존하고, 생성 설정이 `nvidia` runtime 밖의 기존 값을 바꾸면 적용하지 않습니다. `nvidia-ctk` 또는 Docker 재시작 실패 시 원본을 복원합니다. 재시작 직후 exact runtime을 다시 확인하며 실패하면 기존 설정과 service를 복구합니다. 실행 중 컨테이너는 사전 검사와 재시작 직전에 다시 확인합니다. 미리보기는 재시작 영향을 경고하고 명시적 `--apply`는 그 영향의 승인까지 포함합니다. 검사를 통과해도 마지막 확인과 systemd 재시작 사이의 짧은 local race, host root·Docker daemon 침해, malicious APT mirror가 신뢰 key로 서명된 패키지를 제공하는 위험까지 방어하지는 않습니다.
 
 bootstrap 자체는 모델 다운로드, 이미지 pull, Docker run·stop, 배포 생성, `dure join` 또는 Agent 시작을 수행하지 않습니다. host firewall도 직접 변경하지 않지만 Docker 설치의 netfilter·forwarding 효과는 이 경계 밖이므로 운영자가 적용 전후 검증해야 합니다. 실제 GPU 컨테이너를 pull/run하는 자동 수용 시험도 수행하지 않으며, 준비 뒤 `sudo dure doctor`와 별도 보호된 수용 검사가 필요합니다.
 

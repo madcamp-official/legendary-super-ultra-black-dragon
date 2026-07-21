@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -22,6 +23,158 @@ class FakeJSONClient:
     def request(self, method: str, path: str, payload: dict | None = None):
         self.calls.append((self.server, self.token, method, path, payload))
         return self.response
+
+
+class AdminEnvFileCLITests(unittest.TestCase):
+    def setUp(self):
+        FakeJSONClient.calls = []
+        FakeJSONClient.response = {"nodes": []}
+
+    def _write_env(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o600)
+
+    def _run(self, arguments: list[str], working_directory: Path) -> tuple[int, str]:
+        error = io.StringIO()
+        with patch.dict(
+            os.environ,
+            {
+                "DURE_SERVER": "https://stale.example",
+                "DURE_ADMIN_TOKEN": "stale-token",
+            },
+            clear=True,
+        ), patch("dure.cli.Path.cwd", return_value=working_directory), patch(
+            "dure.agent.resolve_join_settings",
+            return_value=("https://packaged", False),
+        ), patch("dure.http.JSONClient", FakeJSONClient), redirect_stderr(error):
+            result = main(arguments)
+        return result, error.getvalue()
+
+    def test_admin_automatically_uses_nested_dure_env_as_one_credential_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_env(
+                root / "dure" / ".env",
+                "DURE_SERVER=https://control.example\nDURE_ADMIN_TOKEN=fresh-token\n",
+            )
+
+            result, error = self._run(["admin", "nodes"], root)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            FakeJSONClient.calls,
+            [("https://control.example", "fresh-token", "GET", "/v1/admin/nodes", None)],
+        )
+
+    def test_admin_uses_current_project_env_and_accepts_export_syntax(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_env(
+                root / ".env",
+                "export DURE_SERVER='https://control.example'\n"
+                'export DURE_ADMIN_TOKEN="fresh-token"\n',
+            )
+
+            result, error = self._run(["admin", "nodes"], root)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(FakeJSONClient.calls[0][:2], ("https://control.example", "fresh-token"))
+
+    def test_explicit_arguments_override_the_env_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_env(
+                root / "admin.env",
+                "DURE_SERVER=https://file.example\nDURE_ADMIN_TOKEN=file-token\n",
+            )
+
+            result, error = self._run(
+                [
+                    "admin",
+                    "--env-file",
+                    str(root / "admin.env"),
+                    "--server",
+                    "https://argument.example",
+                    "--token",
+                    "argument-token",
+                    "nodes",
+                ],
+                root,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(FakeJSONClient.calls[0][:2], ("https://argument.example", "argument-token"))
+
+    def test_complete_explicit_connection_ignores_automatic_env_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "dure" / ".env"
+            self._write_env(
+                path,
+                "DURE_SERVER=https://file.example\nDURE_ADMIN_TOKEN=file-token\n",
+            )
+            path.chmod(0o644)
+
+            result, error = self._run(
+                [
+                    "admin",
+                    "--server",
+                    "https://argument.example",
+                    "--token",
+                    "argument-token",
+                    "nodes",
+                ],
+                root,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(FakeJSONClient.calls[0][:2], ("https://argument.example", "argument-token"))
+
+    def test_admin_rejects_partial_or_group_readable_credential_files(self):
+        cases = (
+            ("DURE_ADMIN_TOKEN=token-only\n", 0o600, "must define"),
+            (
+                "DURE_SERVER=https://control.example\nDURE_ADMIN_TOKEN=token\n",
+                0o640,
+                "must not be accessible",
+            ),
+        )
+        for content, mode, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "dure" / ".env"
+                self._write_env(path, content)
+                path.chmod(mode)
+                FakeJSONClient.calls = []
+
+                result, error = self._run(["admin", "nodes"], root)
+
+                self.assertEqual(result, 2)
+                self.assertIn(expected, error)
+                self.assertEqual(FakeJSONClient.calls, [])
+
+    def test_admin_rejects_a_symlinked_credential_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.env"
+            self._write_env(
+                target,
+                "DURE_SERVER=https://control.example\nDURE_ADMIN_TOKEN=token\n",
+            )
+            path = root / "dure" / ".env"
+            path.parent.mkdir(parents=True)
+            path.symlink_to(target)
+
+            result, error = self._run(["admin", "nodes"], root)
+
+        self.assertEqual(result, 2)
+        self.assertIn("not a safe readable file", error)
+        self.assertEqual(FakeJSONClient.calls, [])
 
 
 class ArtifactManifestCLITests(unittest.TestCase):

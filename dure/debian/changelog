@@ -1,3 +1,12 @@
+dure (0.3.23) UNRELEASED; urgency=medium
+
+  * 관리자 CLI가 안전한 .env 파일에서 서버와 admin credential을 함께 읽도록 합니다.
+  * 명령행 인자, dotenv, 프로세스 환경과 패키지 서버 설정의 우선순위를 고정합니다.
+  * credential 파일의 소유권·권한·일반 파일 여부와 크기를 실패 안전 방식으로 검사합니다.
+  * bootstrap --apply가 계획에 필요한 Docker 재시작 승인까지 포함하도록 합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 16:50:00 +0900
+
 dure (0.3.22) UNRELEASED; urgency=medium
 
   * Docker 29가 빈 platform 이름을 반환해도 검증된 Engine 구성요소로 식별합니다.

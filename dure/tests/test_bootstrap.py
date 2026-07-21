@@ -1090,7 +1090,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertFalse(any(call[:2] == ("apt-get", "remove") for call in runner.calls))
             self.assertFalse(any(call[:2] == ("apt-get", "install") for call in runner.calls))
 
-    def test_running_containers_require_explicit_restart_approval(self):
+    def test_apply_restarts_docker_even_when_containers_are_running(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = StrictBootstrapRunner(
                 docker=True,
@@ -1103,10 +1103,25 @@ class BootstrapTests(unittest.TestCase):
                 runner, root=make_root(directory), effective_uid=lambda: 0
             ).run(apply=True)
 
-            self.assertTrue(report.blocked)
-            self.assertIn("DOCKER_RESTART_BLOCKED", [check.code for check in report.checks])
-            self.assertNotIn(("systemctl", "restart", "docker"), runner.calls)
-            self.assertNotIn(("systemctl", "enable", "--now", "docker"), runner.calls)
+            self.assertTrue(report.ready, report.to_dict())
+            self.assertTrue(report.allow_docker_restart)
+            self.assertEqual(runner.restart_calls, 1)
+
+    def test_preview_warns_about_running_containers_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = StrictBootstrapRunner(
+                docker=True,
+                toolkit=True,
+                runtime=False,
+                running_containers=2,
+            )
+
+            report = Bootstrapper(runner, root=make_root(directory)).run()
+
+            self.assertFalse(report.blocked)
+            self.assertFalse(report.allow_docker_restart)
+            self.assertIn("DOCKER_RESTART_PLANNED", [check.code for check in report.checks])
+            self.assertEqual(runner.restart_calls, 0)
             self.assertFalse(
                 any(call[:3] == ("nvidia-ctk", "runtime", "configure") for call in runner.calls)
             )
@@ -1333,7 +1348,7 @@ class BootstrapTests(unittest.TestCase):
                 any(call[:3] == ("nvidia-ctk", "runtime", "configure") for call in runner.calls)
             )
 
-    def test_running_containers_can_be_restarted_only_after_explicit_approval(self):
+    def test_legacy_restart_approval_flag_remains_compatible(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = StrictBootstrapRunner(
                 docker=True,
@@ -1349,7 +1364,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue(report.ready, report.to_dict())
             self.assertEqual(runner.restart_calls, 1)
 
-    def test_new_workload_after_preflight_cancels_restart_and_restores_config(self):
+    def test_new_workload_after_preflight_is_included_in_apply_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_root(directory)
             daemon = root / "etc" / "docker" / "daemon.json"
@@ -1367,10 +1382,9 @@ class BootstrapTests(unittest.TestCase):
                 runner, root=root, effective_uid=lambda: 0
             ).run(apply=True)
 
-            self.assertTrue(report.blocked)
-            self.assertIn("APPLY_FAILED", [check.code for check in report.checks])
-            self.assertEqual(daemon.read_bytes(), original)
-            self.assertEqual(runner.restart_calls, 0)
+            self.assertTrue(report.ready, report.to_dict())
+            self.assertNotEqual(daemon.read_bytes(), original)
+            self.assertEqual(runner.restart_calls, 1)
 
     def test_invalid_daemon_json_is_blocked_before_configuration(self):
         with tempfile.TemporaryDirectory() as directory:

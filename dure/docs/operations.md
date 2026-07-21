@@ -31,6 +31,37 @@ systemctl restart dure-server
 curl -fsS http://127.0.0.1:8081/health
 ```
 
+## 관리자 CLI credential
+
+관리자 CLI는 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`을 같은 dotenv 파일에서 읽을 수 있습니다. 저장소 최상위에서 실행하면 먼저 `dure/.env`, 그다음 `.env`를 확인합니다. Dure 프로젝트 디렉터리 안에서 실행하면 해당 디렉터리의 `.env`를 확인합니다.
+
+```bash
+cd ~/workspace/dure
+install -m 600 /dev/null dure/.env
+```
+
+파일에는 두 값을 모두 설정합니다. 실제 token은 출력하거나 Git에 추가하지 않습니다.
+
+```dotenv
+DURE_SERVER=https://api.dure.example
+DURE_ADMIN_TOKEN=<same-random-secret-as-the-server>
+```
+
+```bash
+dure admin nodes
+dure admin nodes --pending
+```
+
+다른 위치는 admin 하위 명령보다 앞에 `--env-file`을 지정합니다.
+
+```bash
+dure admin --env-file /secure/path/dure-admin.env nodes
+```
+
+CLI는 파일을 shell로 source하지 않고 빈 줄·주석, `KEY=VALUE`와 `export KEY=VALUE`만 파싱합니다. 그중 `DURE_SERVER`·`DURE_ADMIN_TOKEN`만 사용하며 shell expansion과 command substitution은 실행하지 않습니다. 파일 크기는 64KiB 이하이고 현재 사용자 소유 regular file이며 group·other 권한이 없어야 합니다. symlink, 중복·빈 값, 두 설정 중 하나만 있는 파일은 요청 전에 거부합니다.
+
+연결 설정 우선순위는 `--server`·`--token`, 선택된 dotenv의 한 쌍, 프로세스의 `DURE_SERVER`·`DURE_ADMIN_TOKEN`, 패키지의 서버 주소 순서입니다. 따라서 안전한 dotenv가 발견되면 셸에 남아 있는 오래된 admin 환경변수와 섞지 않습니다. 401이 발생하면 서버 프로세스와 관리자 파일의 token이 같은지 확인하되 값을 터미널·로그에 출력하지 말고, 수정 뒤 파일 권한을 다시 확인합니다.
+
 ## GPU 노드 런타임 준비
 
 GPU 노드에는 Dure 패키지와 정상 동작하는 NVIDIA host driver가 먼저 있어야 합니다. 현재 bootstrap 지원 범위는 Ubuntu 22.04·24.04의 `amd64`·`arm64`입니다. 다만 공식 Dure APT 저장소는 아직 `amd64`만 게시합니다. `arm64`에서는 CLI·Agent 실행 파일과 함께 패키지의 `dure-agent.service`, `/etc/dure/dure-client.env`를 별도로 설치해야 하며 unit이 없으면 bootstrap을 차단합니다. CPU utility 노드는 Docker/NVIDIA runtime 준비를 건너뛸 수 있습니다.
@@ -63,13 +94,13 @@ sudo dure join
 
 적용은 Docker 공식 Ubuntu stable 저장소와 NVIDIA 공식 stable 저장소의 고정 URL을 추가해 사용하고, bootstrap이 새로 사용하거나 Dure의 고정 경로에 이미 있는 keyring에 기대한 primary key 하나만 있는지 fingerprint로 검사합니다. key와 부모는 APT의 비권한 key reader가 읽고 통과할 수 있어야 합니다. 실행 명령은 고정된 system `PATH`와 C locale을 사용하고 호출 셸의 proxy·APT·GPG 환경 설정 및 curl 사용자 설정은 상속하지 않습니다. 폐쇄망이나 proxy 전용 환경은 신뢰된 시스템 APT 설정과 별도 오프라인 provisioning 절차를 먼저 준비해야 합니다. Docker 설치는 제거를 허용하지 않는 닫힌 패키지 목록을 사용하고, Toolkit 네 패키지는 `1.19.1-1`로 설치해 `/etc/apt/preferences.d/dure-nvidia-container-toolkit`에서 우선순위 1001로 고정합니다. pin 파일이 다르면 자동 덮어쓰지 않습니다. 기존 `daemon.json`은 NVIDIA 설정 전에 `/var/lib/dure/bootstrap/daemon.json.before-nvidia-ctk`에 root 전용으로 보존합니다. `nvidia-ctk` 설정이 실패하면 원래 내용·권한·소유자만 복원하고 Docker를 재시작하지 않습니다. Docker 재시작을 이미 시도한 뒤 실패하거나 runtime이 확인되지 않으면 설정을 복원하고 기존 설정으로 복구 재시작을 한 번 시도합니다.
 
-NVIDIA runtime을 처음 등록하면 Docker 재시작이 필요합니다. bootstrap은 사전 검사와 재시작 직전에 실행 중 컨테이너를 다시 조사합니다. 하나라도 있으면 기본 적용을 중단하므로 workload를 직접 확인하고 유지보수 시간을 확보한 경우에만 다음 승인을 추가합니다.
+NVIDIA runtime을 처음 등록하면 Docker 재시작이 필요합니다. bootstrap은 사전 검사와 재시작 직전에 실행 중 컨테이너를 다시 조사합니다. 미리보기는 workload 개수와 영향을 경고하지만 차단하지 않으며, `--apply`는 검토한 폐쇄형 계획에 필요한 Docker 재시작까지 승인합니다. workload를 직접 확인하고 유지보수 시간을 확보한 뒤 실행합니다.
 
 ```bash
-sudo dure bootstrap --apply --allow-docker-restart
+sudo dure bootstrap --apply
 ```
 
-이 승인은 특정 Dure 컨테이너가 아니라 해당 Docker daemon의 모든 실행 workload가 잠시 중단될 수 있음을 뜻합니다. bootstrap은 host firewall을 수정하지 않지만 Docker Engine 설치 자체가 netfilter 규칙과 forwarding 동작에 영향을 줄 수 있으므로 적용 전후 방화벽을 별도로 검증합니다. 사용자를 `docker` 그룹에 추가하지 않으므로 준비 직후 검증은 `sudo dure doctor`로 실행합니다. 이 명령은 NVIDIA driver, 모델, 이미지, 컨테이너, 배포와 Agent 자격 증명을 만들거나 바꾸지 않습니다. 미설정 패키지 Agent는 `/etc/dure/agent.json`이 없으면 시작되지 않고 `dure join`이 설정을 쓴 뒤 활성화합니다. bootstrap apply와 join은 `/run/lock/dure-host-setup.lock`을 공유하며, 등록이 먼저 시작됐거나 노드가 이미 등록·활성화된 경우 bootstrap은 별도의 drain 절차를 추측하지 않고 거부합니다.
+이 승인은 특정 Dure 컨테이너가 아니라 해당 Docker daemon의 모든 실행 workload가 잠시 중단될 수 있음을 뜻합니다. 기존 `--allow-docker-restart`는 호환성을 위해 계속 받지만 추가 권한을 뜻하지 않습니다. bootstrap은 host firewall을 수정하지 않지만 Docker Engine 설치 자체가 netfilter 규칙과 forwarding 동작에 영향을 줄 수 있으므로 적용 전후 방화벽을 별도로 검증합니다. 사용자를 `docker` 그룹에 추가하지 않으므로 준비 직후 검증은 `sudo dure doctor`로 실행합니다. 이 명령은 NVIDIA driver, 모델, 이미지, 컨테이너, 배포와 Agent 자격 증명을 만들거나 바꾸지 않습니다. 미설정 패키지 Agent는 `/etc/dure/agent.json`이 없으면 시작되지 않고 `dure join`이 설정을 쓴 뒤 활성화합니다. bootstrap apply와 join은 `/run/lock/dure-host-setup.lock`을 공유하며, 등록이 먼저 시작됐거나 노드가 이미 등록·활성화된 경우 bootstrap은 별도의 drain 절차를 추측하지 않고 거부합니다.
 
 ## 노드 등록과 승인
 
