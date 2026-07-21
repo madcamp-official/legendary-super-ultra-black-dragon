@@ -1,3 +1,10 @@
+dure (0.4.13) UNRELEASED; urgency=medium
+
+  * PP=1/TP=1 단일 GPU 계획은 Ray 없이 고정 vLLM API 컨테이너를 직접 실행합니다.
+  * 단일 GPU readiness는 같은 API 컨테이너의 CUDA와 HTTP 모델 응답을 검증합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 19:10:00 +0000
+
 dure (0.4.12) UNRELEASED; urgency=medium
 
   * Docker 29의 nanosecond StartedAt을 Python 3.10에서 안전하게 정규화해 성공 컨테이너 정리를 복구합니다.

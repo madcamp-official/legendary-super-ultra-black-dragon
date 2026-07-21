@@ -21,6 +21,7 @@ from .pipeline_runtime import (
     VLLM_API_COMPONENT,
     VLLM_API_HOST,
     VLLM_API_PORT,
+    is_direct_single_gpu_plan,
     is_strict_pipeline_plan,
     stage_identity_labels,
     strict_model_mount_path,
@@ -630,6 +631,18 @@ class ContainerRuntime:
             plan.validate_execution_contract()
         except (TypeError, ValueError) as exc:
             return CheckResult("ray-container", False, str(exc))
+        if is_direct_single_gpu_plan(plan):
+            direct = self.start_api(plan, assignment, replace=replace)
+            return CheckResult(
+                "ray-container",
+                direct.ok,
+                (
+                    "Ray is not required; " + direct.detail
+                    if direct.ok
+                    else direct.detail
+                ),
+                blocking=direct.blocking,
+            )
         strict = is_strict_pipeline_plan(plan)
         if strict:
             try:
@@ -776,6 +789,7 @@ class ContainerRuntime:
         except (TypeError, ValueError) as exc:
             return CheckResult("vllm-api-start", False, str(exc))
         strict = is_strict_pipeline_plan(plan)
+        direct = is_direct_single_gpu_plan(plan)
         if strict:
             try:
                 validate_strict_pipeline_plan(plan)
@@ -834,6 +848,31 @@ class ContainerRuntime:
                 ],
             ]
             api_command = list(strict_vllm_api_command(plan))
+        elif direct:
+            environment_args = [
+                "-e",
+                "VLLM_ATTENTION_BACKEND=FLASH_ATTN",
+            ]
+            api_command = [
+                "serve",
+                "/models/model",
+                "--pipeline-parallel-size",
+                "1",
+                "--tensor-parallel-size",
+                "1",
+                "--quantization",
+                plan.model.quantization,
+                "--gpu-memory-utilization",
+                str(plan.gpu_memory_utilization),
+                "--max-model-len",
+                str(plan.max_model_len),
+                "--host",
+                VLLM_API_HOST,
+                "--port",
+                str(VLLM_API_PORT),
+                "--served-model-name",
+                plan.model.model_id,
+            ]
         else:
             environment_args = [
                 "-e",

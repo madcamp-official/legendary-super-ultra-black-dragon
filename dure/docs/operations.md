@@ -226,7 +226,9 @@ dure admin apply <deployment-id> --nodes <node-a> <node-b> <node-c>
 dure admin tasks --watch
 ```
 
-현재 vLLM API는 Ray head에서만 listen합니다. worker와 head 검증을 분리합니다.
+다중 노드 vLLM API는 Ray head에서만 listen합니다. `PP=1/TP=1` 단일 GPU 계획은
+Ray 없이 같은 head 노드의 vLLM API 컨테이너를 직접 시작합니다. worker와 head
+검증을 분리합니다.
 
 ```bash
 # 모든 배정 노드의 GPU/Ray 검증

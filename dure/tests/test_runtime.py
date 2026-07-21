@@ -267,7 +267,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(stopped.ok)
         self.assertTrue(verified.ok)
 
-    def test_ray_container_uses_explicit_entrypoint_and_no_shell(self):
+    def test_single_gpu_runtime_starts_direct_vllm_without_ray(self):
         node = profile("camp-7", address="192.168.0.228")
         plan = build_plan(
             [node],
@@ -280,7 +280,7 @@ class RuntimeTests(unittest.TestCase):
             "inspect",
             "--format",
             DEPLOYMENT_IDENTITY_FORMAT,
-            f"dure-ray-{plan.deployment_id}",
+            f"dure-api-{plan.deployment_id}",
         )
         runner = FakeRunner(
             executables={"docker"},
@@ -298,6 +298,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("dure.model=qwen2.5-32b-awq", run)
         gpu_flag = run.index("--gpus")
         self.assertEqual(run[gpu_flag + 1], "device=GPU-camp-7")
+        entrypoint = run.index("--entrypoint")
+        self.assertEqual(run[entrypoint + 1], "vllm")
+        image = run.index("registry.example/vllm@sha256:abc")
+        self.assertEqual(run[image + 1 : image + 3], ("serve", "/models/model"))
+        self.assertNotIn("--distributed-executor-backend", run)
+        self.assertNotIn("RAY_ADDRESS=172.17.0.1:6379", run)
+        served_name = run.index("--served-model-name")
+        self.assertEqual(run[served_name + 1], "qwen2.5-32b-awq")
+
+    def test_multi_node_legacy_runtime_still_starts_ray(self):
+        nodes = [
+            profile("camp-1", address="192.168.0.221"),
+            profile("camp-2", address="192.168.0.222"),
+            profile("camp-3", address="192.168.0.223"),
+        ]
+        plan = build_plan(
+            nodes,
+            model_id="qwen2.5-72b-awq",
+            image="registry.example/vllm@sha256:abc",
+        )
+        assert plan is not None
+        head = next(node for node in nodes if node.node_id == plan.ray_head_node_id)
+        assignment = plan.assignment_for(head.node_id)
+        assert assignment is not None
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            f"dure-ray-{plan.deployment_id}",
+        )
+        runner = FakeRunner(
+            executables={"docker"},
+            responses={inspect: CommandResult(inspect, 1, stderr="not found")},
+        )
+
+        result = ContainerRuntime(runner).start_ray(
+            head, plan, assignment, replace=False
+        )
+
+        self.assertTrue(result.ok)
+        run = runner.calls[-1]
         entrypoint = run.index("--entrypoint")
         self.assertEqual(run[entrypoint + 1], "ray")
         image = run.index("registry.example/vllm@sha256:abc")
@@ -337,6 +379,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run[entrypoint + 1], "vllm")
         image = run.index("registry.example/vllm@sha256:abc")
         self.assertEqual(run[image + 1 : image + 3], ("serve", "/models/model"))
+        self.assertNotIn("--distributed-executor-backend", run)
+        self.assertNotIn("RAY_ADDRESS=172.17.0.1:6379", run)
+        served_name = run.index("--served-model-name")
+        self.assertEqual(run[served_name + 1], "qwen2.5-32b-awq")
 
     def test_strict_worker_uses_fixed_address_environment_and_exact_labels(self):
         plan, _, worker = strict_pipeline_fixture()
@@ -919,7 +965,7 @@ class RuntimeTests(unittest.TestCase):
             image="registry.example/vllm@sha256:abc",
         )
         assert plan is not None
-        name = f"dure-ray-{plan.deployment_id}"
+        name = f"dure-api-{plan.deployment_id}"
         inspect = (
             "docker",
             "inspect",
@@ -953,7 +999,7 @@ class RuntimeTests(unittest.TestCase):
             image="registry.example/vllm@sha256:abc",
         )
         assert plan is not None
-        name = f"dure-ray-{plan.deployment_id}"
+        name = f"dure-api-{plan.deployment_id}"
         inspect = (
             "docker",
             "inspect",
@@ -993,7 +1039,7 @@ class RuntimeTests(unittest.TestCase):
             image="registry.example/vllm@sha256:abc",
         )
         assert plan is not None
-        name = f"dure-ray-{plan.deployment_id}"
+        name = f"dure-api-{plan.deployment_id}"
         inspect = (
             "docker",
             "inspect",
@@ -1074,7 +1120,7 @@ class RuntimeTests(unittest.TestCase):
             image="registry.example/vllm@sha256:abc",
         )
         assert plan is not None
-        name = f"dure-ray-{plan.deployment_id}"
+        name = f"dure-api-{plan.deployment_id}"
         inspect = (
             "docker",
             "inspect",
@@ -1115,7 +1161,7 @@ class RuntimeTests(unittest.TestCase):
             image="registry.example/vllm@sha256:abc",
         )
         assert plan is not None
-        name = f"dure-ray-{plan.deployment_id}"
+        name = f"dure-api-{plan.deployment_id}"
         inspect = (
             "docker",
             "inspect",

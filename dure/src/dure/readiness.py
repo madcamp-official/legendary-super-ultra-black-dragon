@@ -18,6 +18,7 @@ from .pipeline_runtime import (
     STRICT_STAGE_VARIANT_LABEL,
     VLLM_API_COMPONENT,
     VLLM_RAY_PP_RUNTIME_VERSION,
+    is_direct_single_gpu_plan,
     is_stage_pipeline_plan,
     is_strict_pipeline_plan,
     pipeline_contract_detail,
@@ -204,7 +205,11 @@ class ReadinessVerifier:
         plan: DeploymentPlan,
         assignment: NodeAssignment | None = None,
     ) -> CheckResult:
-        name = f"dure-ray-{plan.deployment_id}"
+        name = (
+            f"dure-api-{plan.deployment_id}"
+            if is_direct_single_gpu_plan(plan)
+            else f"dure-ray-{plan.deployment_id}"
+        )
         identity, container_reference = self._container_identity(
             plan,
             name,
@@ -237,6 +242,13 @@ class ReadinessVerifier:
                 "ray-cluster",
                 False,
                 "Strict pipeline requires source-pinned pipeline rank verification",
+            )
+        if is_direct_single_gpu_plan(plan):
+            return CheckResult(
+                "ray-cluster",
+                True,
+                "Ray is not required for the direct single-GPU runtime",
+                blocking=False,
             )
         name = f"dure-ray-{plan.deployment_id}"
         identity, container_reference = self._container_identity(
@@ -583,7 +595,10 @@ class ReadinessVerifier:
                 )
                 model_ids = [item["id"] for item in models] if valid_models else []
                 ok = 200 <= response.status < 300 and valid_models
-                if plan is not None and is_strict_pipeline_plan(plan):
+                if plan is not None and (
+                    is_strict_pipeline_plan(plan)
+                    or is_direct_single_gpu_plan(plan)
+                ):
                     ok = ok and model_ids == [plan.model.model_id]
                 detail = (
                     f"HTTP {response.status}; models="

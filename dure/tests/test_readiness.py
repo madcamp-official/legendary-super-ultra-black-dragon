@@ -11,11 +11,13 @@ from dure.pipeline_runtime import (
     strict_runtime_contract_digest,
 )
 from dure.models import CheckResult
+from dure.planner import build_plan
 from dure.readiness import PIPELINE_SNAPSHOT_SCRIPT, ReadinessVerifier
 from dure.runtime import DEPLOYMENT_IDENTITY_FORMAT
 
 from .helpers import (
     FakeRunner,
+    profile,
     strict_pipeline_fixture,
     strict_stage_pipeline_fixture,
 )
@@ -31,6 +33,49 @@ def _response(status=200, body=b""):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_direct_single_gpu_checks_api_container_without_ray(self):
+        node = profile("camp-2", address="192.168.0.222")
+        plan = build_plan(
+            [node],
+            model_id="qwen2.5-32b-awq",
+            image="registry.example/vllm@sha256:abc",
+        )
+        assert plan is not None
+        name = f"dure-api-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        identity = "\t".join(
+            ("container-id", "running", plan.deployment_id, "1", node.node_id)
+        )
+
+        def response(command):
+            if command[:3] == ("docker", "exec", "container-id"):
+                return 0, '{"gpu":"RTX 3090","value":256.0}', ""
+            raise AssertionError(f"unexpected command: {command}")
+
+        runner = FakeRunner(
+            responses={inspect: (0, identity, "")},
+            response_factory=response,
+        )
+        verifier = ReadinessVerifier(runner, node_id=node.node_id)
+
+        gpu = verifier.container_gpu(plan, plan.assignments[0])
+        ray = verifier.ray_cluster(plan)
+
+        self.assertTrue(gpu.ok, gpu.detail)
+        self.assertTrue(ray.ok, ray.detail)
+        self.assertFalse(ray.blocking)
+        self.assertIn(
+            ("docker", "exec", "container-id"),
+            [call[:3] for call in runner.calls],
+        )
+        self.assertFalse(any("dure-ray-" in " ".join(call) for call in runner.calls))
+
     def test_api_requires_health_and_a_served_model(self):
         model_body = json.dumps({"data": [{"id": "qwen-test"}]}).encode()
         with patch(
@@ -41,6 +86,38 @@ class ReadinessTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.detail)
         self.assertIn("qwen-test", result.detail)
+
+    def test_direct_single_gpu_api_requires_exact_planned_model(self):
+        node = profile("camp-2", address="192.168.0.222")
+        plan = build_plan(
+            [node],
+            model_id="qwen2.5-32b-awq",
+            image="registry.example/vllm@sha256:abc",
+        )
+        assert plan is not None
+        verifier = ReadinessVerifier(node_id=node.node_id)
+        wrong = json.dumps({"data": [{"id": "other-model"}]}).encode()
+        expected = json.dumps(
+            {"data": [{"id": plan.model.model_id}]}
+        ).encode()
+
+        with patch.object(
+            verifier, "_container_identity", return_value=(None, "container")
+        ), patch(
+            "dure.readiness.urllib.request.urlopen",
+            side_effect=[_response(), _response(body=wrong)],
+        ):
+            wrong_result = verifier.api(plan=plan)
+        with patch.object(
+            verifier, "_container_identity", return_value=(None, "container")
+        ), patch(
+            "dure.readiness.urllib.request.urlopen",
+            side_effect=[_response(), _response(body=expected)],
+        ):
+            expected_result = verifier.api(plan=plan)
+
+        self.assertFalse(wrong_result.ok)
+        self.assertTrue(expected_result.ok, expected_result.detail)
 
     def test_strict_api_requires_the_exact_planned_served_model(self):
         plan, head, _ = strict_pipeline_fixture()

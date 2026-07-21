@@ -185,7 +185,8 @@ sudo dure init \
 
 여기서 `--accept-model-download`는 기존 로컬 Hugging Face 모델 흐름에 대한 명시적 동의입니다. 새 콘텐츠 주소 캐시를 중앙에서 준비하거나 추천 모델을 자동 설치하는 기능은 아닙니다.
 
-API는 할당된 Ray head에서만 시작합니다. 모든 worker가 join한 뒤 Ray head에서 실행합니다.
+다중 노드 API는 모든 worker가 join한 뒤 할당된 Ray head에서만 시작합니다. `PP=1/TP=1`
+단일 GPU 계획은 Ray 없이 같은 노드의 vLLM API 컨테이너를 직접 시작합니다.
 
 ```bash
 sudo dure init \

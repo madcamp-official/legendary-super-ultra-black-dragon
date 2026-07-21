@@ -74,6 +74,25 @@ def is_stage_pipeline_plan(plan: DeploymentPlan) -> bool:
     )
 
 
+def is_direct_single_gpu_plan(plan: DeploymentPlan) -> bool:
+    """Return whether a legacy-compatible plan can run without Ray."""
+
+    if (
+        plan.execution_backend is not None
+        or plan.pipeline_parallel_size != 1
+        or plan.tensor_parallel_size != 1
+        or len(plan.assignments) != 1
+    ):
+        return False
+    assignment = plan.assignments[0]
+    return (
+        assignment.node_id == plan.ray_head_node_id
+        and assignment.role == "ray-head"
+        and assignment.rank == 0
+        and assignment.pipeline_rank == 0
+    )
+
+
 def _canonical_uuid(value: object, field: str) -> str:
     if type(value) is not str:
         raise PipelineRuntimeContractError(f"{field} must be a canonical UUID")
