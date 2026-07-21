@@ -449,7 +449,15 @@ class Bootstrapper:
 
     def _inspect_pre_join_boundary(self, report: BootstrapReport) -> None:
         config = self._path(DURE_AGENT_CONFIG_PATH)
-        if config.exists() or config.is_symlink():
+        if self._is_retired_install_config(config):
+            report.checks.append(
+                BootstrapCheck(
+                    "NODE_UNJOINED",
+                    "PASS",
+                    "The local registration is retired and retains only its installation identity",
+                )
+            )
+        elif config.exists() or config.is_symlink():
             report.checks.append(
                 BootstrapCheck(
                     "NODE_ALREADY_JOINED",
@@ -480,7 +488,9 @@ class Bootstrapper:
 
     def _require_pre_join_boundary(self) -> None:
         config = self._path(DURE_AGENT_CONFIG_PATH)
-        if config.exists() or config.is_symlink():
+        if (config.exists() or config.is_symlink()) and not self._is_retired_install_config(
+            config
+        ):
             raise BootstrapExecutionError(
                 "Node joined while bootstrap was running; refusing further host changes"
             )
@@ -492,6 +502,27 @@ class Bootstrapper:
             raise BootstrapExecutionError(
                 "Could not prove dure-agent stayed inactive during bootstrap"
             )
+
+    def _is_retired_install_config(self, config: Path) -> bool:
+        if config.is_symlink() or not config.exists():
+            return False
+        try:
+            metadata = config.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                return False
+            if self.root == Path("/") and (
+                metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                return False
+            value = json.loads(config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return (
+            type(value) is dict
+            and set(value) == {"install_id"}
+            and type(value["install_id"]) is str
+            and 0 < len(value["install_id"]) <= 64
+        )
 
     def _inspect_host_prerequisites(self, report: BootstrapReport) -> None:
         required = ("apt-get", "dpkg", "dpkg-query", "systemctl")

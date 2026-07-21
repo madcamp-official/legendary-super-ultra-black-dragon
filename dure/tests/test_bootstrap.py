@@ -606,6 +606,46 @@ class BootstrapTests(unittest.TestCase):
             self.assertIn("DURE_AGENT_ACTIVE", [check.code for check in report.checks])
             self.assertFalse(any(call[0] == "apt-get" for call in runner.calls))
 
+    def test_unjoined_install_identity_is_inside_the_pre_join_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_root(directory)
+            config = root / "etc" / "dure" / "agent.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                '{"install_id":"0123456789abcdef0123456789abcdef"}\n',
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+
+            report = Bootstrapper(StrictBootstrapRunner(), root=root).run()
+
+            self.assertFalse(report.blocked)
+            self.assertIn("NODE_UNJOINED", [check.code for check in report.checks])
+            self.assertNotIn(
+                "NODE_ALREADY_JOINED", [check.code for check in report.checks]
+            )
+
+    def test_unjoined_config_with_credential_or_invalid_identity_stays_blocked(self):
+        values = (
+            {"install_id": "install-1", "credential": "secret"},
+            {"install_id": ""},
+            {"install_id": 123},
+        )
+        for value in values:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = make_root(directory)
+                config = root / "etc" / "dure" / "agent.json"
+                config.parent.mkdir(parents=True)
+                config.write_text(json.dumps(value), encoding="utf-8")
+                config.chmod(0o600)
+
+                report = Bootstrapper(StrictBootstrapRunner(), root=root).run()
+
+                self.assertTrue(report.blocked)
+                self.assertIn(
+                    "NODE_ALREADY_JOINED", [check.code for check in report.checks]
+                )
+
     def test_unsupported_os_is_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = StrictBootstrapRunner()

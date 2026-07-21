@@ -50,7 +50,7 @@ sudo dure bootstrap --json
 - 기존 Docker가 로컬 `/var/run/docker.sock`의 systemd `docker.service`가 아니거나 daemon에 연결할 수 없거나, 재부팅 뒤 `docker.service` 또는 `docker.socket` 기동이 유지됨을 증명할 수 없습니다.
 - Docker CLI가 없더라도 Docker CE 패키지 일부, `dockerd`, `docker.service`나 `/var/run/docker.sock`이 남아 있어 미설치를 증명할 수 없습니다.
 - Docker CLI 또는 Engine 버전이 GPU runtime과 `--pull never` 계약에 필요한 20.10보다 낮거나 버전을 해석할 수 없습니다. 배포판 Docker 29의 빈 `Platform.Name`은 단일 `Engine` 구성요소의 version·Linux OS·지원 architecture가 서버 응답과 일치할 때만 허용합니다.
-- Dure Agent systemd unit이 없거나 Agent가 활성 상태이거나 `/etc/dure/agent.json`이 이미 존재합니다.
+- Dure Agent systemd unit이 없거나 Agent가 활성 상태이거나 `/etc/dure/agent.json`에 credential을 포함한 등록 정보가 존재합니다. `dure unjoin`이 credential을 제거하고 안전한 `install_id`만 남긴 설정은 예외입니다.
 - APT key/source, `/etc/docker/daemon.json`, Dure backup 또는 그 부모가 예상과 다르거나 symbolic link입니다. 현재 `daemon.json` 없이 과거 backup만 남은 경우도 자동 해석하지 않습니다.
 
 검토 뒤 명시적으로 적용하고 다시 조사한 다음 노드를 등록합니다.
@@ -88,6 +88,26 @@ dure admin probe --nodes <node-id>
 ```
 
 hostname, GPU inventory, network 주소, 운영자 소유권을 검토한 뒤에만 승인합니다. pending 노드는 heartbeat는 가능하지만 task 생성과 claim 양쪽에서 거부됩니다.
+
+### GPU 노드 등록 해제
+
+노드 운영자가 직접 반납할 때는 해당 노드에서 다음 명령을 실행합니다.
+
+```bash
+sudo dure unjoin
+```
+
+이 명령은 현재 상태에 기록된 배포 UUID·세대와 서버가 발급한 노드 UUID label이 모두 일치하는 Dure 컨테이너만 중지하고, Agent를 비활성화한 뒤 중앙 credential을 폐기합니다. 로컬 `/etc/dure/agent.json`에는 재등록 identity인 `install_id`만 남으며 모델 캐시, Docker와 NVIDIA driver는 삭제하지 않습니다. 이 안전한 비활성 설정은 bootstrap의 pre-join 경계를 통과합니다. 중앙 연결이나 exact 컨테이너 정리가 실패하면 credential을 지우지 않고 중단합니다.
+
+중앙 운영자는 승인된 GPU 노드 한 대 또는 전체에 폐쇄형 `UNJOIN_NODE` 작업을 보낼 수 있습니다.
+
+```bash
+dure admin unjoin --node <node-id>
+dure admin unjoin --all
+dure admin tasks --watch
+```
+
+대상이 온라인인 동안 모든 작업이 성공했는지 확인하고, 다중 노드 배포에서 빠진 GPU는 기존 세대에 임의로 대체하지 말고 새 추천·준비·배포 세대로 재구성합니다. 다시 참여시키려면 해당 노드에서 `sudo dure join`을 실행하고 pending 등록을 새로 검토·승인합니다.
 
 ## Codex 기반 용량 진단
 
