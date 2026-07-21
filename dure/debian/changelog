@@ -1,3 +1,11 @@
+dure (0.3.25) UNRELEASED; urgency=medium
+
+  * 단일 GPU 릴리스의 등록·준비·벤치마크·승격·추천·배포·검증을 자동화합니다.
+  * 벤치마크에 신뢰 origin의 exact 모델 준비와 digest 이미지 pull 승인을 추가합니다.
+  * 레지스트리 조회, 멱등 재실행, 미리보기와 Agent 최소 버전 게이트를 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 18:30:00 +0900
+
 dure (0.3.24) UNRELEASED; urgency=medium
 
   * 수동 중앙 서버가 안전한 dotenv에서 DB와 관리자 credential을 함께 읽도록 합니다.

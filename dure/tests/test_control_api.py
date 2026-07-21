@@ -228,6 +228,21 @@ class ControlAPITests(unittest.TestCase):
             },
         )
         self.assertEqual(runtime.status_code, 200)
+        artifacts = self.client.get(
+            "/v1/admin/model-artifacts", headers=self.admin
+        )
+        runtimes = self.client.get(
+            "/v1/admin/runtime-releases", headers=self.admin
+        )
+        self.assertEqual(
+            artifacts.json()["artifacts"], [artifact.json()["artifact"]]
+        )
+        self.assertEqual(
+            runtimes.json()["runtimes"], [runtime.json()["runtime"]]
+        )
+        self.assertEqual(
+            self.client.get("/v1/admin/model-artifacts").status_code, 401
+        )
         release = self.client.post(
             "/v1/admin/model-releases",
             headers=self.admin,

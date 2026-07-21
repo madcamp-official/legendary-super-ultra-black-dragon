@@ -27,6 +27,7 @@ from .stage_cache import (
     StageCacheError,
     StageCacheIdentity,
 )
+from .task import BenchmarkTaskPayload
 
 
 PREPARE_MODEL_TASK = "PREPARE_MODEL"
@@ -645,6 +646,85 @@ class ArtifactPreparationExecutor:
             "image_id": image_id,
         }
         return validate_preparation_result(task, result, self.node_id)
+
+    def prepare_benchmark_model(
+        self,
+        task_id: str,
+        payload: BenchmarkTaskPayload,
+    ) -> PreparedModelCache:
+        """Prepare one exact full snapshot for a closed benchmark task."""
+
+        _canonical_uuid(task_id)
+        if type(payload) is not BenchmarkTaskPayload or not payload.prepare_model:
+            raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED")
+        if self.origin is None:
+            raise ArtifactPreparationError("PREPARATION_ORIGIN_UNAVAILABLE")
+        if self.manifest_loader is None:
+            raise ArtifactPreparationError("PREPARATION_MANIFEST_UNAVAILABLE")
+        try:
+            identity = CacheIdentity(
+                repository=payload.model_repository,
+                revision=payload.artifact_revision,
+                manifest_digest=payload.artifact_manifest_digest,
+                quantization=payload.quantization,
+                cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            )
+            manifest = self.manifest_loader(task_id)
+        except Exception:
+            raise ArtifactPreparationError(
+                "PREPARATION_MANIFEST_UNAVAILABLE"
+            ) from None
+        if type(manifest) is not dict:
+            raise ArtifactPreparationError("PREPARATION_MANIFEST_UNAVAILABLE")
+        try:
+            prepared = self.model_preparer.prepare_full_snapshot(
+                identity=identity,
+                manifest=manifest,
+                origin=self.origin,
+            )
+        except ModelStoreError:
+            raise
+        except Exception:
+            raise ArtifactPreparationError("PREPARATION_EXECUTION_FAILED") from None
+        if (
+            type(prepared) is not PreparedModelCache
+            or prepared.identity != identity
+            or prepared.file_count < 1
+            or prepared.total_size_bytes < 1
+        ):
+            raise ArtifactPreparationError("PREPARATION_EXECUTION_FAILED")
+        return prepared
+
+    def prepare_benchmark_image(self, payload: BenchmarkTaskPayload) -> bool:
+        """Ensure one digest-pinned benchmark image is present, optionally pulling it."""
+
+        if type(payload) is not BenchmarkTaskPayload:
+            raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED")
+        runtime_image, _ = _validated_runtime_image(payload.runtime_image)
+        if not self.runner.exists("docker"):
+            raise ArtifactPreparationError("PREPARATION_RUNTIME_UNAVAILABLE")
+        inspected, exact = _inspect_exact_image(self.runner, runtime_image)
+        if inspected:
+            if not exact:
+                raise ArtifactPreparationError(
+                    "PREPARATION_IMAGE_DIGEST_MISMATCH"
+                )
+            return True
+        if not payload.pull_image:
+            raise ArtifactPreparationError("PREPARATION_IMAGE_INSPECT_FAILED")
+        pulled = _bounded_run(
+            self.runner,
+            ["docker", "pull", "--quiet", runtime_image],
+            timeout=1800,
+        )
+        if not pulled.ok:
+            raise ArtifactPreparationError("PREPARATION_IMAGE_PULL_FAILED")
+        inspected, exact = _inspect_exact_image(self.runner, runtime_image)
+        if not inspected:
+            raise ArtifactPreparationError("PREPARATION_IMAGE_INSPECT_FAILED")
+        if not exact:
+            raise ArtifactPreparationError("PREPARATION_IMAGE_DIGEST_MISMATCH")
+        return False
 
     def execute(self, task: dict) -> dict:
         task_type = task.get("type") if type(task) is dict else None

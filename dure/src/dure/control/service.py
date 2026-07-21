@@ -83,6 +83,7 @@ MODEL_RELEASE_TRANSITIONS = {
 STRICT_RAY_AGENT_VERSION = (0, 3, 18)
 STAGE_ARTIFACT_AGENT_VERSION = (0, 3, 19)
 ARTIFACT_CACHE_QUARANTINE_AGENT_VERSION = (0, 3, 20)
+BENCHMARK_PREPARATION_AGENT_VERSION = (0, 3, 25)
 
 
 def _agent_supports_strict_ray(value: str) -> bool:
@@ -101,6 +102,18 @@ def _agent_supports_stage_artifact(value: str) -> bool:
     if matched is None:
         return False
     return tuple(int(part) for part in matched.groups()) >= STAGE_ARTIFACT_AGENT_VERSION
+
+
+def _agent_supports_benchmark_preparation(value: str) -> bool:
+    if type(value) is not str:
+        return False
+    matched = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", value)
+    if matched is None:
+        return False
+    return (
+        tuple(int(part) for part in matched.groups())
+        >= BENCHMARK_PREPARATION_AGENT_VERSION
+    )
 
 
 QUANTIZATIONS = {"awq", "gptq", "fp8", "fp16", "bf16", "int8"}
@@ -1606,6 +1619,67 @@ def get_benchmark_run(session: Session, request_id: str) -> BenchmarkRun:
     return run
 
 
+def manifest_for_benchmark_task(
+    session: Session,
+    task_id: str,
+    node_id: str,
+) -> dict:
+    """Return only the immutable manifest bound to one active benchmark lease."""
+
+    node = session.scalar(
+        select(Node).where(Node.id == node_id).with_for_update()
+    )
+    task = session.scalar(
+        select(Task).where(Task.id == task_id).with_for_update()
+    )
+    if node is None or not node.approved or task is None:
+        raise BenchmarkRunError(
+            "benchmark artifact manifest is unavailable",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        )
+    lease_until = aware(task.lease_until)
+    run = session.scalar(
+        select(BenchmarkRun)
+        .where(BenchmarkRun.task_id == task.id)
+        .with_for_update()
+    )
+    if (
+        task.type != TaskType.BENCHMARK.value
+        or task.node_id != node_id
+        or task.status != TaskStatus.RUNNING.value
+        or lease_until is None
+        or lease_until < utcnow()
+        or run is None
+        or run.status != "QUEUED"
+        or run.coordinator_node_id != node_id
+        or task.payload.get("benchmark_id") != run.id
+        or task.payload.get("artifact_manifest_digest")
+        != run.artifact_manifest_digest
+        or task.payload.get("prepare_model") is not True
+    ):
+        raise BenchmarkRunError(
+            "benchmark artifact manifest is unavailable",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        )
+    manifest = session.get(ArtifactManifest, run.artifact_manifest_digest)
+    if manifest is None:
+        raise BenchmarkRunError(
+            "benchmark artifact manifest is unavailable",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        )
+    try:
+        value = artifact_manifest_dict(session, manifest)
+    except ValueError as exc:
+        raise BenchmarkRunError(
+            "benchmark artifact manifest is unavailable",
+            code="BENCHMARK_CONTEXT_CHANGED",
+        ) from exc
+    return {
+        "schema_version": value["schema_version"],
+        "files": value["files"],
+    }
+
+
 def prepare_benchmark_run(
     session: Session,
     *,
@@ -1711,7 +1785,12 @@ def prepare_benchmark_run(
     return run, True
 
 
-def _benchmark_task_payload(run: BenchmarkRun) -> dict:
+def _benchmark_task_payload(
+    run: BenchmarkRun,
+    *,
+    prepare_model: bool,
+    pull_image: bool,
+) -> dict:
     payload = {
         "benchmark_id": run.id,
         "release_id": run.release_id,
@@ -1737,14 +1816,24 @@ def _benchmark_task_payload(run: BenchmarkRun) -> dict:
         "duration_seconds": run.duration_seconds,
         "apply": True,
     }
+    if prepare_model:
+        payload["prepare_model"] = True
+    if pull_image:
+        payload["pull_image"] = True
     # Keep the producer and node-agent consumer on one exact, closed schema.
     BenchmarkTaskPayload.from_dict(payload)
     return payload
 
 
 def apply_benchmark_run(
-    session: Session, request_id: str
+    session: Session,
+    request_id: str,
+    *,
+    prepare_model: bool = False,
+    pull_image: bool = False,
 ) -> tuple[BenchmarkRun, Task, bool]:
+    if type(prepare_model) is not bool or type(pull_image) is not bool:
+        raise ValueError("benchmark preparation approvals must be booleans")
     identity = session.execute(
         select(
             BenchmarkRun.release_id,
@@ -1788,7 +1877,29 @@ def apply_benchmark_run(
                 "benchmark run has no corresponding task",
                 code="BENCHMARK_TASK_STATE_INVALID",
             )
+        if (
+            task.payload.get("prepare_model", False) is not prepare_model
+            or task.payload.get("pull_image", False) is not pull_image
+        ):
+            raise BenchmarkRunError(
+                "benchmark apply approvals do not match the existing task",
+                code="BENCHMARK_REQUEST_CONFLICT",
+                details={"request_id": request_id},
+            )
         return run, task, False
+
+    if (prepare_model or pull_image) and not _agent_supports_benchmark_preparation(
+        locked_node.agent_version
+    ):
+        raise BenchmarkRunError(
+            "benchmark preparation requires a newer node Agent",
+            code="BENCHMARK_CONTEXT_CHANGED",
+            details={
+                "node_id": locked_node.id,
+                "required_agent_version": "0.3.25",
+                "actual_agent_version": locked_node.agent_version,
+            },
+        )
 
     active_task = session.scalar(
         select(Task)
@@ -1875,7 +1986,11 @@ def apply_benchmark_run(
         )
 
     try:
-        payload = _benchmark_task_payload(run)
+        payload = _benchmark_task_payload(
+            run,
+            prepare_model=prepare_model,
+            pull_image=pull_image,
+        )
     except ValueError as exc:  # pragma: no cover - persisted runs use this schema
         raise BenchmarkRunError(
             "prepared benchmark payload no longer matches the closed schema",

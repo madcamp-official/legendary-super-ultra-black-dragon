@@ -285,6 +285,47 @@ def _parser() -> argparse.ArgumentParser:
         dest="previous_generation_id",
         help="Link the new generation to an existing deployment generation",
     )
+    activation = admin_sub.add_parser(
+        "activate",
+        help="Qualify, recommend, prepare, deploy, and verify one release",
+    )
+    activation.add_argument(
+        "--file",
+        type=Path,
+        required=True,
+        help="Closed activation specification JSON",
+    )
+    activation_nodes = activation.add_mutually_exclusive_group(required=True)
+    activation_nodes.add_argument(
+        "--all-online",
+        action="store_true",
+        help="Consider every approved online node",
+    )
+    activation_nodes.add_argument(
+        "--nodes",
+        nargs="+",
+        help="Consider only these approved online node UUIDs",
+    )
+    activation.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Authorize model/image preparation, benchmark execution, registry "
+            "activation, deployment, and API verification"
+        ),
+    )
+    activation.add_argument(
+        "--timeout",
+        type=float,
+        default=7200,
+        help="Maximum seconds to wait for each asynchronous stage",
+    )
+    activation.add_argument(
+        "--poll-interval",
+        type=float,
+        default=5,
+        help="Seconds between central status checks",
+    )
     for command in ("apply", "start", "stop", "restart"):
         operation = admin_sub.add_parser(command)
         operation.add_argument("deployment_id")
@@ -674,6 +715,28 @@ def _admin(args: argparse.Namespace) -> int:
             value = client.request("POST", f"{path}/accept", payload)
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0
+    if args.admin_command == "activate":
+        from .activation import ActivationSpec, ActivationWorkflow
+
+        spec = ActivationSpec.from_file(args.file)
+        workflow = ActivationWorkflow(
+            client,
+            timeout=args.timeout,
+            poll_interval=args.poll_interval,
+            reporter=lambda message: print(message, file=sys.stderr),
+        )
+        value = (
+            workflow.apply(spec, node_ids=args.nodes)
+            if args.apply
+            else workflow.preview(spec, node_ids=args.nodes)
+        )
+        print(json.dumps(value, indent=2, sort_keys=True))
+        if not args.apply:
+            print(
+                "Preview only; add --apply after reviewing the immutable spec and steps.",
+                file=sys.stderr,
+            )
+        return 0
     if args.admin_command == "deployment":
         if args.deployment_command == "recommend":
             node_ids = list(
@@ -838,7 +901,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         return handlers[args.command](args)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

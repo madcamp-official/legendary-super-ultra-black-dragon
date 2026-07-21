@@ -11,6 +11,8 @@ from unittest.mock import call, patch
 
 from dure.cli import main
 
+from .test_activation import NODE_ID, _inventory, _spec_document
+
 
 class FakeJSONClient:
     calls: list[tuple[str, str, str, str, dict | None]] = []
@@ -175,6 +177,52 @@ class AdminEnvFileCLITests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("not a safe readable file", error)
         self.assertEqual(FakeJSONClient.calls, [])
+
+
+class ActivationCLITests(unittest.TestCase):
+    def test_activate_previews_without_writes_and_requires_a_selection_mode(self):
+        FakeJSONClient.calls = []
+        FakeJSONClient.response = _inventory()
+        output = io.StringIO()
+        error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "activation.json"
+            source.write_text(json.dumps(_spec_document()), encoding="utf-8")
+            with patch(
+                "dure.agent.resolve_join_settings",
+                return_value=("https://packaged", False),
+            ), patch("dure.http.JSONClient", FakeJSONClient), redirect_stdout(
+                output
+            ), redirect_stderr(error):
+                result = main(
+                    [
+                        "admin",
+                        "--server",
+                        "https://control.example",
+                        "--token",
+                        "admin-token",
+                        "activate",
+                        "--file",
+                        str(source),
+                        "--all-online",
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["benchmark_node_id"], NODE_ID)
+        self.assertIn("Preview only", error.getvalue())
+        self.assertEqual(
+            FakeJSONClient.calls,
+            [
+                (
+                    "https://control.example",
+                    "admin-token",
+                    "GET",
+                    "/v1/admin/inventory",
+                    None,
+                )
+            ],
+        )
 
 
 class ArtifactManifestCLITests(unittest.TestCase):

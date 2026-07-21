@@ -78,6 +78,7 @@ from .service import (
     fail_benchmark_task,
     finish_task,
     get_benchmark_run,
+    manifest_for_benchmark_task,
     get_artifact_manifest,
     join_node,
     node_status,
@@ -516,6 +517,8 @@ class BenchmarkRunPrepare(StrictBody):
 
 class BenchmarkRunApply(StrictBody):
     apply: Literal[True]
+    prepare_model: StrictBool = False
+    pull_image: StrictBool = False
 
 
 class BenchmarkTaskMetrics(StrictBody):
@@ -883,9 +886,19 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 },
             )
         try:
-            manifest = manifest_for_preparation_task(
-                session, task_id, node.id
-            )
+            task = session.get(Task, task_id)
+            if task is not None and task.type == TaskType.BENCHMARK.value:
+                manifest = manifest_for_benchmark_task(
+                    session, task_id, node.id
+                )
+            else:
+                manifest = manifest_for_preparation_task(
+                    session, task_id, node.id
+                )
+        except BenchmarkRunError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _benchmark_run_error_detail(exc)
+            ) from exc
         except ArtifactPreparationError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
@@ -1163,6 +1176,11 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"artifact": _artifact_dict(record)}
 
+    @app.get("/v1/admin/model-artifacts", dependencies=[Depends(admin_auth)])
+    def model_artifacts(session: Session = Depends(get_session)):
+        records = session.scalars(select(ModelArtifact).order_by(ModelArtifact.created_at))
+        return {"artifacts": [_artifact_dict(item) for item in records]}
+
     @app.post(
         "/v1/admin/model-artifacts/{artifact_id}/manifest",
         dependencies=[Depends(admin_auth)],
@@ -1335,6 +1353,11 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"runtime": _runtime_release_dict(record)}
+
+    @app.get("/v1/admin/runtime-releases", dependencies=[Depends(admin_auth)])
+    def runtime_releases(session: Session = Depends(get_session)):
+        records = session.scalars(select(RuntimeRelease).order_by(RuntimeRelease.created_at))
+        return {"runtimes": [_runtime_release_dict(item) for item in records]}
 
     @app.post("/v1/admin/model-releases", dependencies=[Depends(admin_auth)])
     def model_release_create(
@@ -1511,9 +1534,13 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         body: BenchmarkRunApply,
         session: Session = Depends(get_session),
     ):
-        del body  # Literal[True] is the explicit mutation authorization gate.
         try:
-            run, task, created = apply_benchmark_run(session, request_id)
+            run, task, created = apply_benchmark_run(
+                session,
+                request_id,
+                prepare_model=body.prepare_model,
+                pull_image=body.pull_image,
+            )
         except BenchmarkRunNotFoundError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         except BenchmarkRunError as exc:

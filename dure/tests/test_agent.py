@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from dure import __version__
 from dure.agent import (
@@ -28,7 +28,7 @@ from dure.model_cache import (
     MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_VERIFICATION_VERSION,
 )
-from dure.models import CheckResult, InstalledModelProfile
+from dure.models import CheckResult, InstalledModelProfile, WorkloadProfile
 from dure.pipeline_runtime import (
     RAY_COMPONENT,
     pipeline_contract_detail,
@@ -314,7 +314,7 @@ class AgentTaskExecutorTests(unittest.TestCase):
                 path.write_text("not-a-commit\n", encoding="ascii")
                 self.assertIsNone(_load_build_commit(path))
 
-    def test_benchmark_fingerprint_ignores_volatile_capacity_only(self):
+    def test_benchmark_fingerprint_ignores_capacity_and_cache_preparation(self):
         baseline = benchmark_profile()
         expected = benchmark_profile_fingerprint(BENCHMARK_NODE_ID, baseline)
 
@@ -322,6 +322,7 @@ class AgentTaskExecutorTests(unittest.TestCase):
         volatile.memory_available_mib -= 128
         volatile.disk_free_mib -= 256
         volatile.issues.append("temporary-pressure")
+        volatile.installed_models = []
         self.assertEqual(
             benchmark_profile_fingerprint(BENCHMARK_NODE_ID, volatile), expected
         )
@@ -991,6 +992,90 @@ class AgentTaskExecutorTests(unittest.TestCase):
         self.assertIs(observed_profile, node_profile)
         self.assertEqual(cached_model.path, "/var/lib/dure/models/qwen-test-awq")
         self.assertEqual(runner.calls, [])
+
+    def test_benchmark_can_prepare_exact_assets_before_closed_execution(self):
+        node_profile = benchmark_profile()
+        payload = benchmark_payload(node_profile)
+        payload.update(prepare_model=True, pull_image=True)
+        safe_executor = SafeBenchmarkExecutor()
+        preparation = Mock()
+        executor = TaskExecutor(
+            BENCHMARK_NODE_ID,
+            benchmark_executor=safe_executor,
+            preparation_executor=preparation,
+            build_commit=BENCHMARK_DURE_COMMIT,
+        )
+        task_id = "99999999-9999-4999-8999-999999999999"
+
+        with patch("dure.probe.NodeProbe.collect", return_value=node_profile):
+            result = executor.execute(
+                {"id": task_id, "type": "BENCHMARK", "payload": payload}
+            )
+
+        validated = BenchmarkTaskPayload.from_dict(payload)
+        preparation.prepare_benchmark_model.assert_called_once_with(
+            task_id, validated
+        )
+        preparation.prepare_benchmark_image.assert_called_once_with(validated)
+        self.assertEqual(result["benchmark_id"], validated.benchmark_id)
+        self.assertEqual(len(safe_executor.calls), 1)
+
+    def test_benchmark_build_identity_is_checked_before_asset_mutation(self):
+        node_profile = benchmark_profile()
+        payload = benchmark_payload(node_profile)
+        payload.update(prepare_model=True, pull_image=True)
+        preparation = Mock()
+        executor = TaskExecutor(
+            BENCHMARK_NODE_ID,
+            benchmark_executor=SafeBenchmarkExecutor(),
+            preparation_executor=preparation,
+            build_commit="f" * 40,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Agent build"):
+            executor.execute(
+                {
+                    "id": "99999999-9999-4999-8999-999999999999",
+                    "type": "BENCHMARK",
+                    "payload": payload,
+                }
+            )
+
+        preparation.prepare_benchmark_model.assert_not_called()
+        preparation.prepare_benchmark_image.assert_not_called()
+
+    def test_benchmark_asset_preparation_is_refused_while_workload_is_active(self):
+        node_profile = benchmark_profile()
+        node_profile.workloads.append(
+            WorkloadProfile(
+                name="user-container",
+                runtime="docker",
+                image="example/image:latest",
+                status="running",
+            )
+        )
+        payload = benchmark_payload(node_profile)
+        payload.update(prepare_model=True, pull_image=True)
+        preparation = Mock()
+        executor = TaskExecutor(
+            BENCHMARK_NODE_ID,
+            benchmark_executor=SafeBenchmarkExecutor(),
+            preparation_executor=preparation,
+            build_commit=BENCHMARK_DURE_COMMIT,
+        )
+
+        with patch("dure.probe.NodeProbe.collect", return_value=node_profile):
+            with self.assertRaisesRegex(ValueError, "another workload"):
+                executor.execute(
+                    {
+                        "id": "99999999-9999-4999-8999-999999999999",
+                        "type": "BENCHMARK",
+                        "payload": payload,
+                    }
+                )
+
+        preparation.prepare_benchmark_model.assert_not_called()
+        preparation.prepare_benchmark_image.assert_not_called()
 
     def test_benchmark_rejects_arbitrary_execution_and_secret_fields(self):
         safe_executor = SafeBenchmarkExecutor()

@@ -20,6 +20,7 @@ from dure.control.models import (
     BenchmarkEvidence,
     BenchmarkRun,
     Deployment,
+    ModelArtifact,
     NodeCredential,
     NodeProfileRecord,
     Task,
@@ -27,7 +28,13 @@ from dure.control.models import (
     TaskType,
     utcnow,
 )
-from dure.control.service import cancel_task, create_tasks, secret_hash
+from dure.artifact_manifest import parse_artifact_manifest
+from dure.control.service import (
+    cancel_task,
+    create_tasks,
+    register_artifact_manifest,
+    secret_hash,
+)
 
 from .test_benchmark import _multi_release, _node, _release
 
@@ -224,6 +231,93 @@ class BenchmarkTaskAPITests(unittest.TestCase):
             },
         )
         self.assertEqual(generic.status_code, 400)
+
+    def test_apply_can_explicitly_prepare_assets_only_on_a_new_agent(self):
+        node, release, placement, _ = self.fixture("asset-prepare")
+        body = _request(node, release, placement)
+        self.assertEqual(self.prepare(body).status_code, 200)
+
+        rejected = self.apply(
+            body["request_id"],
+            {"apply": True, "prepare_model": True, "pull_image": True},
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(rejected.json()["detail"]["code"], "BENCHMARK_CONTEXT_CHANGED")
+
+        with self.client.app.state.session_factory() as session:
+            stored = session.get(type(node), node.id)
+            stored.agent_version = "0.3.25"
+            session.commit()
+
+        applied = self.apply(
+            body["request_id"],
+            {"apply": True, "prepare_model": True, "pull_image": True},
+        )
+        self.assertEqual(applied.status_code, 200, applied.text)
+        self.assertTrue(applied.json()["task"]["payload"]["prepare_model"])
+        self.assertTrue(applied.json()["task"]["payload"]["pull_image"])
+
+        conflict = self.apply(body["request_id"])
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["detail"]["code"], "BENCHMARK_REQUEST_CONFLICT")
+
+    def test_preparing_benchmark_can_fetch_only_its_manifest_during_active_lease(self):
+        node, release, placement, credential = self.fixture("manifest-lease")
+        manifest = {
+            "schema_version": 1,
+            "files": [
+                {
+                    "path": "config.json",
+                    "kind": "REGULAR",
+                    "size_bytes": 2,
+                    "sha256": "sha256:" + "a" * 64,
+                    "chunks": [
+                        {
+                            "ordinal": 0,
+                            "offset_bytes": 0,
+                            "length_bytes": 2,
+                            "sha256": "sha256:" + "b" * 64,
+                        }
+                    ],
+                }
+            ],
+        }
+        digest = parse_artifact_manifest(manifest).digest
+        with self.client.app.state.session_factory() as session:
+            stored_node = session.get(type(node), node.id)
+            stored_node.agent_version = "0.3.25"
+            artifact = session.get(ModelArtifact, release.artifact_id)
+            artifact.manifest_digest = digest
+            session.flush()
+            register_artifact_manifest(
+                session,
+                artifact_id=artifact.id,
+                manifest=manifest,
+            )
+            session.commit()
+
+        body = _request(node, release, placement)
+        self.assertEqual(self.prepare(body).status_code, 200)
+        applied = self.apply(
+            body["request_id"],
+            {"apply": True, "prepare_model": True, "pull_image": True},
+        )
+        self.assertEqual(applied.status_code, 200, applied.text)
+        task_id = applied.json()["task"]["id"]
+        agent = {"Authorization": f"Bearer {credential}"}
+
+        before_claim = self.client.get(
+            f"/v1/agent/tasks/{task_id}/artifact-manifest", headers=agent
+        )
+        self.assertEqual(before_claim.status_code, 409)
+        claimed = self.client.post("/v1/agent/tasks/claim", headers=agent)
+        self.assertEqual(claimed.status_code, 200)
+        self.assertEqual(claimed.json()["task"]["id"], task_id)
+        fetched = self.client.get(
+            f"/v1/agent/tasks/{task_id}/artifact-manifest", headers=agent
+        )
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(fetched.json()["manifest"], parse_artifact_manifest(manifest).document)
 
     def test_queued_cache_quarantine_blocks_benchmark_apply(self):
         node, release, placement, _ = self.fixture("quarantine-busy")

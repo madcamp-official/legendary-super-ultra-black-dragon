@@ -743,6 +743,56 @@ class TaskExecutor:
                     "BENCHMARK inventory fingerprint mismatch",
                     failure_code="BENCHMARK_PAYLOAD_REJECTED",
                 )
+            if benchmark.prepare_model or benchmark.pull_image:
+                ignored_name = f"dure-benchmark-{benchmark.benchmark_id}"
+                active_workloads = [
+                    workload
+                    for workload in profile.workloads
+                    if workload.name != ignored_name
+                    and not workload.status.strip().lower().startswith(
+                        ("exited", "dead")
+                    )
+                ]
+                if active_workloads:
+                    raise BenchmarkAgentError(
+                        "BENCHMARK asset preparation is refused while another workload may be active",
+                        failure_code="BENCHMARK_RUNTIME_UNAVAILABLE",
+                    )
+            if benchmark.prepare_model:
+                task_id = task.get("id")
+                if type(task_id) is not str:
+                    raise BenchmarkAgentError(
+                        "BENCHMARK task identity is invalid",
+                        failure_code="BENCHMARK_PAYLOAD_REJECTED",
+                    )
+                try:
+                    self.preparation_executor.prepare_benchmark_model(
+                        task_id,
+                        benchmark,
+                    )
+                except Exception as exc:
+                    raise BenchmarkAgentError(
+                        "BENCHMARK model preparation failed",
+                        failure_code="BENCHMARK_ARTIFACT_UNAVAILABLE",
+                    ) from exc
+            if benchmark.pull_image:
+                try:
+                    self.preparation_executor.prepare_benchmark_image(benchmark)
+                except Exception as exc:
+                    raise BenchmarkAgentError(
+                        "BENCHMARK image preparation failed",
+                        failure_code="BENCHMARK_RUNTIME_UNAVAILABLE",
+                    ) from exc
+            if benchmark.prepare_model or benchmark.pull_image:
+                profile = self._profile()
+                if (
+                    benchmark_profile_fingerprint(self.node_id, profile)
+                    != benchmark.inventory_fingerprint
+                ):
+                    raise BenchmarkAgentError(
+                        "BENCHMARK inventory fingerprint mismatch",
+                        failure_code="BENCHMARK_PAYLOAD_REJECTED",
+                    )
             cached_model = _exact_cached_model(profile, benchmark)
             result = self.benchmark_executor(benchmark, profile, cached_model)
             return _validated_benchmark_result(benchmark, result)

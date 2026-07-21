@@ -45,7 +45,6 @@ BENCHMARK_PROFILE_IDENTITY_FIELDS = (
     "gpus",
     "network",
     "runtime",
-    "installed_models",
 )
 
 
@@ -158,6 +157,8 @@ class BenchmarkTaskPayload:
     warmup_requests: int
     request_count: int
     duration_seconds: float
+    prepare_model: bool
+    pull_image: bool
     apply: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,8 +172,9 @@ class BenchmarkTaskPayload:
         if not isinstance(value, dict):
             raise ValueError("BENCHMARK payload must be an object")
         allowed = set(cls.__dataclass_fields__)
+        optional = {"prepare_model", "pull_image"}
         unexpected = sorted(set(value) - allowed)
-        missing = sorted(allowed - set(value))
+        missing = sorted(allowed - optional - set(value))
         if unexpected:
             raise ValueError("unexpected BENCHMARK payload field(s)")
         if missing:
@@ -284,9 +286,11 @@ class BenchmarkTaskPayload:
             or duration_seconds != BENCHMARK_DURATION_SECONDS
         ):
             raise ValueError("BENCHMARK measurement dimensions do not match the allowlist")
+        prepare_model = value.get("prepare_model", False)
+        pull_image = value.get("pull_image", False)
         apply = value["apply"]
-        if type(apply) is not bool:
-            raise ValueError("BENCHMARK apply must be a boolean")
+        if any(type(item) is not bool for item in (prepare_model, pull_image, apply)):
+            raise ValueError("BENCHMARK mutation approval must be a boolean")
 
         return cls(
             benchmark_id=benchmark_id,
@@ -311,6 +315,8 @@ class BenchmarkTaskPayload:
             warmup_requests=warmup_requests,
             request_count=request_count,
             duration_seconds=duration_seconds,
+            prepare_model=prepare_model,
+            pull_image=pull_image,
             apply=apply,
         )
 
