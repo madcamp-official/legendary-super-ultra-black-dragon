@@ -60,7 +60,7 @@ def payload(
         "release_id": "33333333-3333-4333-8333-333333333333",
         "placement_id": "44444444-4444-4444-8444-444444444444",
         "suite_id": "dure-serving-slo-v1",
-        "policy_version": "benchmark-gate-v2",
+        "policy_version": "benchmark-gate-v3",
         "model_id": "qwen-test-awq",
         "model_repository": "Qwen/Test-AWQ",
         "artifact_revision": "a" * 40,
@@ -74,9 +74,9 @@ def payload(
         "input_tokens": 1024,
         "output_tokens": 128,
         "concurrency": 8,
-        "warmup_requests": 20,
-        "request_count": 200,
-        "duration_seconds": 900.0,
+        "warmup_requests": 2,
+        "request_count": 20,
+        "duration_seconds": 240.0,
         "apply": apply,
     }
     if "dure_commit" in BenchmarkTaskPayload.__dataclass_fields__:
@@ -294,7 +294,12 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.limited_output_timeouts,
-            [900.0 + BENCHMARK_CONTAINER_GRACE_SECONDS],
+            [300.0],
+        )
+        self.assertEqual(
+            BENCHMARK_WORKLOADS["short-chat-1k-128"].duration_seconds
+            + BENCHMARK_CONTAINER_GRACE_SECONDS,
+            300.0,
         )
 
     def test_unsafe_packaged_entrypoint_is_rejected_before_docker(self):
@@ -605,7 +610,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             payload(), self.profile, self.cached_model
         )
 
-        self.assertEqual(result["metrics"]["request_count"], 200)
+        self.assertEqual(result["metrics"]["request_count"], 20)
         self.assertIn(
             ("docker", "stop", "--time", "30", container_id), runner.calls
         )
@@ -816,7 +821,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             payload(), self.profile, self.cached_model
         )
 
-        self.assertEqual(result["metrics"]["request_count"], 200)
+        self.assertEqual(result["metrics"]["request_count"], 20)
         self.assertIn(("docker", "rm", container_id), runner.calls)
         self.assertEqual(runner.calls[-1][:2], ("docker", "run"))
         self.assertFalse(
@@ -1035,7 +1040,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             metrics(success_rate=math.nan),
             metrics(oom_count=True),
             metrics(oom_count=2**63),
-            metrics(request_count=199),
+            metrics(request_count=19),
         )
         for summary in invalid_summaries:
             with self.subTest(summary=summary):
@@ -1057,8 +1062,8 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 self.assertNotIn("raw", str(raised.exception))
 
         duplicate = json.dumps(metrics()).replace(
-            '"warmup_requests": 20',
-            '"warmup_requests": 20, "warmup_requests": 20',
+            '"warmup_requests": 2',
+            '"warmup_requests": 2, "warmup_requests": 2',
             1,
         )
 

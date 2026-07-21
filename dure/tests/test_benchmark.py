@@ -180,9 +180,9 @@ def _evidence_body(session, artifact, runtime, release, placement, nodes, **over
         "input_tokens": 4096,
         "output_tokens": 256,
         "concurrency": 8,
-        "warmup_requests": 20,
-        "request_count": 200,
-        "duration_seconds": 900.0,
+        "warmup_requests": 2,
+        "request_count": 20,
+        "duration_seconds": 240.0,
         "oom_count": 0,
         "crash_count": 0,
         "restart_count": 0,
@@ -555,7 +555,7 @@ class BenchmarkServiceTests(unittest.TestCase):
                 release,
                 placements[0],
                 [node],
-                request_count=199,
+                request_count=19,
                 duration_seconds=3600.0,
             )
 
@@ -577,7 +577,7 @@ class BenchmarkServiceTests(unittest.TestCase):
                 release,
                 placements[0],
                 [node],
-                request_count=200,
+                request_count=20,
                 duration_seconds=1.0,
             )
 
@@ -944,6 +944,12 @@ class BenchmarkAPITests(unittest.TestCase):
             json={**body, "oom_count": 2**63},
         )
         self.assertEqual(oversized_integer.status_code, 422)
+        stale_policy = self.client.post(
+            endpoint,
+            headers=self.admin,
+            json={**body, "policy_version": "benchmark-gate-v2"},
+        )
+        self.assertEqual(stale_policy.status_code, 422)
 
         first = self.client.post(endpoint, headers=self.admin, json=body)
         second = self.client.post(endpoint, headers=self.admin, json=body)
