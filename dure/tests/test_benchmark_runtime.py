@@ -109,9 +109,9 @@ def metrics(**overrides):
 def container_identity(
     *, state: str, deployment: str = "-", started_at: str | None = None
 ) -> str:
-    started_at = started_at or datetime.now(timezone.utc).isoformat().replace(
-        "+00:00", "Z"
-    )
+    started_at = started_at or datetime.now(timezone.utc).isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "123Z")
     return "\t".join(
         (
             "a" * 64,

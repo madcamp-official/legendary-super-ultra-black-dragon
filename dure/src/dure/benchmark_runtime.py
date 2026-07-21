@@ -511,8 +511,18 @@ def _benchmark_container_identity(
         or identity[3:] != expected
     ):
         return None
+    timestamp = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z",
+        identity[2],
+    )
+    if timestamp is None:
+        return None
+    fraction = timestamp.group(2)
+    normalized = timestamp.group(1)
+    if fraction is not None:
+        normalized += "." + fraction[:6].ljust(6, "0")
     try:
-        started_at = datetime.fromisoformat(identity[2].replace("Z", "+00:00"))
+        started_at = datetime.fromisoformat(normalized + "+00:00")
     except ValueError:
         return None
     if started_at.tzinfo is None:

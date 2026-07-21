@@ -1,3 +1,9 @@
+dure (0.4.12) UNRELEASED; urgency=medium
+
+  * Docker 29의 nanosecond StartedAt을 Python 3.10에서 안전하게 정규화해 성공 컨테이너 정리를 복구합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 18:48:00 +0000
+
 dure (0.4.11) UNRELEASED; urgency=medium
 
   * 고정 vLLM V1 비동기 엔진에서 첫 stream 요청이 진행되도록 비동기 스케줄링을 복구합니다.
