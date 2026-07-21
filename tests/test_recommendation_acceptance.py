@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -209,7 +209,7 @@ class RecommendationAcceptanceTests(unittest.TestCase):
 
     def assert_error_code(self, response, status_code: int, code: str) -> None:
         self.assertEqual(response.status_code, status_code, response.text)
-        self.assertEqual(response.json()["detail"]["code"], code)
+        self.assertEqual(response.json()["detail"]["code"], code, response.json())
 
     def test_repeated_recommendation_persists_one_snapshot_without_execution_rows(self):
         node_id, _, _ = self._seed_active_candidate("repeat")
@@ -588,25 +588,36 @@ class RecommendationAcceptanceTests(unittest.TestCase):
         )
         for key, options, expected_code in cases:
             with self.subTest(key=key):
-                node_ids, _, placement_id = self._seed_pipeline_candidate(
-                    key, **options
-                )
-                recommendation = self._recommend_nodes(node_ids)
-                self.assertIsNone(recommendation["selected"])
-                candidate = next(
-                    item
-                    for item in recommendation["candidates"]
-                    if item["placement_id"] == placement_id
-                )
-                codes = {
-                    item["code"]
-                    for item in candidate["rejections"]
-                }
-                self.assertIn(expected_code, codes)
-                response = self._accept(recommendation["id"])
-                self.assert_error_code(
-                    response, 409, "RECOMMENDATION_NOT_FEASIBLE"
-                )
+                evaluation_now = utcnow()
+                # Freshness is part of the recommendation input. Freeze the
+                # test clock so a host/WSL wall-clock correction cannot turn
+                # unchanged inventory into a different snapshot mid-assertion.
+                with (
+                    patch(f"{__name__}.utcnow", return_value=evaluation_now),
+                    patch(
+                        "dure.control.recommendation.utcnow",
+                        return_value=evaluation_now,
+                    ),
+                ):
+                    node_ids, _, placement_id = self._seed_pipeline_candidate(
+                        key, **options
+                    )
+                    recommendation = self._recommend_nodes(node_ids)
+                    self.assertIsNone(recommendation["selected"])
+                    candidate = next(
+                        item
+                        for item in recommendation["candidates"]
+                        if item["placement_id"] == placement_id
+                    )
+                    codes = {
+                        item["code"]
+                        for item in candidate["rejections"]
+                    }
+                    self.assertIn(expected_code, codes)
+                    response = self._accept(recommendation["id"])
+                    self.assert_error_code(
+                        response, 409, "RECOMMENDATION_NOT_FEASIBLE"
+                    )
 
     def test_postgresql_accept_locks_evidence_registry_and_inventory_tables(self):
         session = Mock()
