@@ -1,0 +1,50 @@
+#!/bin/sh
+set -eu
+
+repository_url='@DURE_REPOSITORY_URL@'
+keyring='/usr/share/keyrings/dure-archive-keyring.gpg'
+source_file='/etc/apt/sources.list.d/dure.sources'
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo 'Run this installer as root, for example: curl ... | sudo sh' >&2
+  exit 1
+fi
+
+for command in curl gpg apt-get dpkg; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Missing required command: $command" >&2
+    exit 1
+  fi
+done
+
+architecture=$(dpkg --print-architecture)
+if [ "$architecture" != 'amd64' ]; then
+  echo "Dure's initial APT repository supports amd64 only; found $architecture" >&2
+  exit 1
+fi
+
+temporary_dir=$(mktemp -d)
+trap 'find "$temporary_dir" -depth -delete 2>/dev/null || true' EXIT INT TERM
+
+curl --fail --silent --show-error --location \
+  "$repository_url/dure-archive-keyring.gpg" \
+  --output "$temporary_dir/dure-archive-keyring.gpg"
+gpg --batch --show-keys "$temporary_dir/dure-archive-keyring.gpg" >/dev/null
+install -m 0644 "$temporary_dir/dure-archive-keyring.gpg" "$keyring"
+
+printf '%s\n' \
+  'Types: deb' \
+  "URIs: $repository_url" \
+  'Suites: stable' \
+  'Components: main' \
+  'Architectures: amd64' \
+  "Signed-By: $keyring" \
+  > "$source_file"
+
+apt-get update
+apt-get install -y dure
+
+echo 'Dure is installed.'
+echo 'GPU node: sudo dure bootstrap, review, then sudo dure bootstrap --apply'
+echo 'After runtime preparation: sudo dure doctor, then sudo dure join'
+echo 'CPU utility node: skip bootstrap and run sudo dure join'

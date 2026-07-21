@@ -1,0 +1,161 @@
+dure (0.3.21) UNRELEASED; urgency=medium
+
+  * Docker Engine과 NVIDIA Container Toolkit의 로컬 명시적 준비 기능을 추가합니다.
+  * 드라이버 불변, 패키지 충돌, 서명 키와 Docker 재시작 안전 검사를 추가합니다.
+  * 노드 등록 전 미설정 Agent 시작을 막고 설치·복구 절차를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 18:00:00 +0900
+
+dure (0.3.20) UNRELEASED; urgency=medium
+
+  * 추천 시 정확한 STAGE 또는 FULL 전달 방식을 선택하고 세대에 고정합니다.
+  * 노드 아티팩트 캐시 상태, 검증 게이트와 추가 전용 감사 이력을 추가합니다.
+  * 참조를 확인하는 명시적 캐시 격리와 롤백 직전 재검사를 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 12:00:00 +0900
+
+dure (0.3.19) UNRELEASED; urgency=medium
+
+  * 검증된 stage variant의 pipeline rank별 다운로드와 원자적 캐시 활성화를 추가합니다.
+  * vLLM sharded_state 로더, 복합 캐시 identity와 실행 직전 무결성 검사를 추가합니다.
+  * 명시적 재시도·롤백과 실제 다중 노드 GPU 수용 검사 절차를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 07:15:40 +0900
+
+dure (0.3.18) UNRELEASED; urgency=medium
+
+  * vLLM 0.9.0 Ray pipeline의 결정론적 노드 UUID·rank 결합을 추가합니다.
+  * 엄격한 2·3노드 FULL_SNAPSHOT 실행·준비 검증과 실패 안전 중지를 추가합니다.
+  * 실제 GPU 수용 검사 도구와 운영·보안·복구 절차를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 06:08:18 +0900
+
+dure (0.3.17) UNRELEASED; urgency=medium
+
+  * vLLM 단계 아티팩트 variant와 rank별 불변 매니페스트를 추가합니다.
+  * 신뢰된 오프라인 빌더 계약과 단계 아티팩트 검증·승격 게이트를 추가합니다.
+  * 검증되지 않은 런타임, 토폴로지와 불완전한 rank 구성을 실패 안전하게 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 04:20:00 +0900
+
+dure (0.3.16) UNRELEASED; urgency=medium
+
+  * 추천 배포 세대의 모델과 이미지를 명시적으로 준비하는 중앙 작업을 추가합니다.
+  * 노드별 준비 증적, 실패 단계 재시도와 늦은 결과 펜싱을 추가합니다.
+  * 검증된 정확한 캐시와 다이제스트 이미지가 없는 추천 배포 적용을 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 03:42:05 +0900
+
+dure (0.3.15) UNRELEASED; urgency=medium
+
+  * 신뢰 HTTPS 원본과 SHA-256 콘텐츠 주소 청크 저장소를 추가합니다.
+  * 중단 뒤 재개 가능한 파일 조립과 검증된 FULL_SNAPSHOT 캐시 활성화를 추가합니다.
+  * 캐시 소유권, 디스크, 경로 충돌과 실패 안전 복구 경계를 강화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 03:17:05 +0900
+
+dure (0.3.14) UNRELEASED; urgency=medium
+
+  * 불변 정규 모델 아티팩트 매니페스트와 파일·청크 레지스트리를 추가합니다.
+  * 관리자 전용의 멱등 매니페스트 등록·조회와 엄격한 경로·범위 검증을 추가합니다.
+  * SHA-256 무결성과 게시자 서명·공급망 provenance의 신뢰 경계를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 01:10:11 +0900
+
+dure (0.3.13) UNRELEASED; urgency=medium
+
+  * 정확한 다중 노드 조합의 최신 네트워크·NCCL 증적을 중앙 추천에 연결합니다.
+  * 증적의 24시간 신선도와 릴리스·런타임·인벤토리 결합을 다시 검증합니다.
+  * 실패·진행 중인 최신 실행과 불일치 증적을 실패 안전 방식으로 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 00:52:56 +0900
+
+dure (0.3.12) UNRELEASED; urgency=medium
+
+  * 배포 세대별 적용·검증 상태와 실패 노드 재시도 추적을 추가합니다.
+  * 검증된 직전 세대로만 복구하는 명시적 단계형 롤백을 추가합니다.
+  * 컨테이너 조작 전에 배포·세대·노드 식별자를 다시 검증합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 23:30:00 +0900
+
+dure (0.3.11) UNRELEASED; urgency=medium
+
+  * 결정론적 추천과 정규화 인벤토리를 불변 스냅샷으로 저장합니다.
+  * 추천 유효성을 재검사해 적용 전 배포 세대만 만드는 명시적 수락을 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 20:30:00 +0900
+
+dure (0.3.10) UNRELEASED; urgency=medium
+
+  * 폐쇄형 단일 노드 GPU 벤치마크 작업과 증적 수집 경로를 추가합니다.
+  * 벤치마크 실행을 변경 불가능한 빌드·모델·런타임 식별자에 결합합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 18:11:43 +0900
+
+dure (0.3.9) UNRELEASED; urgency=medium
+
+  * 모델 릴리스의 성능·안정성 벤치마크 증적과 영속 모델을 추가합니다.
+  * SLO, OCI 다이제스트 및 증적 조건을 모두 통과해야 ACTIVE로 승격하도록 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:30:00 +0900
+
+dure (0.3.8) UNRELEASED; urgency=medium
+
+  * 승인된 노드 인벤토리와 ACTIVE 모델 릴리스를 이용한 읽기 전용 배포 추천을 추가합니다.
+  * 추천 결과의 결정론성, 중앙 UUID, 고정 리비전과 다이제스트를 안전하게 검증합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:20:00 +0900
+
+dure (0.3.7) UNRELEASED; urgency=medium
+
+  * 모델, 고정 리비전, OCI 다이제스트와 배치 프로필을 중앙 레지스트리에 영속화합니다.
+  * 관리자 권한, 상태 전이, 중복 및 충돌을 안전하게 거부하는 API와 회귀 테스트를 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:10:00 +0900
+
+dure (0.3.6) UNRELEASED; urgency=medium
+
+  * GPU 인벤토리와 모델 카탈로그를 바탕으로 품질 우선의 결정론적 모델 선택을 추가합니다.
+  * 자원 부족과 잘못된 노드 식별자를 안전하게 거부하는 경계 및 회귀 테스트를 보강합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:00:00 +0900
+
+dure (0.3.4) stable; urgency=medium
+
+  * Identify Dure HTTP requests so Cloudflare does not reject Python urllib's default signature.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 05:24:00 +0000
+
+dure (0.3.3) stable; urgency=medium
+
+  * Add central hardware, installed-model, and LLM workload inventory.
+  * Add read-only Codex-assisted admin capacity diagnosis.
+  * Point new node joins at the public HTTPS control-plane endpoint.
+  * Verify the packaged client configuration never enables insecure HTTP.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 05:15:00 +0000
+
+dure (0.3.2) stable; urgency=medium
+
+  * Make root-required join tests portable to unprivileged CI runners.
+
+ -- Dure contributors <maintainers@example.invalid>  Sun, 19 Jul 2026 05:35:00 +0000
+
+dure (0.3.1) stable; urgency=medium
+
+  * Split the dependency-free node package from optional control-plane dependencies.
+  * Run full server tests separately from Debian core package tests.
+
+ -- Dure contributors <maintainers@example.invalid>  Sun, 19 Jul 2026 05:30:00 +0000
+
+dure (0.3.0) stable; urgency=medium
+
+  * Add tokenless node join with central approval.
+
+ -- Dure contributors <maintainers@example.invalid>  Sat, 18 Jul 2026 13:30:00 +0000
+
+dure (0.1.0) unstable; urgency=medium
+
+  * Initial MVP release.
+
+ -- Dure contributors <maintainers@example.invalid>  Sat, 18 Jul 2026 11:55:00 +0000

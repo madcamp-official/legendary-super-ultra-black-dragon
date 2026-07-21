@@ -1,0 +1,20 @@
+[Unit]
+Description=Dure node agent
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/dure/agent.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/dure-agent run
+Restart=on-failure
+RestartSec=10
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/dure /var/lib/dure
+
+[Install]
+WantedBy=multi-user.target
