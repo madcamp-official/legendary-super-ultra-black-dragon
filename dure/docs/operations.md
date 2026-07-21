@@ -8,7 +8,7 @@
 python3 -m pip install -e '.[server]'
 ```
 
-secret은 저장소 밖에 둡니다.
+systemd 운영 secret은 저장소 밖에 둡니다. 저장소에 제공된 서버 unit template은 이 파일을 프로세스 환경으로 읽습니다.
 
 ```dotenv
 DURE_DATABASE_URL=postgresql+psycopg://dure:password@127.0.0.1/dure
@@ -25,7 +25,24 @@ dure-server --migrate
 systemctl restart dure-server
 ```
 
-패키지의 개발/LAN service는 `0.0.0.0:8081`에서 listen합니다. 운영 환경에서는 application을 loopback에 bind하고 TLS reverse proxy를 통해 HTTPS 443만 노출해야 합니다. PostgreSQL과 Ray 포트는 공개하지 않습니다.
+개발 또는 수동 운영에서 저장소 최상위에서 실행하면 `dure-server`는 먼저 `dure/.env`, 그다음 `.env`를 확인합니다. Dure 프로젝트 디렉터리 안에서 실행하면 해당 디렉터리의 `.env`를 확인합니다. 다른 위치의 파일은 `--env-file`로 명시합니다. 선택된 파일에는 `DURE_DATABASE_URL`과 `DURE_ADMIN_TOKEN`이 모두 있어야 하며, 둘 중 하나만 있으면 서버는 시작하지 않습니다.
+
+```dotenv
+DURE_SERVER=http://127.0.0.1:8081
+DURE_DATABASE_URL=postgresql+psycopg://dure:<database-password>@127.0.0.1:5432/dure
+DURE_ADMIN_TOKEN=<random-secret>
+```
+
+```bash
+cd ~/workspace/dure
+chmod 600 dure/.env
+dure-server --env-file dure/.env --migrate
+dure-server --env-file dure/.env --host 0.0.0.0 --port 8081
+```
+
+`DURE_SERVER`는 같은 파일을 관리자 CLI와 공유하기 위한 클라이언트 주소이며 서버 자체는 사용하지 않습니다. 서버의 DB URL 우선순위는 `--database-url`, 선택된 dotenv, 프로세스의 `DURE_DATABASE_URL`, 내장 기본값 순서입니다. 관리자 token은 선택된 dotenv가 프로세스 환경보다 우선하며, migration 전용 실행이 아닌데 token이 없으면 서버는 시작하지 않습니다. 서버는 migration과 listen 전에 `SELECT 1` 연결 검사를 수행합니다. DB 비밀번호가 맞지 않으면 URL이나 token을 출력하지 않고 시작을 중단하므로 PostgreSQL role 암호와 `DURE_DATABASE_URL`을 먼저 일치시켜야 합니다.
+
+제공된 개발/LAN service template은 `0.0.0.0:8081`에서 listen합니다. 운영 환경에서는 application을 loopback에 bind하고 TLS reverse proxy를 통해 HTTPS 443만 노출해야 합니다. PostgreSQL과 Ray 포트는 공개하지 않습니다.
 
 ```bash
 curl -fsS http://127.0.0.1:8081/health
@@ -33,7 +50,7 @@ curl -fsS http://127.0.0.1:8081/health
 
 ## 관리자 CLI credential
 
-관리자 CLI는 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`을 같은 dotenv 파일에서 읽을 수 있습니다. 저장소 최상위에서 실행하면 먼저 `dure/.env`, 그다음 `.env`를 확인합니다. Dure 프로젝트 디렉터리 안에서 실행하면 해당 디렉터리의 `.env`를 확인합니다.
+관리자 CLI는 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`을 같은 dotenv 파일에서 읽을 수 있습니다. 저장소 최상위에서 실행하면 먼저 `dure/.env`, 그다음 `.env`를 확인합니다. Dure 프로젝트 디렉터리 안에서 실행하면 해당 디렉터리의 `.env`를 확인합니다. 중앙 서버와 파일을 공유할 때는 위 예시처럼 `DURE_DATABASE_URL`도 함께 둡니다.
 
 ```bash
 cd ~/workspace/dure

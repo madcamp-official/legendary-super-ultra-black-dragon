@@ -3,13 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import stat
 import sys
 import time
 import uuid
 from pathlib import Path
 
 from . import __version__
+from .envfile import parse_secure_env_file
 from .models import CheckResult, NodeProfile
 from .orchestrator import InitOrchestrator
 from .planner import build_plan, classify_node, recommend_local_model
@@ -20,83 +20,18 @@ from .state import StateStore
 
 
 ADMIN_ENV_KEYS = frozenset({"DURE_SERVER", "DURE_ADMIN_TOKEN"})
-ADMIN_ENV_MAX_BYTES = 64 * 1024
 
 
 def _parse_admin_env_file(path: Path, *, required: bool) -> dict[str, str]:
     try:
-        descriptor = os.open(
+        return parse_secure_env_file(
             path,
-            os.O_RDONLY
-            | os.O_CLOEXEC
-            | os.O_NONBLOCK
-            | getattr(os, "O_NOFOLLOW", 0),
+            keys=ADMIN_ENV_KEYS,
+            required=required,
+            required_description="DURE_SERVER and DURE_ADMIN_TOKEN",
         )
-    except FileNotFoundError:
-        if required:
-            raise ValueError(f"admin env file does not exist: {path}") from None
-        return {}
-    except OSError as exc:
-        raise ValueError(f"admin env file is not a safe readable file: {path}: {exc}") from exc
-
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"admin env file must be a regular file: {path}")
-        content = os.read(descriptor, ADMIN_ENV_MAX_BYTES + 1)
-    except ValueError:
-        raise
-    except OSError as exc:
-        raise ValueError(f"could not read admin env file: {path}: {exc}") from exc
-    finally:
-        os.close(descriptor)
-
-    if len(content) > ADMIN_ENV_MAX_BYTES:
-        raise ValueError(f"admin env file exceeds {ADMIN_ENV_MAX_BYTES} bytes: {path}")
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"admin env file is not valid UTF-8: {path}") from exc
-
-    values: dict[str, str] = {}
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("export "):
-            stripped = stripped[7:].lstrip()
-        if "=" not in stripped:
-            if stripped.startswith("DURE_"):
-                raise ValueError(f"invalid Dure setting in {path}:{line_number}")
-            continue
-        key, raw_value = stripped.split("=", 1)
-        key = key.strip()
-        if key not in ADMIN_ENV_KEYS:
-            continue
-        if key in values:
-            raise ValueError(f"duplicate {key} in admin env file: {path}")
-        raw_value = raw_value.strip()
-        if raw_value[:1] in {"'", '"'}:
-            quote = raw_value[0]
-            if len(raw_value) < 2 or raw_value[-1] != quote:
-                raise ValueError(f"unterminated quoted {key} in {path}:{line_number}")
-            raw_value = raw_value[1:-1]
-        if not raw_value:
-            raise ValueError(f"{key} must not be empty in admin env file: {path}")
-        values[key] = raw_value
-
-    if not values and not required:
-        return {}
-    missing = sorted(ADMIN_ENV_KEYS - values.keys())
-    if missing:
-        raise ValueError(
-            f"admin env file must define DURE_SERVER and DURE_ADMIN_TOKEN together: {path}"
-        )
-    if metadata.st_uid != os.geteuid():
-        raise ValueError(f"admin env file must be owned by the current user: {path}")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ValueError(f"admin env file must not be accessible by group or others: {path}")
-    return values
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("env file", "admin env file")) from exc
 
 
 def _admin_env_values(explicit_path: Path | None) -> dict[str, str]:

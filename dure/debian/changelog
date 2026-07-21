@@ -1,3 +1,11 @@
+dure (0.3.24) UNRELEASED; urgency=medium
+
+  * 수동 중앙 서버가 안전한 dotenv에서 DB와 관리자 credential을 함께 읽도록 합니다.
+  * 서버가 migration과 listen 전에 DB 연결을 검사해 잘못된 암호로 API를 열지 않게 합니다.
+  * CLI와 서버의 dotenv 파일 안전성 검사를 공용 구현으로 통합합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 17:30:00 +0900
+
 dure (0.3.23) UNRELEASED; urgency=medium
 
   * 관리자 CLI가 안전한 .env 파일에서 서버와 admin credential을 함께 읽도록 합니다.
