@@ -462,6 +462,14 @@ class ControlAPITests(unittest.TestCase):
             ).status_code,
             422,
         )
+        self.assertEqual(
+            self.client.post(
+                "/v1/admin/profile-qualifications/prepare",
+                headers=self.admin,
+                json={**body, "purpose": "OTHER"},
+            ).status_code,
+            422,
+        )
         prepared = self.client.post(
             "/v1/admin/profile-qualifications/prepare",
             headers=self.admin,
@@ -469,6 +477,7 @@ class ControlAPITests(unittest.TestCase):
         )
         self.assertEqual(prepared.status_code, 200, prepared.text)
         run = prepared.json()["qualification"]
+        self.assertEqual(run["purpose"], "PRIMARY")
         self.assertTrue(prepared.json()["created"])
         repeated = self.client.post(
             "/v1/admin/profile-qualifications/prepare",

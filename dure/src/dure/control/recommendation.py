@@ -268,92 +268,116 @@ def _network_evidence_bindings(
 
     inventory_by_id = {node.node_id: node for node in inventory}
     if requires_qualification:
-        if not placement.qualification_evidence_id:
-            return ()
-        qualification = session.get(
-            ProfileQualificationEvidence,
-            placement.qualification_evidence_id,
-        )
-        qualification_run = (
-            session.get(ProfileQualificationRun, qualification.run_id)
-            if qualification is not None
-            else None
-        )
-        if qualification is None or qualification_run is None:
-            return ()
-        try:
-            validate_profile_qualification_evidence(
-                session,
-                placement=placement,
-                evidence=qualification,
-                run=qualification_run,
-                now=now,
-            )
-        except ProfileQualificationError:
-            return ()
-        registered_at = aware(qualification.created_at)
-        age = now - registered_at
-        node_set = _exact_node_set(
-            qualification_run.node_ids,
-            node_count=placement.node_count,
-        )
-        rank_node_ids = qualification_run.rank_node_ids
-        rank_node_set = (
-            tuple(sorted(rank_node_ids))
-            if isinstance(rank_node_ids, list)
-            and len(rank_node_ids) == placement.node_count
-            and all(isinstance(item, str) for item in rank_node_ids)
-            and len(rank_node_ids) == len(set(rank_node_ids))
-            else None
-        )
-        selected_inventory = [
-            inventory_by_id[node_id]
-            for node_id in (node_set or ())
-            if node_id in inventory_by_id
-        ]
-        metrics = qualification.metrics
-        network_ok = not requires_network or (
-            type(metrics) is dict
-            and type(metrics.get("network_bandwidth_mbps")) in {int, float}
-            and (
-                placement.min_bandwidth_mbps is None
-                or metrics["network_bandwidth_mbps"]
-                >= placement.min_bandwidth_mbps
-            )
-            and type(metrics.get("network_rtt_ms")) in {int, float}
-            and (
-                placement.max_rtt_ms is None
-                or metrics["network_rtt_ms"] <= placement.max_rtt_ms
-            )
-            and type(metrics.get("packet_loss_pct")) in {int, float}
-            and (
-                placement.max_packet_loss_pct is None
-                or metrics["packet_loss_pct"] <= placement.max_packet_loss_pct
-            )
-            and (
-                not placement.requires_nccl
-                or metrics.get("nccl_all_reduce_ok") is True
+        rows = list(
+            session.execute(
+                select(
+                    ProfileQualificationRun,
+                    ProfileQualificationEvidence,
+                )
+                .outerjoin(
+                    ProfileQualificationEvidence,
+                    ProfileQualificationEvidence.run_id
+                    == ProfileQualificationRun.id,
+                )
+                .where(
+                    ProfileQualificationRun.placement_id == placement.id,
+                    ProfileQualificationRun.status.in_(
+                        ("QUALIFYING", "PASSED", "FAILED")
+                    ),
+                )
+                .order_by(
+                    ProfileQualificationRun.updated_at.desc(),
+                    ProfileQualificationRun.id.desc(),
+                )
             )
         )
-        if (
-            node_set is not None
-            and rank_node_set == node_set
-            and len(selected_inventory) == placement.node_count
-            and timedelta(0) <= age <= NETWORK_EVIDENCE_MAX_AGE
-            and network_ok
-        ):
-            return (
+        bindings: list[NetworkEvidenceBinding] = []
+        seen_node_sets: set[tuple[str, ...]] = set()
+        for qualification_run, qualification in rows:
+            node_set = _exact_node_set(
+                qualification_run.node_ids,
+                node_count=placement.node_count,
+            )
+            if node_set is None or node_set in seen_node_sets:
+                continue
+            # The newest attempt for an exact node set is authoritative.  A
+            # pending or failed requalification blocks reuse of an older pass.
+            seen_node_sets.add(node_set)
+            if (
+                qualification_run.status != "PASSED"
+                or qualification is None
+                or qualification_run.evidence_id != qualification.id
+            ):
+                continue
+            try:
+                validate_profile_qualification_evidence(
+                    session,
+                    placement=placement,
+                    evidence=qualification,
+                    run=qualification_run,
+                    now=now,
+                    require_primary=False,
+                )
+            except ProfileQualificationError:
+                continue
+            registered_at = aware(qualification.created_at)
+            age = now - registered_at
+            if age < timedelta(0) or age > NETWORK_EVIDENCE_MAX_AGE:
+                continue
+            if any(
+                node_id not in inventory_by_id
+                or inventory_by_id[node_id].profile is None
+                for node_id in node_set
+            ):
+                continue
+            metrics = qualification.metrics
+            network_ok = not requires_network or (
+                type(metrics) is dict
+                and type(metrics.get("network_bandwidth_mbps")) in {int, float}
+                and (
+                    placement.min_bandwidth_mbps is None
+                    or metrics["network_bandwidth_mbps"]
+                    >= placement.min_bandwidth_mbps
+                )
+                and type(metrics.get("network_rtt_ms")) in {int, float}
+                and (
+                    placement.max_rtt_ms is None
+                    or metrics["network_rtt_ms"] <= placement.max_rtt_ms
+                )
+                and type(metrics.get("packet_loss_pct")) in {int, float}
+                and (
+                    placement.max_packet_loss_pct is None
+                    or metrics["packet_loss_pct"]
+                    <= placement.max_packet_loss_pct
+                )
+                and (
+                    not placement.requires_nccl
+                    or metrics.get("nccl_all_reduce_ok") is True
+                )
+            )
+            if not network_ok:
+                continue
+            bindings.append(
                 NetworkEvidenceBinding(
                     evidence_id=qualification.id,
                     evidence_digest=qualification.evidence_digest,
                     node_ids=node_set,
                     registered_at=registered_at.isoformat(),
                     rank_node_ids=tuple(qualification_run.rank_node_ids),
-                ),
+                )
             )
         # AUTO profiles never fall back to generic network verification or
         # benchmark evidence: deployment must use the exact qualified nodes.
-        return ()
+        return tuple(
+            sorted(
+                bindings,
+                key=lambda item: (
+                    item.node_ids,
+                    item.evidence_digest,
+                    item.evidence_id,
+                ),
+            )
+        )
     evidence_rows = list(
         session.scalars(
             select(BenchmarkEvidence)

@@ -35,6 +35,8 @@ DRAFT
 
 `VALIDATED`는 자동으로 `ACTIVE`가 되지 않습니다. 추천기는 모델 릴리스와 배치 프로필이 모두 `ACTIVE`인 조합만 읽습니다.
 
+최초 활성화 증적이 만들어진 뒤에는 같은 프로필에 `SUPPLEMENTARY` 실행을 명시해 다른 exact 노드 집합의 증적을 추가할 수 있습니다. `PRIMARY` 실행만 위 상태 전이를 소유하며, 보조 실행은 `VALIDATED` 또는 `ACTIVE` 상태와 최초 `qualification_evidence_id`를 변경하지 않습니다. 따라서 보조 실행의 실패나 취소가 이미 활성화된 프로필을 `DRAFT`로 되돌리지 않습니다. 실행 목적은 run의 서명 대상 workload 계약에 동결되고 조회 응답의 `purpose`에도 표시됩니다.
+
 ## 준비와 점유 노드 차단
 
 준비 요청은 정규 UUID인 `request_id`, 자동 배치 프로필 ID와 정확한 노드 UUID 목록을 받습니다. 노드 수는 프로필의 `node_count`와 정확히 같아야 하고 중복할 수 없습니다. 서버는 다음 조건을 실패 안전 방식으로 검사합니다.
@@ -60,11 +62,14 @@ Content-Type: application/json
   "request_id": "<정규 UUID>",
   "placement_id": "<자동 배치 프로필 UUID>",
   "node_ids": ["<노드 UUID>"],
-  "apply": false
+  "apply": false,
+  "purpose": "PRIMARY"
 }
 ```
 
-`apply=false`는 DB run, Agent task, 다운로드, 이미지 pull 또는 컨테이너 변경을 만들지 않습니다. `apply=true`는 run·binding·감사 기록과 프로필의 `QUALIFYING` 상태만 DB에 저장합니다. 이 경우에도 Agent task나 호스트 변경은 만들지 않습니다. 같은 `request_id`와 같은 프로필·노드 집합의 재요청은 저장된 run을 반환하고, 다른 결합은 충돌로 거부합니다.
+최초 증적으로 활성화된 프로필의 다른 exact 노드 집합을 검증할 때만 `purpose`를 `SUPPLEMENTARY`로 지정합니다. 생략값은 기존 호출과 호환되는 `PRIMARY`이며, 활성 프로필에서 목적을 생략한 요청은 보조 실행으로 추측하지 않고 거부합니다. 서로 다른 보조 실행은 GPU·노드가 겹치지 않을 때 병행할 수 있습니다.
+
+`apply=false`는 DB run, Agent task, 다운로드, 이미지 pull 또는 컨테이너 변경을 만들지 않습니다. `apply=true`는 run·binding·감사 기록을 저장하며, `PRIMARY`일 때만 프로필을 `QUALIFYING`으로 바꿉니다. `SUPPLEMENTARY`는 기존 `VALIDATED`·`ACTIVE` 상태와 최초 증적 포인터를 유지합니다. 어느 목적도 Agent task나 호스트 변경을 만들지 않습니다. 같은 `request_id`와 같은 프로필·노드 집합·목적의 재요청은 저장된 run을 반환하고, 다른 결합은 충돌로 거부합니다.
 
 ## rank·노드·GPU UUID 결합
 
@@ -157,6 +162,8 @@ POST /v1/admin/placement-profiles/<placement-id>/activate
 8. 등록 시각이 미래가 아니고 24시간 이내입니다.
 
 서로 다른 증적의 노드를 섞거나 부분 집합을 재사용하지 않습니다. 단일 노드에서도 동일 사양의 다른 GPU로 바꿔 선택하지 않습니다. 24시간 TTL은 `ACTIVE` 상태를 자동 취소하는 규칙이 아니라, 오래된 실제 실행 증적을 새 후보에 재사용하지 않기 위한 읽기 전용 추천 게이트입니다.
+
+PRIMARY와 유효한 모든 SUPPLEMENTARY exact 증적은 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)의 독립 배포 후보가 될 수 있습니다. 같은 exact 노드 집합의 새 실행이 진행 중이거나 실패하면 과거 통과 증적을 Fleet 후보로 되살리지 않습니다.
 
 ## 호스트 변경이 없는 경계
 

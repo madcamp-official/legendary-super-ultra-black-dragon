@@ -384,6 +384,7 @@ class ProfileQualificationPrepare(StrictBody):
     placement_id: str
     node_ids: list[str] = Field(min_length=1, max_length=64)
     apply: StrictBool = False
+    purpose: Literal["PRIMARY", "SUPPLEMENTARY"] = "PRIMARY"
 
     @model_validator(mode="after")
     def validate_identities(self):

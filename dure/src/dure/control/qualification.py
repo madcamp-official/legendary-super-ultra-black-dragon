@@ -39,6 +39,7 @@ from .models import (
 
 QUALIFICATION_POLICY_VERSION = "profile-qualification-v1"
 QUALIFICATION_SUITE_ID = "dure-profile-qualification-v1"
+QUALIFICATION_PURPOSES = frozenset({"PRIMARY", "SUPPLEMENTARY"})
 QUALIFICATION_PROFILE_MAX_AGE = timedelta(seconds=90)
 QUALIFICATION_STEPS = (
     "STATIC_COMPATIBILITY",
@@ -254,10 +255,11 @@ def _workload_contract(
     release: ModelRelease,
     artifact: ModelArtifact,
     runtime: RuntimeRelease,
+    qualification_purpose: str | None,
 ) -> dict[str, Any]:
     output_tokens = min(256, max(1, placement.max_model_len // 16))
     input_tokens = placement.max_model_len - output_tokens
-    return {
+    contract = {
         "policy_version": QUALIFICATION_POLICY_VERSION,
         "suite_id": QUALIFICATION_SUITE_ID,
         "release_id": release.id,
@@ -278,6 +280,24 @@ def _workload_contract(
         "minimum_request_count": max(4, placement.max_concurrency),
         "steps": list(QUALIFICATION_STEPS),
     }
+    if qualification_purpose is not None:
+        contract["qualification_purpose"] = qualification_purpose
+    return contract
+
+
+def _qualification_purpose(run: ProfileQualificationRun) -> str:
+    if type(run.workload) is not dict:
+        raise ProfileQualificationError(
+            "qualification run has an invalid workload",
+            code="QUALIFICATION_PURPOSE_INVALID",
+        )
+    purpose = run.workload.get("qualification_purpose", "PRIMARY")
+    if type(purpose) is not str or purpose not in QUALIFICATION_PURPOSES:
+        raise ProfileQualificationError(
+            "qualification run has an invalid purpose",
+            code="QUALIFICATION_PURPOSE_INVALID",
+        )
+    return purpose
 
 
 def _stored_bindings(
@@ -307,6 +327,7 @@ def _qualification_context(
     node_ids: list[str],
     now,
     qualification_run_id: str | None = None,
+    qualification_purpose: str | None = "PRIMARY",
 ) -> dict[str, Any]:
     if placement.origin != AUTO_PROFILE_ORIGIN or placement.spec_digest is None:
         raise ProfileQualificationError(
@@ -442,6 +463,7 @@ def _qualification_context(
         release=release,
         artifact=artifact,
         runtime=runtime,
+        qualification_purpose=qualification_purpose,
     )
     return {
         "release": release,
@@ -497,10 +519,16 @@ def validate_profile_qualification_evidence(
     evidence: ProfileQualificationEvidence,
     run: ProfileQualificationRun,
     now=None,
+    require_primary: bool = True,
 ) -> dict[str, Any]:
+    purpose = _qualification_purpose(run)
     if (
         placement.origin != AUTO_PROFILE_ORIGIN
-        or placement.qualification_evidence_id != evidence.id
+        or (require_primary and purpose != "PRIMARY")
+        or (
+            require_primary
+            and placement.qualification_evidence_id != evidence.id
+        )
         or evidence.status != "PASSED"
         or run.status != "PASSED"
         or run.failure_code is not None
@@ -538,6 +566,7 @@ def validate_profile_qualification_evidence(
         placement=placement,
         node_ids=list(run.node_ids),
         now=checked_at,
+        qualification_purpose=run.workload.get("qualification_purpose"),
     )
     if (
         context["inventory_fingerprint"] != run.inventory_fingerprint
@@ -564,6 +593,7 @@ def qualification_run_dict(run: ProfileQualificationRun) -> dict[str, Any]:
         "release_id": run.release_id,
         "placement_id": run.placement_id,
         "status": run.status,
+        "purpose": _qualification_purpose(run),
         "node_ids": list(run.node_ids),
         "rank_node_ids": list(run.rank_node_ids),
         "gpu_bindings": list(run.gpu_bindings),
@@ -594,11 +624,14 @@ def prepare_profile_qualification(
     placement_id: str,
     node_ids: list[str],
     apply: bool,
+    purpose: str = "PRIMARY",
 ) -> tuple[dict[str, Any], bool]:
     request_id = _canonical_uuid(request_id, field="request_id")
     _canonical_uuid(placement_id, field="placement_id")
     if type(apply) is not bool:
         raise ValueError("apply must be a boolean")
+    if type(purpose) is not str or purpose not in QUALIFICATION_PURPOSES:
+        raise ValueError("unsupported qualification purpose")
     for node_id in node_ids:
         _canonical_uuid(node_id, field="node_id")
     placement = session.scalar(
@@ -617,6 +650,7 @@ def prepare_profile_qualification(
             existing.placement_id != placement.id
             or list(existing.node_ids) != sorted(node_ids)
             or existing.release_id != placement.release_id
+            or _qualification_purpose(existing) != purpose
             or _stored_bindings(session, existing.id) != existing.gpu_bindings
         ):
             raise ProfileQualificationError(
@@ -625,14 +659,38 @@ def prepare_profile_qualification(
             )
         return qualification_run_dict(existing), False
     now = utcnow()
+    if purpose == "PRIMARY":
+        if (
+            placement.status != "DRAFT"
+            or placement.qualification_evidence_id is not None
+        ):
+            raise ProfileQualificationError(
+                "primary qualification can start only from an unevidenced DRAFT profile",
+                code="QUALIFICATION_PROFILE_STATE",
+                details={"status": placement.status},
+            )
+    elif (
+        placement.status not in {"VALIDATED", "ACTIVE"}
+        or placement.qualification_evidence_id is None
+    ):
+        raise ProfileQualificationError(
+            "supplementary qualification requires an evidenced VALIDATED or ACTIVE profile",
+            code="QUALIFICATION_PROFILE_STATE",
+            details={"status": placement.status},
+        )
     context = _qualification_context(
-        session, placement=placement, node_ids=node_ids, now=now
+        session,
+        placement=placement,
+        node_ids=node_ids,
+        now=now,
+        qualification_purpose=purpose,
     )
     planned = {
         "id": request_id,
         "release_id": placement.release_id,
         "placement_id": placement.id,
         "status": "QUALIFYING",
+        "purpose": purpose,
         "node_ids": sorted(node_ids),
         "rank_node_ids": context["rank_node_ids"],
         "gpu_bindings": context["gpu_bindings"],
@@ -652,24 +710,6 @@ def prepare_profile_qualification(
         "evidence_id": None,
         "failure_code": None,
     }
-    active = session.scalar(
-        select(ProfileQualificationRun.id).where(
-            ProfileQualificationRun.placement_id == placement.id,
-            ProfileQualificationRun.status == "QUALIFYING",
-        )
-    )
-    if active is not None:
-        raise ProfileQualificationError(
-            "another qualification run is already active",
-            code="QUALIFICATION_ALREADY_RUNNING",
-            details={"run_id": active},
-        )
-    if placement.status != "DRAFT":
-        raise ProfileQualificationError(
-            "qualification can start only from DRAFT",
-            code="QUALIFICATION_PROFILE_STATE",
-            details={"status": placement.status},
-        )
     if not apply:
         return planned, False
     run = ProfileQualificationRun(
@@ -712,14 +752,19 @@ def prepare_profile_qualification(
             for binding in planned["gpu_bindings"]
         ]
     )
-    placement.status = "QUALIFYING"
+    if purpose == "PRIMARY":
+        placement.status = "QUALIFYING"
     session.add(
         AuditEvent(
             actor="admin",
             action="placement_profile.qualification.start",
             target=placement.id,
             outcome="success",
-            detail={"run_id": run.id, "node_ids": planned["node_ids"]},
+            detail={
+                "run_id": run.id,
+                "node_ids": planned["node_ids"],
+                "purpose": purpose,
+            },
         )
     )
     try:
@@ -913,7 +958,14 @@ def register_profile_qualification_evidence(
                 code="QUALIFICATION_EVIDENCE_CONFLICT",
             )
         return existing, run, False
-    if run.status != "QUALIFYING" or placement.status != "QUALIFYING":
+    purpose = _qualification_purpose(run)
+    valid_profile_state = (
+        placement.status == "QUALIFYING"
+        if purpose == "PRIMARY"
+        else placement.status in {"VALIDATED", "ACTIVE"}
+        and placement.qualification_evidence_id is not None
+    )
+    if run.status != "QUALIFYING" or not valid_profile_state:
         raise ProfileQualificationError(
             "qualification run is not accepting evidence",
             code="QUALIFICATION_RUN_STATE",
@@ -940,6 +992,7 @@ def register_profile_qualification_evidence(
         node_ids=list(run.node_ids),
         now=now,
         qualification_run_id=run.id,
+        qualification_purpose=run.workload.get("qualification_purpose"),
     )
     if (
         context["inventory_fingerprint"] != run.inventory_fingerprint
@@ -981,11 +1034,11 @@ def register_profile_qualification_evidence(
     run.evidence_id = evidence.id
     run.failure_code = failures[0] if failures else None
     run.updated_at = now
-    if status == "PASSED":
+    if status == "PASSED" and purpose == "PRIMARY":
         placement.status = "VALIDATED"
         placement.qualification_evidence_id = evidence.id
         placement.qualified_at = now
-    else:
+    elif status == "FAILED" and purpose == "PRIMARY":
         placement.status = "DRAFT"
     session.add(
         AuditEvent(
@@ -997,6 +1050,7 @@ def register_profile_qualification_evidence(
                 "run_id": run.id,
                 "evidence_id": evidence.id,
                 "failure_codes": failures,
+                "purpose": purpose,
             },
         )
     )
@@ -1112,7 +1166,17 @@ def cancel_profile_qualification(
         .where(PlacementProfileRecord.id == run.placement_id)
         .with_for_update()
     )
-    if placement is None or placement.status != "QUALIFYING":
+    purpose = _qualification_purpose(run)
+    valid_profile_state = (
+        placement is not None
+        and (
+            placement.status == "QUALIFYING"
+            if purpose == "PRIMARY"
+            else placement.status in {"VALIDATED", "ACTIVE"}
+            and placement.qualification_evidence_id is not None
+        )
+    )
+    if not valid_profile_state:
         raise ProfileQualificationError(
             "qualification profile state is inconsistent",
             code="QUALIFICATION_PROFILE_STATE",
@@ -1120,14 +1184,15 @@ def cancel_profile_qualification(
     run.status = "CANCELED"
     run.failure_code = "QUALIFICATION_CANCELED"
     run.updated_at = utcnow()
-    placement.status = "DRAFT"
+    if purpose == "PRIMARY":
+        placement.status = "DRAFT"
     session.add(
         AuditEvent(
             actor="admin",
             action="placement_profile.qualification.cancel",
             target=placement.id,
             outcome="success",
-            detail={"run_id": run.id},
+            detail={"run_id": run.id, "purpose": purpose},
         )
     )
     session.commit()

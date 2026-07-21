@@ -674,12 +674,16 @@ curl -sS -X POST \
 
 현재 Dure는 다중 노드 qualification을 Agent에 자동 분배하지 않습니다. 신뢰된 외부 executor가 동결된 정책 `profile-qualification-v1`, suite `dure-profile-qualification-v1`, 작업 부하와 exact binding을 사용해 정적 호환성, 용량 추정, 아티팩트 준비, 네트워크·NCCL, 모델 load, 짧은 추론, 컨텍스트·동시성, 재시작 안정성의 8단계를 실행한 뒤 결과를 등록해야 합니다.
 
+최초 활성화 뒤 다른 exact 노드 집합을 검증할 때는 준비 본문에 `"purpose":"SUPPLEMENTARY"`를 명시합니다. 목적을 생략하면 `PRIMARY`이므로 활성 프로필에서 자동 추측하지 않고 거부합니다. 보조 실행의 통과·실패·취소는 기존 프로필 상태와 최초 증적 포인터를 바꾸지 않으며, 겹치지 않는 노드 집합의 보조 실행은 병행할 수 있습니다.
+
 - `GET /v1/admin/profile-qualifications/{run_id}`: 동결 계약과 현재 결과 조회
 - `POST /v1/admin/profile-qualifications/{run_id}/evidence`: 8단계 폐쇄형 증적 등록
 - `POST /v1/admin/profile-qualifications/{run_id}/cancel`: 진행 중 run 취소와 `DRAFT` 복귀
 - `POST /v1/admin/placement-profiles/{placement_id}/activate`: 통과 증적을 현재 인벤토리와 다시 비교한 명시적 활성화
 
 증적이 모두 통과하면 서버가 프로필을 `VALIDATED`로 만들지만 자동 활성화하지 않습니다. 운영자가 마지막 API를 호출하고 현재 인벤토리·레지스트리·정규화 binding이 그대로여야 `ACTIVE`가 됩니다. 단일·다중 노드 AUTO 추천에는 exact 노드·rank·GPU UUID 결합과 현재 정책·suite·작업 부하가 같은 24시간 이내 증적만 사용할 수 있습니다. preview, 적용, 증적 등록과 활성화 자체는 모델 다운로드·이미지 pull·컨테이너 실행·기존 서비스 변경을 수행하지 않습니다. 전체 요청 스키마와 실패 코드는 [자동 배치 프로필 qualification](profile-qualification.md)을 참고합니다.
+
+내부 Fleet 평가기는 이 PRIMARY·SUPPLEMENTARY 증적들을 현재 GPU 풀에 대입해 여러 독립 배포 조합과 미배정 사유를 계산합니다. 이 단계는 아직 별도 관리자 CLI/API로 공개하거나 DB에 저장하지 않으며, task·예약·배포 세대를 만들지 않습니다. 계산 계약과 한도는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
 
 ## 벤치마크 증적 등록과 승격
 

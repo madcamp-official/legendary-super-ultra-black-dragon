@@ -10,8 +10,10 @@ from sqlalchemy import func, select
 
 from dure.control.benchmark import promote_model_release
 from dure.control.db import Base, make_engine, make_session_factory
+from dure.control.fleet import FleetEvaluationError, evaluate_fleet_schedule
 from dure.control.models import (
     Deployment,
+    DeploymentRecommendationRecord,
     Node,
     NodeProfileRecord,
     PlacementProfileRecord,
@@ -30,6 +32,7 @@ from dure.control.qualification import (
     cancel_profile_qualification,
     prepare_profile_qualification,
     register_profile_qualification_evidence,
+    validate_profile_qualification_evidence,
 )
 from dure.control.recommendation import evaluate_deployment_recommendation
 from dure.control.service import (
@@ -91,10 +94,11 @@ class ProfileQualificationTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _release(self, session, model_id: str):
-        size_mib, context, layers, manifest_digit = {
-            "qwen2.5-7b-awq": (4916, 8192, 28, "b"),
-            "qwen2.5-14b-awq": (9728, 8192, 48, "e"),
-            "qwen2.5-72b-awq": (39670, 8192, 80, "f"),
+        size_mib, context, layers, manifest_digit, quality_rank = {
+            "qwen2.5-7b-awq": (4916, 8192, 28, "b", 7),
+            "qwen2.5-14b-awq": (9728, 8192, 48, "e", 14),
+            "qwen2.5-32b-awq": (19968, 4096, 64, "d", 32),
+            "qwen2.5-72b-awq": (39670, 8192, 80, "f", 72),
         }[model_id]
         artifact = create_model_artifact(
             session,
@@ -120,7 +124,7 @@ class ProfileQualificationTests(unittest.TestCase):
             session,
             artifact_id=artifact.id,
             runtime_id=runtime.id,
-            quality_rank=72 if "72b" in model_id else 7,
+            quality_rank=quality_rank,
         )
         generate_auto_placement_profiles(
             session, release_id=release.id, apply=True
@@ -155,6 +159,186 @@ class ProfileQualificationTests(unittest.TestCase):
             node_ids.append(node.id)
         session.commit()
         return sorted(node_ids)
+
+    def _qualify(
+        self,
+        session,
+        placement: PlacementProfileRecord,
+        node_ids: list[str],
+        *,
+        purpose: str = "PRIMARY",
+    ):
+        run, created = prepare_profile_qualification(
+            session,
+            request_id=str(uuid.uuid4()),
+            placement_id=placement.id,
+            node_ids=node_ids,
+            purpose=purpose,
+            apply=True,
+        )
+        self.assertTrue(created)
+        evidence, _, created = register_profile_qualification_evidence(
+            session,
+            run_id=run["id"],
+            steps=_passing_steps(),
+            metrics=_passing_metrics(
+                run,
+                multi_node=placement.node_count > 1,
+            ),
+            executor_image=(
+                "registry.example/qualification@sha256:" + "d" * 64
+            ),
+            dure_commit="e" * 40,
+        )
+        self.assertTrue(created)
+        return evidence
+
+    def test_fleet_scheduler_combines_disjoint_exact_evidence_sets(self):
+        with self.factory() as session:
+            large_release = self._release(session, "qwen2.5-72b-awq")
+            small_release = self._release(session, "qwen2.5-32b-awq")
+            large = session.scalar(
+                select(PlacementProfileRecord).where(
+                    PlacementProfileRecord.release_id == large_release.id,
+                    PlacementProfileRecord.pipeline_parallel_size == 3,
+                )
+            )
+            small = session.scalar(
+                select(PlacementProfileRecord).where(
+                    PlacementProfileRecord.release_id == small_release.id,
+                )
+            )
+            node_ids = self._nodes(session, 9)
+
+            self._qualify(session, large, node_ids[0:3])
+            activate_validated_profile(session, large.id)
+            self._qualify(
+                session,
+                large,
+                node_ids[3:6],
+                purpose="SUPPLEMENTARY",
+            )
+            self._qualify(session, small, [node_ids[6]])
+            activate_validated_profile(session, small.id)
+            self._qualify(
+                session,
+                small,
+                [node_ids[7]],
+                purpose="SUPPLEMENTARY",
+            )
+            low_profile = session.get(NodeProfileRecord, node_ids[8])
+            changed = copy.deepcopy(low_profile.profile)
+            changed["gpus"][0]["memory_mib"] = 4096
+            low_profile.profile = changed
+            low_profile.updated_at = utcnow()
+            session.commit()
+
+            for release in (large_release, small_release):
+                transition_model_release(session, release.id, "VALIDATED")
+                promote_model_release(session, release.id)
+
+            result = evaluate_fleet_schedule(
+                session,
+                node_ids=node_ids,
+                all_online=False,
+            )
+            reversed_result = evaluate_fleet_schedule(
+                session,
+                node_ids=list(reversed(node_ids)),
+                all_online=False,
+            )
+
+            self.assertEqual(result, reversed_result)
+            selected = result["schedule"]["selected"]
+            self.assertEqual(
+                [item["model_id"] for item in selected],
+                [
+                    "qwen2.5-72b-awq",
+                    "qwen2.5-72b-awq",
+                    "qwen2.5-32b-awq",
+                    "qwen2.5-32b-awq",
+                ],
+            )
+            self.assertEqual(
+                len(result["schedule"]["used_node_ids"]),
+                8,
+            )
+            self.assertEqual(
+                len(result["schedule"]["used_gpu_uuids"]),
+                8,
+            )
+            self.assertEqual(
+                result["unassigned_nodes"],
+                [
+                    {
+                        "node_id": node_ids[8],
+                        "reason": "NO_VALIDATED_CANDIDATE",
+                        "occupancy_reason": None,
+                        "candidate_ids": [],
+                        "candidate_rejection_codes": [],
+                    }
+                ],
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Task)),
+                0,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Deployment)),
+                0,
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(
+                        DeploymentRecommendationRecord
+                    )
+                ),
+                0,
+            )
+
+            zoned_result = evaluate_fleet_schedule(
+                session,
+                node_ids=node_ids,
+                all_online=False,
+                network_zones={
+                    node_id: (
+                        "zone-a"
+                        if index in {0, 1, 2, 6, 7}
+                        else "zone-b"
+                        if index in {3, 5}
+                        else "zone-c"
+                    )
+                    for index, node_id in enumerate(node_ids)
+                },
+            )
+            self.assertNotEqual(
+                result["selected_candidate_ids"],
+                zoned_result["selected_candidate_ids"],
+            )
+            large_candidates = sorted(
+                (
+                    item
+                    for item in zoned_result["candidates"]
+                    if item["model_id"] == "qwen2.5-72b-awq"
+                ),
+                key=lambda item: item["rank_node_ids"],
+            )
+            self.assertEqual(large_candidates[0]["network_zone"], "zone-a")
+            self.assertEqual(large_candidates[0]["zone_penalty"], 0.0)
+            self.assertIsNone(large_candidates[1]["network_zone"])
+            self.assertEqual(large_candidates[1]["zone_penalty"], 1.0)
+
+            with self.assertRaises(FleetEvaluationError) as invalid_zone:
+                evaluate_fleet_schedule(
+                    session,
+                    node_ids=node_ids,
+                    all_online=False,
+                    network_zones={node_ids[0]: ""},
+                )
+            self.assertEqual(
+                invalid_zone.exception.code,
+                "FLEET_NETWORK_ZONE_INVALID",
+            )
 
     def test_exact_gpu_evidence_validates_activates_and_feeds_recommendation(self):
         with self.factory() as session:
@@ -549,6 +733,168 @@ class ProfileQualificationTests(unittest.TestCase):
                     .where(Task.type == TaskType.BENCHMARK.value)
                 ),
                 0,
+            )
+
+    def test_supplementary_pass_preserves_primary_activation_evidence(self):
+        with self.factory() as session:
+            release = self._release(session, "qwen2.5-7b-awq")
+            placement = session.scalar(
+                select(PlacementProfileRecord).where(
+                    PlacementProfileRecord.release_id == release.id
+                )
+            )
+            primary_node, supplementary_node = self._nodes(session, 2)
+            primary_run, _ = prepare_profile_qualification(
+                session,
+                request_id=str(uuid.uuid4()),
+                placement_id=placement.id,
+                node_ids=[primary_node],
+                apply=True,
+            )
+            primary_evidence, _, _ = register_profile_qualification_evidence(
+                session,
+                run_id=primary_run["id"],
+                steps=_passing_steps(),
+                metrics=_passing_metrics(primary_run, multi_node=False),
+                executor_image=(
+                    "registry.example/qualification@sha256:" + "d" * 64
+                ),
+                dure_commit="e" * 40,
+            )
+
+            supplementary_run, created = prepare_profile_qualification(
+                session,
+                request_id=str(uuid.uuid4()),
+                placement_id=placement.id,
+                node_ids=[supplementary_node],
+                apply=True,
+                purpose="SUPPLEMENTARY",
+            )
+            self.assertTrue(created)
+            self.assertEqual(supplementary_run["purpose"], "SUPPLEMENTARY")
+            session.refresh(placement)
+            self.assertEqual(placement.status, "VALIDATED")
+            supplementary_evidence, stored_run, _ = (
+                register_profile_qualification_evidence(
+                    session,
+                    run_id=supplementary_run["id"],
+                    steps=_passing_steps(),
+                    metrics=_passing_metrics(
+                        supplementary_run, multi_node=False
+                    ),
+                    executor_image=(
+                        "registry.example/qualification@sha256:" + "d" * 64
+                    ),
+                    dure_commit="f" * 40,
+                )
+            )
+
+            session.refresh(placement)
+            self.assertEqual(placement.status, "VALIDATED")
+            self.assertEqual(
+                placement.qualification_evidence_id, primary_evidence.id
+            )
+            self.assertNotEqual(supplementary_evidence.id, primary_evidence.id)
+            activated, changed = activate_validated_profile(
+                session, placement.id
+            )
+            self.assertTrue(changed)
+            self.assertEqual(activated.status, "ACTIVE")
+            validate_profile_qualification_evidence(
+                session,
+                placement=placement,
+                evidence=supplementary_evidence,
+                run=stored_run,
+                require_primary=False,
+            )
+            with self.assertRaises(ProfileQualificationError) as primary_only:
+                validate_profile_qualification_evidence(
+                    session,
+                    placement=placement,
+                    evidence=supplementary_evidence,
+                    run=stored_run,
+                )
+            self.assertEqual(
+                primary_only.exception.code, "QUALIFICATION_EVIDENCE_INVALID"
+            )
+
+    def test_supplementary_failure_and_cancel_do_not_downgrade_active_profile(self):
+        with self.factory() as session:
+            release = self._release(session, "qwen2.5-7b-awq")
+            placement = session.scalar(
+                select(PlacementProfileRecord).where(
+                    PlacementProfileRecord.release_id == release.id
+                )
+            )
+            primary_node, failed_node, canceled_node = self._nodes(session, 3)
+            primary_run, _ = prepare_profile_qualification(
+                session,
+                request_id=str(uuid.uuid4()),
+                placement_id=placement.id,
+                node_ids=[primary_node],
+                apply=True,
+            )
+            primary_evidence, _, _ = register_profile_qualification_evidence(
+                session,
+                run_id=primary_run["id"],
+                steps=_passing_steps(),
+                metrics=_passing_metrics(primary_run, multi_node=False),
+                executor_image=(
+                    "registry.example/qualification@sha256:" + "d" * 64
+                ),
+                dure_commit="e" * 40,
+            )
+            activate_validated_profile(session, placement.id)
+
+            failed_run, _ = prepare_profile_qualification(
+                session,
+                request_id=str(uuid.uuid4()),
+                placement_id=placement.id,
+                node_ids=[failed_node],
+                apply=True,
+                purpose="SUPPLEMENTARY",
+            )
+            canceled_run, _ = prepare_profile_qualification(
+                session,
+                request_id=str(uuid.uuid4()),
+                placement_id=placement.id,
+                node_ids=[canceled_node],
+                apply=True,
+                purpose="SUPPLEMENTARY",
+            )
+            failed_steps = _passing_steps()
+            failed_steps[4] = {
+                "step_id": "MODEL_LOAD",
+                "status": "FAILED",
+                "failure_code": "MODEL_LOAD_FAILED",
+            }
+            register_profile_qualification_evidence(
+                session,
+                run_id=failed_run["id"],
+                steps=failed_steps,
+                metrics=_passing_metrics(failed_run, multi_node=False),
+                executor_image=(
+                    "registry.example/qualification@sha256:" + "d" * 64
+                ),
+                dure_commit="f" * 40,
+            )
+            cancel_profile_qualification(session, canceled_run["id"])
+
+            session.refresh(placement)
+            self.assertEqual(placement.status, "ACTIVE")
+            self.assertEqual(
+                placement.qualification_evidence_id, primary_evidence.id
+            )
+            with self.assertRaises(ProfileQualificationError) as wrong_purpose:
+                prepare_profile_qualification(
+                    session,
+                    request_id=str(uuid.uuid4()),
+                    placement_id=placement.id,
+                    node_ids=[failed_node],
+                    apply=False,
+                )
+            self.assertEqual(
+                wrong_purpose.exception.code, "QUALIFICATION_PROFILE_STATE"
             )
 
     def test_failure_code_must_match_its_step(self):

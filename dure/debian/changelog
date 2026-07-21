@@ -1,3 +1,11 @@
+dure (0.3.29) UNRELEASED; urgency=medium
+
+  * PRIMARY·SUPPLEMENTARY exact 증적을 여러 독립 배포 후보로 투영합니다.
+  * 네 모델과 TP=1을 강제하는 결정론적 Fleet set-packing 스케줄러를 추가합니다.
+  * 제품 노드 수 상한 없이 100개 노드와 구조화된 미배정 사유를 검증합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:00:00 +0900
+
 dure (0.3.28) UNRELEASED; urgency=medium
 
   * 자동 배치 프로필에 GPU UUID 결합 qualification 증적과 승격 게이트를 추가합니다.
