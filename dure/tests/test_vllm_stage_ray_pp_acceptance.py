@@ -248,6 +248,9 @@ class VllmStageRayPpAcceptanceTests(unittest.TestCase):
         environment.pop(
             "DURE_RUN_VLLM_STAGE_RAY_PP_ACCEPTANCE", None
         )
+        environment["PYTHONPATH"] = str(
+            Path(__file__).resolve().parents[1] / "src"
+        )
         completed = subprocess.run(
             [sys.executable, str(SCRIPT)],
             check=False,
@@ -255,7 +258,7 @@ class VllmStageRayPpAcceptanceTests(unittest.TestCase):
             text=True,
             env=environment,
         )
-        self.assertEqual(completed.returncode, 77)
+        self.assertEqual(completed.returncode, 77, completed.stderr)
         self.assertEqual(completed.stderr, "")
         self.assertEqual(json.loads(completed.stdout)["status"], "NOT_RUN")
 

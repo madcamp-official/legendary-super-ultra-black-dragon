@@ -221,6 +221,9 @@ class StageBuilderTests(unittest.TestCase):
                 environment.pop("DURE_RUN_STAGE_GPU_ACCEPTANCE", None)
                 environment.pop("DURE_STAGE_ACCEPTANCE_LOAD", None)
                 environment.update(updates)
+                environment["PYTHONPATH"] = str(
+                    Path(__file__).resolve().parents[1] / "src"
+                )
                 completed = subprocess.run(
                     [sys.executable, str(script)],
                     check=False,
@@ -228,7 +231,7 @@ class StageBuilderTests(unittest.TestCase):
                     text=True,
                     env=environment,
                 )
-                self.assertEqual(completed.returncode, 77)
+                self.assertEqual(completed.returncode, 77, completed.stderr)
                 self.assertEqual(completed.stderr, "")
                 report = json.loads(completed.stdout)
                 self.assertEqual(report["status"], "NOT_RUN")

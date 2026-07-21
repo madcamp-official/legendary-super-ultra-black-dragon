@@ -1,3 +1,10 @@
+dure (0.3.27) UNRELEASED; urgency=medium
+
+  * CI 자식 Python이 같은 checkout의 source package를 사용하도록 고정합니다.
+  * GPU acceptance 기본 실행 테스트 실패 시 자식 stderr를 함께 보고합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 19:45:00 +0900
+
 dure (0.3.26) UNRELEASED; urgency=medium
 
   * HTTPS 중앙 서버를 content-addressed 모델 청크 origin으로 사용합니다.
