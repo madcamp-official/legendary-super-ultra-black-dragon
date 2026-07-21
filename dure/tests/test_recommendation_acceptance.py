@@ -638,46 +638,28 @@ class RecommendationAcceptanceTests(unittest.TestCase):
             all(item["gpu_uuid"].startswith("GPU-") for item in assignments)
         )
 
-    def test_postgresql_accept_locks_evidence_registry_and_inventory_tables(self):
+    def test_accept_locks_only_the_frozen_inventory_rows_in_writer_order(self):
         session = Mock()
         session.get_bind.return_value.dialect.name = "postgresql"
         session.scalars.return_value = []
-        record = Mock(selection_mode="all_online", requested_node_ids=[])
+        node_ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ]
+        record = Mock(selection_mode="all_online", requested_node_ids=node_ids)
 
         _lock_recommendation_inputs(session, record)
 
-        statement = str(session.execute.call_args.args[0])
-        self.assertEqual(
-            statement,
-            "LOCK TABLE artifact_chunks, artifact_manifests, "
-            "artifact_manifest_files, artifact_file_chunks, benchmark_evidence, "
-            "benchmark_runs, model_artifacts, model_releases, nodes, "
-            "node_profiles, placement_profiles, runtime_releases, "
-            "stage_artifact_variants, stage_artifact_ranks, "
-            "stage_artifact_validation_evidence, "
-            "stage_artifact_validation_ranks IN SHARE MODE",
-        )
-        self.assertLess(
-            statement.index("artifact_chunks"),
-            statement.index("artifact_manifests"),
-        )
-        self.assertLess(
-            statement.index("artifact_manifests"),
-            statement.index("artifact_manifest_files"),
-        )
-        self.assertLess(
-            statement.index("artifact_manifest_files"),
-            statement.index("artifact_file_chunks"),
-        )
-        self.assertLess(
-            statement.index("stage_artifact_variants"),
-            statement.index("stage_artifact_ranks"),
-        )
-        self.assertLess(
-            statement.index("stage_artifact_ranks"),
-            statement.index("stage_artifact_validation_evidence"),
-        )
-        session.scalars.assert_not_called()
+        session.execute.assert_not_called()
+        self.assertEqual(session.scalars.call_count, 2)
+        node_statement = str(session.scalars.call_args_list[0].args[0])
+        profile_statement = str(session.scalars.call_args_list[1].args[0])
+        self.assertIn("FROM nodes", node_statement)
+        self.assertIn("ORDER BY nodes.id", node_statement)
+        self.assertIn("FOR UPDATE", node_statement)
+        self.assertIn("FROM node_profiles", profile_statement)
+        self.assertIn("ORDER BY node_profiles.node_id", profile_statement)
+        self.assertIn("FOR UPDATE", profile_statement)
 
     def test_multinode_ray_head_rejects_public_only_address(self):
         public_only = profile("public-only", address="203.0.113.10")

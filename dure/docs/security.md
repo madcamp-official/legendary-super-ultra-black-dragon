@@ -168,7 +168,7 @@ probe는 최대 256개의 marker metadata만 보고합니다. `scan_complete=tru
 
 ## 자동 배치 프로필 qualification의 신뢰 경계
 
-자동 프로필 qualification은 `DRAFT → QUALIFYING → VALIDATED → 운영자 ACTIVE` 전이와 증적 형식을 중앙에서 강제하는 계약입니다. 준비 시 policy·suite·작업 부하, 모델·런타임 식별자와 8단계 순서를 동결하고 각 rank를 서버 발급 노드 UUID와 GPU index·UUID에 정규화해 결합합니다. task, 활성 배포 operation, 다른 qualification 예약 또는 관측 작업 부하가 있는 노드는 대상에서 제외합니다. 증적 등록과 활성화 시 현재 인벤토리·binding·레지스트리를 다시 계산하며, 중앙 단일·다중 노드 AUTO 추천은 exact 결합의 24시간 이내 통과 증적만 사용합니다.
+자동 프로필 qualification은 `DRAFT → QUALIFYING → VALIDATED → 운영자 ACTIVE` 전이와 증적 형식을 중앙에서 강제하는 계약입니다. 준비 시 policy·suite·작업 부하, 모델·런타임 식별자와 8단계 순서를 동결하고 각 rank를 서버 발급 노드 UUID와 GPU index·UUID에 정규화해 결합합니다. task, 활성 배포 operation, 활성 Fleet 예약, 다른 qualification 예약 또는 관측 작업 부하가 있는 노드는 대상에서 제외합니다. 증적 등록과 활성화 시 현재 인벤토리·binding·레지스트리를 다시 계산하며, 중앙 단일·다중 노드 AUTO 추천은 exact 결합의 24시간 이내 통과 증적만 사용합니다.
 
 - 준비 preview, `apply=true` run 생성, 증적 등록과 활성화는 Agent task, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지를 만들지 않습니다.
 - 증적은 정적 호환성, 용량, 아티팩트, 네트워크·NCCL, 모델 load, 짧은 추론, 컨텍스트·동시성, 재시작 안정성의 8단계와 폐쇄형 수치·실패 코드만 받습니다. 임의 명령·환경 변수·마운트·비밀·로그를 표현할 수 없습니다.
@@ -177,7 +177,11 @@ probe는 최대 256개의 marker metadata만 보고합니다. `scan_complete=tru
 
 따라서 관리자 token, executor, 원본 결과 저장소를 같은 신뢰된 운영 경계에서 관리해야 합니다. 이 경계의 전체 계약은 [자동 배치 프로필 qualification](profile-qualification.md)을 참고합니다.
 
-Fleet 평가기는 유효한 PRIMARY·SUPPLEMENTARY 증적 하나를 정확한 node/GPU/rank 집합 하나로만 투영합니다. 같은 evidence ID의 digest나 결합이 달라지면 닫히고, 새 실패·진행 중 실행이 있는 exact 집합에서는 오래된 통과 결과를 사용하지 않습니다. 선택된 후보끼리 노드 또는 GPU UUID가 한 개라도 겹치면 동시에 선택할 수 없습니다. 관리자 추천 API는 평가 전체를 별도 콘텐츠 주소 행으로 멱등 저장하지만 예약·deployment·task·컨테이너 권한은 만들지 않습니다. `show`는 저장 기록이며 현재 유효성 보증이 아닙니다. 클라이언트는 계산 한도나 network zone을 입력해 점수를 조작할 수 없습니다. 상세 목적 순서와 계산 한도는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
+Fleet 평가기는 유효한 PRIMARY·SUPPLEMENTARY 증적 하나를 정확한 node/GPU/rank 집합 하나로만 투영합니다. 같은 evidence ID의 digest나 결합이 달라지면 닫히고, 새 실패·진행 중 실행이 있는 exact 집합에서는 오래된 통과 결과를 사용하지 않습니다. 선택된 후보끼리 노드 또는 GPU UUID가 한 개라도 겹치면 동시에 선택할 수 없습니다. 관리자 추천 API는 평가 전체를 별도 콘텐츠 주소 행으로 멱등 저장하며 `show`는 저장 기록일 뿐 현재 유효성 보증이 아닙니다. 클라이언트는 계산 한도나 network zone을 입력해 점수를 조작할 수 없습니다.
+
+Fleet 수락은 저장 스냅샷의 콘텐츠 무결성을 먼저 확인하고, 전용 트랜잭션 잠금과 고정 인벤토리 행 잠금 안에서 레지스트리·인벤토리·qualification·task·operation·예약 입력으로 전체 추천을 다시 계산합니다. 선택된 각 후보는 `TP=1`, exact 노드·GPU index·GPU UUID·rank·STAGE/FULL identity와 전체 실행 plan 정규 digest가 생성 plan과 다시 일치해야 합니다. 모든 generation 1 배포와 활성 예약은 한 트랜잭션으로 생성되며, 일부만 성공한 Fleet는 허용하지 않습니다. 활성 노드와 GPU UUID에는 전역 조건부 unique 제약을 적용하고 Fleet 내부에도 노드·GPU·deployment/rank 중복 금지를 둡니다. 노드 UUID가 달라도 같은 GPU UUID를 보고하면 충돌로 취급하며 다른 단일 배포, qualification, benchmark, 캐시 격리와 무관한 task는 이 예약을 우회할 수 없습니다.
+
+추천 수락이 만드는 권한은 중앙 DB의 `CREATED` 배포와 예약뿐입니다. Agent task, 자격 증명, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지 또는 기존 서비스 변경 권한은 부여하지 않습니다. 후속 전용 Fleet runtime이 추가되기 전에는 기존 단일 배포 준비·task·rollout API도 Fleet 소속 세대를 `FLEET_RUNTIME_NOT_AVAILABLE`로 거부합니다. 상세 목적 순서와 계산 한도, 수락 경계는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
 
 ## 모델 레지스트리, 승격 게이트와 추천 수락의 경계
 

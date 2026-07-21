@@ -121,6 +121,12 @@ from .fleet_recommendation import (
     recommend_fleet,
     show_fleet_recommendation,
 )
+from .fleet_acceptance import (
+    FleetAcceptanceError,
+    FleetNotFoundError,
+    accept_fleet_recommendation,
+    show_fleet,
+)
 from .qualification import (
     QUALIFICATION_STEPS,
     ProfileQualificationError,
@@ -541,6 +547,10 @@ class FleetRecommendationCreate(StrictBody):
                     "minimum replica counts must be non-negative integers"
                 )
         return self
+
+
+class FleetRecommendationAccept(StrictBody):
+    pass
 
 
 class DeploymentRecommendationAccept(StrictBody):
@@ -1809,6 +1819,50 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         try:
             return show_fleet_recommendation(session, recommendation_id)
         except FleetRecommendationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except FleetRecommendationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
+
+    @app.post(
+        "/v1/admin/fleet-recommendations/{recommendation_id}/accept",
+        dependencies=[Depends(admin_auth)],
+    )
+    def fleet_recommendation_accept(
+        recommendation_id: str,
+        body: FleetRecommendationAccept,
+        session: Session = Depends(get_session),
+    ):
+        del body
+        try:
+            return accept_fleet_recommendation(session, recommendation_id)
+        except FleetRecommendationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except (FleetAcceptanceError, FleetRecommendationError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
+        except RecommendationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
+
+    @app.get(
+        "/v1/admin/fleets/{fleet_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def fleet_get(
+        fleet_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return show_fleet(session, fleet_id)
+        except FleetNotFoundError as exc:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, exc.to_detail()
             ) from exc

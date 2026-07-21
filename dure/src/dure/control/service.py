@@ -69,6 +69,11 @@ from .models import (
     utcnow,
 )
 from .qualification import active_profile_qualification_nodes
+from .resource_reservation import (
+    FleetResourceReservationError,
+    ensure_fleet_reservation_scope,
+    lock_fleet_reservation_gate,
+)
 from .rollout import (
     DeploymentRolloutConflictError,
     PHASE_TASK_TYPES,
@@ -342,6 +347,7 @@ def prepare_or_apply_artifact_cache_quarantine(
         from .cache_lifecycle import request_cache_quarantine
         from .models import NodeArtifactCache
 
+        lock_fleet_reservation_gate(session)
         locked_node = session.scalar(
             select(Node)
             .join(NodeArtifactCache, NodeArtifactCache.node_id == Node.id)
@@ -354,6 +360,18 @@ def prepare_or_apply_artifact_cache_quarantine(
                 "artifact cache node is unavailable",
                 code="ARTIFACT_CACHE_NODE_UNAVAILABLE",
             )
+        try:
+            ensure_fleet_reservation_scope(
+                session,
+                node_ids=[node_id],
+                gate_locked=True,
+            )
+        except FleetResourceReservationError as exc:
+            raise ArtifactCacheControlError(
+                str(exc),
+                code=exc.code,
+                details=exc.details,
+            ) from exc
         cache = _artifact_cache_projection(session, cache_id)
         current_identity = _validated_cache_control_projection(cache, cache_id)
         if current_identity != (node_id, cache_kind, cache_identity_digest):
@@ -1425,12 +1443,15 @@ def _mark_node_unjoined(session: Session, node: Node, *, actor: str) -> None:
 
 def unjoin_node(session: Session, node_id: str) -> bool:
     try:
+        lock_fleet_reservation_gate(session)
         node = session.scalar(
             select(Node).where(Node.id == node_id).with_for_update()
         )
         if node is None:
             return False
-        _ensure_deployment_node_scope_available(session, [node_id])
+        _ensure_deployment_node_scope_available(
+            session, [node_id], gate_locked=True
+        )
         _mark_node_unjoined(session, node, actor=f"node:{node_id}")
         session.commit()
         return True
@@ -1996,6 +2017,7 @@ def apply_benchmark_run(
     ).one_or_none()
     if identity is None:
         raise BenchmarkRunNotFoundError("benchmark run not found")
+    lock_fleet_reservation_gate(session)
     locked_release = session.scalar(
         select(ModelRelease)
         .where(ModelRelease.id == identity.release_id)
@@ -2054,6 +2076,36 @@ def apply_benchmark_run(
                 "actual_agent_version": locked_node.agent_version,
             },
         )
+
+    selected_gpu_uuids: list[str] = []
+    profile_record = session.get(NodeProfileRecord, locked_node.id)
+    if profile_record is not None:
+        try:
+            current_profile = NodeProfile.from_dict(profile_record.profile)
+            healthy_gpus = [gpu for gpu in current_profile.gpus if gpu.healthy]
+            if healthy_gpus:
+                selected_gpu = max(
+                    healthy_gpus,
+                    key=lambda gpu: (gpu.memory_mib, -gpu.index),
+                )
+                selected_gpu_uuids = [selected_gpu.uuid]
+        except (KeyError, TypeError, ValueError):
+            # benchmark_context below returns the closed context error; this
+            # guard only adds the exact GPU identity when it is representable.
+            pass
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=[locked_node.id],
+            gpu_uuids=selected_gpu_uuids,
+            gate_locked=True,
+        )
+    except FleetResourceReservationError as exc:
+        raise BenchmarkRunError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
 
     active_task = session.scalar(
         select(Task)
@@ -2663,12 +2715,44 @@ def _lock_deployment_task_nodes(
     return {node.id: node for node in nodes}
 
 
+def _ensure_fleet_reservation_scope_available(
+    session: Session,
+    node_ids: list[str],
+    *,
+    deployment: Deployment | None = None,
+    gate_locked: bool = False,
+) -> None:
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=node_ids,
+            deployment=deployment,
+            gate_locked=gate_locked,
+        )
+    except FleetResourceReservationError as exc:
+        raise DeploymentRolloutConflictError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
+
+
 def _ensure_deployment_node_scope_available(
-    session: Session, node_ids: list[str]
+    session: Session,
+    node_ids: list[str],
+    *,
+    deployment: Deployment | None = None,
+    gate_locked: bool = False,
 ) -> None:
     requested = set(node_ids)
     if not requested:
         return
+    _ensure_fleet_reservation_scope_available(
+        session,
+        node_ids,
+        deployment=deployment,
+        gate_locked=gate_locked,
+    )
     for operation in session.scalars(
         select(DeploymentOperation).where(
             DeploymentOperation.active_lineage_id.is_not(None)
@@ -2755,17 +2839,42 @@ def create_tasks(
         bulk_id = str(uuid.uuid4())
         tasks: list[Task] = []
         errors: dict[str, str] = {}
+        lock_fleet_reservation_gate(session)
         locked_nodes = _lock_deployment_task_nodes(session, node_ids)
         deployment = (
             session.get(Deployment, deployment_id) if deployment_id else None
         )
         if task_type in DEPLOYMENT_TASK_TYPES and deployment is None:
             raise ValueError("a valid deployment_id is required")
+        if (
+            deployment is not None
+            and deployment.fleet_id is not None
+            and task_type in DEPLOYMENT_TASK_TYPES
+        ):
+            raise DeploymentRolloutConflictError(
+                "Fleet deployment runtime requires the dedicated Fleet workflow",
+                code="FLEET_RUNTIME_NOT_AVAILABLE",
+                details={
+                    "fleet_id": deployment.fleet_id,
+                    "deployment_id": deployment.id,
+                },
+            )
         if deployment is not None and task_type in DEPLOYMENT_TASK_TYPES:
             _lock_deployment_lineage_for_task_creation(session, deployment)
-            _ensure_deployment_node_scope_available(session, node_ids)
+            _ensure_deployment_node_scope_available(
+                session,
+                node_ids,
+                deployment=deployment,
+                gate_locked=True,
+            )
         elif task_type == TaskType.UNJOIN_NODE:
-            _ensure_deployment_node_scope_available(session, node_ids)
+            _ensure_deployment_node_scope_available(
+                session, node_ids, gate_locked=True
+            )
+        else:
+            _ensure_fleet_reservation_scope_available(
+                session, node_ids, gate_locked=True
+            )
         effective_plan = deployment.plan if deployment is not None else None
         if deployment is not None and deployment.source_recommendation_id is not None:
             from .preparation import effective_deployment_plan

@@ -21,6 +21,7 @@ from dure.selector import InventoryNode, _gpu_architecture
 
 from .models import (
     AuditEvent,
+    Deployment,
     DeploymentOperation,
     ModelArtifact,
     ModelRelease,
@@ -34,6 +35,10 @@ from .models import (
     Task,
     TaskStatus,
     utcnow,
+)
+from .resource_reservation import (
+    active_fleet_reservations,
+    lock_fleet_reservation_gate,
 )
 
 
@@ -181,25 +186,84 @@ def _qualification_occupancy(
 ) -> dict[str, str]:
     requested = {item.node_id for item in inventory}
     reasons: dict[str, str] = {}
-    for node_id, run_id in active_profile_qualification_nodes(
-        session, requested, exclude_run_id=exclude_run_id
-    ).items():
-        reasons.setdefault(node_id, f"ACTIVE_PROFILE_QUALIFICATION:{run_id}")
-    for node_id, task_id in session.execute(
-        select(Task.node_id, Task.id).where(
-            Task.node_id.in_(requested),
+    gpu_nodes: dict[str, set[str]] = {}
+    for item in inventory:
+        if item.profile is None:
+            continue
+        for gpu in item.profile.gpus:
+            gpu_nodes.setdefault(gpu.uuid, set()).add(item.node_id)
+    for reservation in active_fleet_reservations(
+        session,
+        node_ids=requested,
+        gpu_uuids=gpu_nodes,
+    ):
+        affected = set(gpu_nodes.get(reservation.gpu_uuid, set()))
+        if reservation.node_id in requested:
+            affected.add(reservation.node_id)
+        for node_id in sorted(affected):
+            reasons.setdefault(
+                node_id,
+                "ACTIVE_FLEET_RESERVATION:"
+                f"{reservation.fleet_id}:{reservation.deployment_id}",
+            )
+    active_runs = select(ProfileQualificationRun).where(
+        ProfileQualificationRun.status == "QUALIFYING"
+    )
+    if exclude_run_id is not None:
+        active_runs = active_runs.where(
+            ProfileQualificationRun.id != exclude_run_id
+        )
+    for run in session.scalars(active_runs.order_by(ProfileQualificationRun.id)):
+        affected = set(run.node_ids)
+        for binding in run.gpu_bindings or []:
+            if isinstance(binding, dict):
+                affected.update(
+                    gpu_nodes.get(binding.get("gpu_uuid"), set())
+                )
+        for affected_node_id in sorted(affected):
+            if affected_node_id in requested:
+                reasons.setdefault(
+                    affected_node_id,
+                    f"ACTIVE_PROFILE_QUALIFICATION:{run.id}",
+                )
+    for node_id, task_id, deployment_id in session.execute(
+        select(Task.node_id, Task.id, Task.deployment_id).where(
             Task.status.in_(
                 {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
             ),
         )
     ):
-        reasons.setdefault(node_id, f"ACTIVE_TASK:{task_id}")
+        affected = {node_id}
+        deployment = (
+            session.get(Deployment, deployment_id)
+            if deployment_id is not None
+            else None
+        )
+        if deployment is not None and isinstance(deployment.plan, dict):
+            for assignment in deployment.plan.get("assignments", []):
+                if isinstance(assignment, dict):
+                    affected.update(
+                        gpu_nodes.get(assignment.get("gpu_uuid"), set())
+                    )
+        for affected_node_id in sorted(affected):
+            if affected_node_id in requested:
+                reasons.setdefault(
+                    affected_node_id, f"ACTIVE_TASK:{task_id}"
+                )
     for operation in session.scalars(
         select(DeploymentOperation).where(
             DeploymentOperation.active_lineage_id.is_not(None)
         )
     ):
-        for node_id in operation.node_ids:
+        affected = set(operation.node_ids)
+        deployment = session.get(Deployment, operation.deployment_id)
+        if deployment is not None and isinstance(deployment.plan, dict):
+            for assignment in deployment.plan.get("assignments", []):
+                if isinstance(assignment, dict):
+                    affected.update(
+                        gpu_nodes.get(assignment.get("gpu_uuid"), set())
+                    )
+        for node_id in affected:
             if node_id in requested:
                 reasons.setdefault(
                     node_id, f"ACTIVE_DEPLOYMENT_OPERATION:{operation.id}"
@@ -634,6 +698,8 @@ def prepare_profile_qualification(
         raise ValueError("unsupported qualification purpose")
     for node_id in node_ids:
         _canonical_uuid(node_id, field="node_id")
+    if apply:
+        lock_fleet_reservation_gate(session)
     placement = session.scalar(
         select(PlacementProfileRecord)
         .where(PlacementProfileRecord.id == placement_id)

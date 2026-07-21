@@ -61,6 +61,11 @@ from .models import (
 )
 from .qualification import active_profile_qualification_nodes
 from .recommendation import RecommendationError, evaluate_deployment_recommendation
+from .resource_reservation import (
+    FleetResourceReservationError,
+    ensure_fleet_reservation_scope,
+    lock_fleet_reservation_gate,
+)
 from .stage_artifacts import (
     StageArtifactConflictError,
     StageArtifactNotFoundError,
@@ -1396,6 +1401,7 @@ def prepare_deployment_artifacts(
     now: datetime | None = None,
 ) -> tuple[ArtifactPreparation, list[Task], bool]:
     _canonical_uuid(request_id, "request_id")
+    lock_fleet_reservation_gate(session)
     candidate = session.get(Deployment, deployment_id)
     if candidate is None:
         raise ArtifactPreparationNotFoundError(
@@ -1440,6 +1446,29 @@ def prepare_deployment_artifacts(
             code="PREPARATION_PLAN_CONFLICT",
             details={"deployment_id": deployment_id},
         )
+    if deployment.fleet_id is not None:
+        raise ArtifactPreparationError(
+            "Fleet deployment runtime requires the dedicated Fleet workflow",
+            code="FLEET_RUNTIME_NOT_AVAILABLE",
+            details={
+                "fleet_id": deployment.fleet_id,
+                "deployment_id": deployment.id,
+            },
+        )
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=candidate_node_ids,
+            deployment=deployment,
+            plan=candidate_plan,
+            gate_locked=True,
+        )
+    except FleetResourceReservationError as exc:
+        raise ArtifactPreparationError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
     request_digest = _digest(
         _request_identity(
             deployment,
@@ -1491,6 +1520,7 @@ def prepare_deployment_artifacts(
                 # be rolled back merely because the subsequent retry safety
                 # gates (for example approval) reject a new attempt.
                 session.commit()
+                lock_fleet_reservation_gate(session)
                 list(
                     session.scalars(
                         select(Node)
@@ -1517,6 +1547,20 @@ def prepare_deployment_artifacts(
                         "preparation disappeared after lease fencing",
                         code="PREPARATION_ATTEMPT_CONFLICT",
                     )
+                try:
+                    ensure_fleet_reservation_scope(
+                        session,
+                        node_ids=candidate_node_ids,
+                        deployment=deployment,
+                        plan=deployment.plan,
+                        gate_locked=True,
+                    )
+                except FleetResourceReservationError as exc:
+                    raise ArtifactPreparationError(
+                        str(exc),
+                        code=exc.code,
+                        details=exc.details,
+                    ) from exc
                 if now is None:
                     evaluated_at = utcnow()
         if not apply or existing.status == "SUCCEEDED" or _active_attempts(

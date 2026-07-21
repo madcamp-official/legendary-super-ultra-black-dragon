@@ -652,6 +652,39 @@ class FleetRecommendationCLITests(unittest.TestCase):
             json.dumps(FakeJSONClient.response, indent=2, sort_keys=True) + "\n",
         )
 
+    def test_accept_posts_an_explicit_empty_body_to_the_exact_endpoint(self):
+        recommendation_id = "sha256:" + "b" * 64
+        fleet_id = "00000000-0000-4000-8000-000000000099"
+        FakeJSONClient.response = {
+            "fleet": {
+                "id": fleet_id,
+                "source_recommendation_id": recommendation_id,
+                "status": "ACCEPTED",
+            },
+            "created": True,
+        }
+
+        result, output, error = self.run_cli("accept", recommendation_id)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            FakeJSONClient.calls,
+            [
+                (
+                    "https://control.example",
+                    "admin-token",
+                    "POST",
+                    f"/v1/admin/fleet-recommendations/{recommendation_id}/accept",
+                    {},
+                )
+            ],
+        )
+        self.assertEqual(
+            output,
+            json.dumps(FakeJSONClient.response, indent=2, sort_keys=True) + "\n",
+        )
+
     def test_recommend_rejects_invalid_policy_syntax_before_any_request(self):
         common = [
             "admin",

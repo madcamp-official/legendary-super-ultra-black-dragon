@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from dure.catalog import ModelCatalog
@@ -26,7 +26,9 @@ from dure.resource_pool import FLEET_MODEL_IDS, build_gpu_pool_snapshot
 from dure.selector import InventoryNode, recommend_model
 
 from .models import (
+    Deployment,
     DeploymentOperation,
+    FleetResourceReservation,
     Node,
     ProfileQualificationEvidence,
     ProfileQualificationRun,
@@ -34,18 +36,18 @@ from .models import (
     TaskStatus,
     utcnow,
 )
-from .qualification import active_profile_qualification_nodes
 from .recommendation import (
     _FULL_SNAPSHOT_AGENT_VERSION,
     _active_catalog,
     _agent_supports,
+    _build_generation_plan,
     _inventory_nodes,
     _strict_candidate_rejections,
     canonical_inventory_snapshot,
 )
 
 
-FLEET_CANDIDATE_POLICY_VERSION = "fleet-candidate-v1"
+FLEET_CANDIDATE_POLICY_VERSION = "fleet-candidate-v2"
 FLEET_SCHEDULER_VERSION = "fleet-set-packing-v1"
 
 
@@ -72,34 +74,111 @@ def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _plan_contract_digest(plan: dict[str, Any]) -> str:
+    """Bind every runtime field except the acceptance-assigned generation ID."""
+
+    if not isinstance(plan, dict):
+        raise ValueError("Fleet generation plan must be an object")
+    contract = dict(plan)
+    contract.pop("deployment_id", None)
+    contract.pop("generation", None)
+    return _digest(contract)
+
+
 def _fleet_occupancy(
     session: Session,
     inventory: list[InventoryNode],
 ) -> dict[str, str]:
     requested = {item.node_id for item in inventory}
     reasons: dict[str, str] = {}
-    for node_id, run_id in active_profile_qualification_nodes(
-        session, requested
-    ).items():
-        reasons.setdefault(
-            node_id,
-            f"ACTIVE_PROFILE_QUALIFICATION:{run_id}",
+    gpu_nodes: dict[str, set[str]] = {}
+    for item in inventory:
+        if item.profile is None:
+            continue
+        for gpu in item.profile.gpus:
+            gpu_nodes.setdefault(gpu.uuid, set()).add(item.node_id)
+    reservation_filter = []
+    if requested:
+        reservation_filter.append(
+            FleetResourceReservation.node_id.in_(requested)
         )
-    for node_id, task_id in session.execute(
-        select(Task.node_id, Task.id).where(
-            Task.node_id.in_(requested),
+    if gpu_nodes:
+        reservation_filter.append(
+            FleetResourceReservation.gpu_uuid.in_(gpu_nodes)
+        )
+    if reservation_filter:
+        for reservation in session.scalars(
+            select(FleetResourceReservation)
+            .where(
+                FleetResourceReservation.released_at.is_(None),
+                or_(*reservation_filter),
+            )
+            .order_by(FleetResourceReservation.node_id)
+        ):
+            affected = set(gpu_nodes.get(reservation.gpu_uuid, set()))
+            if reservation.node_id in requested:
+                affected.add(reservation.node_id)
+            for node_id in sorted(affected):
+                reasons.setdefault(
+                    node_id,
+                    "ACTIVE_FLEET_RESERVATION:"
+                    f"{reservation.fleet_id}:{reservation.gpu_uuid}",
+                )
+    for run in session.scalars(
+        select(ProfileQualificationRun)
+        .where(ProfileQualificationRun.status == "QUALIFYING")
+        .order_by(ProfileQualificationRun.id)
+    ):
+        affected = set(run.node_ids)
+        for binding in run.gpu_bindings or []:
+            if isinstance(binding, dict):
+                affected.update(
+                    gpu_nodes.get(binding.get("gpu_uuid"), set())
+                )
+        for affected_node_id in sorted(affected):
+            if affected_node_id in requested:
+                reasons.setdefault(
+                    affected_node_id,
+                    f"ACTIVE_PROFILE_QUALIFICATION:{run.id}",
+                )
+    for node_id, task_id, deployment_id in session.execute(
+        select(Task.node_id, Task.id, Task.deployment_id).where(
             Task.status.in_(
                 {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
             ),
         )
     ):
-        reasons.setdefault(node_id, f"ACTIVE_TASK:{task_id}")
+        affected = {node_id}
+        deployment = (
+            session.get(Deployment, deployment_id)
+            if deployment_id is not None
+            else None
+        )
+        if deployment is not None and isinstance(deployment.plan, dict):
+            for assignment in deployment.plan.get("assignments", []):
+                if isinstance(assignment, dict):
+                    affected.update(
+                        gpu_nodes.get(assignment.get("gpu_uuid"), set())
+                    )
+        for affected_node_id in sorted(affected):
+            if affected_node_id in requested:
+                reasons.setdefault(
+                    affected_node_id, f"ACTIVE_TASK:{task_id}"
+                )
     for operation in session.scalars(
         select(DeploymentOperation).where(
             DeploymentOperation.active_lineage_id.is_not(None)
         )
     ):
-        for node_id in operation.node_ids:
+        affected = set(operation.node_ids)
+        deployment = session.get(Deployment, operation.deployment_id)
+        if deployment is not None and isinstance(deployment.plan, dict):
+            for assignment in deployment.plan.get("assignments", []):
+                if isinstance(assignment, dict):
+                    affected.update(
+                        gpu_nodes.get(assignment.get("gpu_uuid"), set())
+                    )
+        for node_id in affected:
             if node_id in requested:
                 reasons.setdefault(
                     node_id,
@@ -398,6 +477,32 @@ def _project_candidates(
                 )
                 continue
 
+            stage_node_bindings: list[dict[str, Any]] | None = None
+            if context.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE:
+                stage_ranks = context.get("stage_ranks")
+                if (
+                    not isinstance(stage_ranks, list)
+                    or len(stage_ranks) != len(run.rank_node_ids)
+                    or len(stage_ranks) != len(projected_bindings)
+                    or any(not isinstance(item, dict) for item in stage_ranks)
+                ):
+                    rejections.append(
+                        {
+                            "catalog_candidate_id": entry.candidate_id,
+                            "evidence_id": binding.evidence_id,
+                            "code": "STAGE_RANK_BINDING_INVALID",
+                            "node_ids": sorted(candidate_node_ids),
+                        }
+                    )
+                    continue
+                stage_node_bindings = [
+                    {
+                        "node_id": run.rank_node_ids[rank],
+                        **stage_ranks[rank],
+                    }
+                    for rank in range(len(stage_ranks))
+                ]
+
             evidence = session.get(
                 ProfileQualificationEvidence,
                 binding.evidence_id,
@@ -480,6 +585,7 @@ def _project_candidates(
             details[candidate_id] = {
                 **scheduler_candidate.to_dict(),
                 **context,
+                "candidate_id": candidate_id,
                 "catalog_candidate_id": entry.candidate_id,
                 "placement_profile_id": entry.placement.profile_id,
                 "qualification_purpose": run.workload.get(
@@ -489,6 +595,10 @@ def _project_candidates(
                 "gpu_bindings": projected_bindings,
                 "qualification_registered_at": binding.registered_at,
             }
+            if stage_node_bindings is not None:
+                details[candidate_id]["stage_node_bindings"] = (
+                    stage_node_bindings
+                )
     return (
         sorted(candidates, key=lambda item: item.candidate_id),
         details,
@@ -584,6 +694,31 @@ def evaluate_fleet_schedule(
             max_candidates=max_candidates,
             max_search_states=max_search_states,
         )
+
+    # Freeze the complete runtime plan contract in the content-addressed
+    # recommendation. Deployment ID and generation are assigned only when the
+    # operator accepts the recommendation, so they are excluded from this
+    # digest and validated separately by the acceptance service.
+    for scheduled in schedule.selected:
+        detail = candidate_details[scheduled.candidate_id]
+        selected = dict(detail)
+        selected.update(
+            {
+                "feasible": True,
+                "node_ids": sorted(item["node_id"] for item in detail["bindings"]),
+                "rejections": [],
+            }
+        )
+        contract_plan = _build_generation_plan(
+            session,
+            recommendation={
+                "id": "fleet-plan-contract",
+                "selected": selected,
+            },
+            deployment_id="00000000-0000-4000-8000-000000000000",
+            generation=1,
+        )
+        detail["plan_contract_digest"] = _plan_contract_digest(contract_plan)
 
     selected_ids = {item.candidate_id for item in schedule.selected}
     selected_nodes = set(schedule.used_node_ids)

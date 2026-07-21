@@ -1,3 +1,11 @@
+dure (0.3.31) UNRELEASED; urgency=medium
+
+  * 불변 Fleet 추천 수락 시 모든 배포 세대와 노드·GPU 예약을 원자적으로 생성합니다.
+  * 추천 입력과 qualification 증적을 잠금 안에서 재검사하고 부분 Fleet 생성을 금지합니다.
+  * 활성 Fleet 예약을 다른 배포·작업·qualification이 우회하지 못하게 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:50:00 +0900
+
 dure (0.3.30) UNRELEASED; urgency=medium
 
   * 다중 배포 Fleet 추천을 콘텐츠 주소 불변 스냅샷으로 저장합니다.

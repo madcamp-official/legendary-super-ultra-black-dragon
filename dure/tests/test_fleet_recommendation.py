@@ -4,12 +4,17 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import ANY, patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from dure.control.api import create_app
 from dure.control.db import Base, make_engine, make_session_factory
+from dure.control.fleet_acceptance import (
+    FleetAcceptanceError,
+    accept_fleet_recommendation,
+)
 from dure.control.fleet_recommendation import (
     FleetRecommendationConflictError,
     FleetRecommendationError,
@@ -24,6 +29,8 @@ from dure.control.models import (
     Deployment,
     DeploymentRecommendationRecord,
     FleetRecommendationRecord,
+    FleetRecord,
+    FleetResourceReservation,
     Node,
     NodeProfileRecord,
     Task,
@@ -122,6 +129,23 @@ class FleetRecommendationServiceTests(unittest.TestCase):
             )
             self.assertEqual(shown["recommendation"], recommendation)
             self.assertEqual(shown["recorded_at"], first["recorded_at"])
+
+            with self.assertRaises(FleetAcceptanceError) as unmet:
+                accept_fleet_recommendation(session, recommendation["id"])
+            self.assertEqual(
+                unmet.exception.code,
+                "FLEET_MINIMUM_REPLICAS_UNMET",
+            )
+            for model in (
+                FleetRecord,
+                Deployment,
+                FleetResourceReservation,
+                Task,
+            ):
+                self.assertEqual(
+                    session.scalar(select(func.count()).select_from(model)),
+                    0,
+                )
 
     def test_all_online_freezes_the_observed_node_set(self):
         with self.factory() as session:
@@ -329,6 +353,89 @@ class FleetRecommendationAPITests(unittest.TestCase):
         self.assertEqual(
             unknown_node.json()["detail"]["code"],
             "RECOMMENDATION_NODE_NOT_FOUND",
+        )
+
+    def test_accept_and_fleet_show_require_auth_and_strict_empty_body(self):
+        recommendation_id = "sha256:" + "a" * 64
+        fleet_id = str(uuid.uuid4())
+        accepted_payload = {
+            "fleet": {
+                "id": fleet_id,
+                "source_recommendation_id": recommendation_id,
+                "status": "ACCEPTED",
+                "deployments": [],
+                "reservations": [],
+                "created_at": "2026-07-21T00:00:00+00:00",
+            },
+            "created": True,
+        }
+
+        unauthorized_accept = self.client.post(
+            f"/v1/admin/fleet-recommendations/{recommendation_id}/accept",
+            json={},
+        )
+        self.assertEqual(unauthorized_accept.status_code, 401)
+        unauthorized_show = self.client.get(f"/v1/admin/fleets/{fleet_id}")
+        self.assertEqual(unauthorized_show.status_code, 401)
+
+        with patch(
+            "dure.control.api.accept_fleet_recommendation",
+            return_value=accepted_payload,
+        ) as accept:
+            strict = self.client.post(
+                f"/v1/admin/fleet-recommendations/{recommendation_id}/accept",
+                headers=self.admin,
+                json={"apply": True},
+            )
+            self.assertEqual(strict.status_code, 422, strict.text)
+            accept.assert_not_called()
+
+            accepted = self.client.post(
+                f"/v1/admin/fleet-recommendations/{recommendation_id}/accept",
+                headers=self.admin,
+                json={},
+            )
+            self.assertEqual(accepted.status_code, 200, accepted.text)
+            self.assertEqual(accepted.json(), accepted_payload)
+            accept.assert_called_once_with(ANY, recommendation_id)
+
+        with patch(
+            "dure.control.api.show_fleet",
+            return_value={"fleet": accepted_payload["fleet"]},
+        ) as show:
+            shown = self.client.get(
+                f"/v1/admin/fleets/{fleet_id}",
+                headers=self.admin,
+            )
+            self.assertEqual(shown.status_code, 200, shown.text)
+            self.assertEqual(shown.json(), {"fleet": accepted_payload["fleet"]})
+            show.assert_called_once_with(ANY, fleet_id)
+
+    def test_accept_and_fleet_show_return_structured_not_found_errors(self):
+        missing_recommendation = self.client.post(
+            "/v1/admin/fleet-recommendations/sha256:" + "0" * 64 + "/accept",
+            headers=self.admin,
+            json={},
+        )
+        self.assertEqual(
+            missing_recommendation.status_code,
+            404,
+            missing_recommendation.text,
+        )
+        self.assertEqual(
+            missing_recommendation.json()["detail"]["code"],
+            "FLEET_RECOMMENDATION_NOT_FOUND",
+        )
+
+        fleet_id = str(uuid.uuid4())
+        missing_fleet = self.client.get(
+            f"/v1/admin/fleets/{fleet_id}",
+            headers=self.admin,
+        )
+        self.assertEqual(missing_fleet.status_code, 404, missing_fleet.text)
+        self.assertEqual(
+            missing_fleet.json()["detail"]["code"],
+            "FLEET_NOT_FOUND",
         )
 
 

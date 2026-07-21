@@ -46,11 +46,12 @@ DRAFT
 - 정상 GPU, 최소 VRAM, 지원 compute capability·GPU 아키텍처
 - 최소 디스크와 다중 노드의 고유한 사설 IPv4 주소
 - `QUEUED`·`RUNNING` 중앙 task 부재
+- 활성 Fleet 노드·GPU 예약 부재
 - 활성 배포 operation 부재
 - 다른 `QUALIFYING` 실행의 노드 예약 부재
 - Agent 인벤토리에 관측된 실행 중 작업 부하 부재
 
-점유 노드는 `NODE_OCCUPIED`와 구조화된 점유 사유로 거부합니다. qualification이 기존 서비스와 GPU를 공유할 수 있다고 추측하지 않습니다.
+점유 노드는 `NODE_OCCUPIED`와 구조화된 점유 사유로 거부합니다. 활성 Fleet 예약은 `ACTIVE_FLEET_RESERVATION:<fleet-id>:<deployment-id>`로 식별하며, `apply=true`는 예약 경계와 인벤토리를 잠근 상태에서 다시 검사합니다. qualification이 기존 서비스나 수락된 Fleet와 GPU를 공유할 수 있다고 추측하지 않습니다.
 
 기본 준비는 preview입니다.
 

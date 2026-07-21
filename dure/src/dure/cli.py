@@ -278,6 +278,13 @@ def _parser() -> argparse.ArgumentParser:
     fleet_show.add_argument(
         "recommendation_id", type=_non_empty_identifier_argument
     )
+    fleet_accept = fleet_sub.add_parser(
+        "accept",
+        help="Atomically create deployment generations and reserve their nodes/GPUs",
+    )
+    fleet_accept.add_argument(
+        "recommendation_id", type=_non_empty_identifier_argument
+    )
     deployment = admin_sub.add_parser("deployment")
     deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
     deployment_create = deployment_sub.add_parser("create")
@@ -800,6 +807,14 @@ def _admin(args: argparse.Namespace) -> int:
             value = client.request(
                 "GET",
                 f"/v1/admin/fleet-recommendations/{args.recommendation_id}",
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.fleet_command == "accept":
+            value = client.request(
+                "POST",
+                f"/v1/admin/fleet-recommendations/{args.recommendation_id}/accept",
+                {},
             )
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0

@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -75,6 +75,11 @@ from .models import (
     utcnow,
 )
 from .service import artifact_manifest_dict, aware, node_status
+from .resource_reservation import (
+    FleetResourceReservationError,
+    ensure_fleet_reservation_scope,
+    lock_fleet_reservation_gate,
+)
 from .stage_artifacts import (
     StageArtifactConflictError,
     StageArtifactNotFoundError,
@@ -1405,54 +1410,53 @@ def show_deployment_recommendation(
 def _lock_recommendation_inputs(
     session: Session, record: DeploymentRecommendationRecord
 ) -> None:
-    if session.get_bind().dialect.name == "postgresql":
-        session.execute(
-            text(
-                "LOCK TABLE artifact_chunks, artifact_manifests, "
-                "artifact_manifest_files, artifact_file_chunks, benchmark_evidence, "
-                "benchmark_runs, model_artifacts, model_releases, nodes, "
-                "node_profiles, placement_profiles, runtime_releases, "
-                "stage_artifact_variants, stage_artifact_ranks, "
-                "stage_artifact_validation_evidence, "
-                "stage_artifact_validation_ranks IN SHARE MODE"
+    # The immutable recommendation already freezes its observed node set. Lock
+    # those rows in the same Node -> NodeProfile order used by heartbeat and
+    # task completion, then re-evaluate every registry/evidence input. Broad
+    # table SHARE locks used here previously could deadlock with a completion
+    # that held a Node row and needed to flush its node/profile update.
+    node_ids = sorted(set(record.requested_node_ids))
+    if not node_ids:
+        inventory_snapshot = getattr(record, "inventory_snapshot", None)
+        if not isinstance(inventory_snapshot, list):
+            stored = getattr(record, "recommendation_snapshot", None)
+            evaluation = (
+                stored.get("evaluation") if isinstance(stored, dict) else None
             )
-        )
+            inventory_snapshot = (
+                evaluation.get("inventory_snapshot")
+                if isinstance(evaluation, dict)
+                else None
+            )
+        if isinstance(inventory_snapshot, list):
+            node_ids = sorted(
+                {
+                    item.get("node_id")
+                    for item in inventory_snapshot
+                    if isinstance(item, dict)
+                    and isinstance(item.get("node_id"), str)
+                }
+            )
+    if not node_ids:
         return
-    # Keep the fallback lock order identical across callers.  SQLite ignores
-    # FOR UPDATE, but this path is also exercised by databases that provide
-    # row locks without PostgreSQL table locks.
-    for model, order_by in (
-        (ArtifactChunk, (ArtifactChunk.digest,)),
-        (ArtifactManifest, (ArtifactManifest.digest,)),
-        (ArtifactManifestFile, (ArtifactManifestFile.id,)),
-        (ArtifactFileChunk, (ArtifactFileChunk.file_id, ArtifactFileChunk.ordinal)),
-        (BenchmarkEvidence, (BenchmarkEvidence.id,)),
-        (BenchmarkRun, (BenchmarkRun.id,)),
-        (ModelArtifact, (ModelArtifact.id,)),
-        (ModelRelease, (ModelRelease.id,)),
-        (PlacementProfileRecord, (PlacementProfileRecord.id,)),
-        (RuntimeRelease, (RuntimeRelease.id,)),
-        (StageArtifactVariant, (StageArtifactVariant.artifact_set_digest,)),
-        (StageArtifactRank, (StageArtifactRank.id,)),
-        (
-            StageArtifactValidationEvidence,
-            (StageArtifactValidationEvidence.identity_digest,),
-        ),
-        (
-            StageArtifactValidationRank,
-            (StageArtifactValidationRank.evidence_id, StageArtifactValidationRank.rank),
-        ),
-    ):
-        list(session.scalars(select(model).order_by(*order_by).with_for_update()))
-    node_statement = select(Node).order_by(Node.id)
-    profile_statement = select(NodeProfileRecord).order_by(NodeProfileRecord.node_id)
-    if record.selection_mode == "explicit_nodes":
-        node_statement = node_statement.where(Node.id.in_(record.requested_node_ids))
-        profile_statement = profile_statement.where(
-            NodeProfileRecord.node_id.in_(record.requested_node_ids)
+    list(
+        session.scalars(
+            select(Node)
+            .where(Node.id.in_(node_ids))
+            .order_by(Node.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-    list(session.scalars(node_statement.with_for_update()))
-    list(session.scalars(profile_statement.with_for_update()))
+    )
+    list(
+        session.scalars(
+            select(NodeProfileRecord)
+            .where(NodeProfileRecord.node_id.in_(node_ids))
+            .order_by(NodeProfileRecord.node_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
 
 
 def _best_gpu(profile: NodeProfile, minimum_mib: int):
@@ -1987,6 +1991,33 @@ def _previous_generation(
     return previous, lineage_id, previous.generation + 1
 
 
+def _raise_if_previous_lineage_operation_is_active(
+    session: Session, previous_generation_id: str | None
+) -> None:
+    """Preserve the specific lineage conflict before reporting inventory drift."""
+    if previous_generation_id is None:
+        return
+    lineage_id = session.scalar(
+        select(Deployment.lineage_id).where(
+            Deployment.id == previous_generation_id
+        )
+    )
+    if not isinstance(lineage_id, str):
+        return
+    active_operation = session.scalar(
+        select(DeploymentOperation)
+        .where(DeploymentOperation.active_lineage_id == lineage_id)
+        .order_by(DeploymentOperation.created_at, DeploymentOperation.id)
+        .limit(1)
+    )
+    if active_operation is not None:
+        raise RecommendationGenerationConflictError(
+            "deployment lineage has an active operation",
+            code="DEPLOYMENT_OPERATION_ACTIVE",
+            details={"operation_id": active_operation.id},
+        )
+
+
 def accept_deployment_recommendation(
     session: Session,
     recommendation_id: str,
@@ -1994,6 +2025,9 @@ def accept_deployment_recommendation(
     previous_generation_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    # Serialize with Fleet acceptance before taking recommendation, node, or
+    # deployment rows so all resource owners share one PostgreSQL lock order.
+    lock_fleet_reservation_gate(session)
     recommendation_record = session.scalar(
         select(DeploymentRecommendationRecord)
         .where(DeploymentRecommendationRecord.id == recommendation_id)
@@ -2045,6 +2079,12 @@ def accept_deployment_recommendation(
         current_snapshot != expected_snapshot
         or inventory_snapshot != recommendation_record.inventory_snapshot
     ):
+        # An operation created after recommendation persistence also changes
+        # the qualification occupancy projection. Keep the established,
+        # actionable lineage error instead of obscuring it as generic drift.
+        _raise_if_previous_lineage_operation_is_active(
+            session, previous_generation_id
+        )
         changed_fields = [
             field
             for field in (
@@ -2097,6 +2137,18 @@ def accept_deployment_recommendation(
                 "selected recommendation node inventory no longer exists",
                 details={"node_ids": normalized_selected_node_ids},
             )
+        try:
+            ensure_fleet_reservation_scope(
+                session,
+                node_ids=normalized_selected_node_ids,
+                gate_locked=True,
+            )
+        except FleetResourceReservationError as exc:
+            raise RecommendationNotAcceptableError(
+                str(exc),
+                code=exc.code,
+                details=exc.details,
+            ) from exc
         active_quarantine = session.execute(
             select(Task.id, Task.node_id)
             .where(
@@ -2134,6 +2186,23 @@ def accept_deployment_recommendation(
         deployment_id=deployment_id,
         generation=generation,
     )
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=[item["node_id"] for item in plan["assignments"]],
+            gpu_uuids=[
+                item["gpu_uuid"]
+                for item in plan["assignments"]
+                if isinstance(item.get("gpu_uuid"), str)
+            ],
+            gate_locked=True,
+        )
+    except FleetResourceReservationError as exc:
+        raise RecommendationNotAcceptableError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
     deployment = Deployment(
         id=deployment_id,
         lineage_id=lineage_id,

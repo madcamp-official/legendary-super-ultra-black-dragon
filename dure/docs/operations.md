@@ -399,10 +399,12 @@ DURE_RUN_VLLM_RAY_PP_ACCEPTANCE=1 \
 - `POST /v1/admin/deployment-recommendations/{id}/accept`: 현재 유효성 재검사 후 적용 전 배포 세대 생성
 - `POST /v1/admin/fleet-recommendations`: 네 모델의 exact 증적을 여러 비중첩 배포로 조합한 불변 Fleet 추천 저장
 - `GET /v1/admin/fleet-recommendations/{id}`: 저장 당시 Fleet 정책·후보·선택·미배정·증적 스냅샷 조회
+- `POST /v1/admin/fleet-recommendations/{id}/accept`: 현재 입력을 잠금 안에서 재평가하고 모든 배포 세대·노드·GPU 예약을 원자 생성
+- `GET /v1/admin/fleets/{id}`: 수락된 Fleet의 배포 세대와 exact 활성 예약 조회
 
 모든 경로는 관리자 전달자 인증을 요구합니다. 모델 리비전, 매니페스트, 런타임 이미지가 고정되지 않으면 등록할 수 없고, 허용 목록 밖의 Docker 인자·환경 변수·마운트·호스트 경로는 요청 단계에서 거부됩니다. 레지스트리 등록이나 상태 전이만으로 에이전트 작업 또는 호스트 변경이 발생하지 않습니다.
 
-Fleet 추천은 다음처럼 생성·조회합니다.
+Fleet 추천은 다음처럼 생성·조회·수락합니다.
 
 ```bash
 dure admin fleet recommend --all-online --objective quality-first
@@ -412,9 +414,12 @@ dure admin fleet recommend \
   --minimum-reserve-nodes 1 \
   --reserve-node <node-c>
 dure admin fleet show sha256:<64-hex>
+dure admin fleet accept sha256:<64-hex>
 ```
 
-`recommend`는 불변 추천 행 하나만 멱등 저장합니다. 모델 다운로드, 이미지 pull, 배포 세대, 노드·GPU 예약, Agent task와 컨테이너 변경은 만들지 않습니다. `show`는 저장 시점 기록이므로 현재 인벤토리의 유효성을 의미하지 않습니다. Fleet 수락·준비·적용 명령은 아직 제공하지 않습니다.
+`recommend`는 불변 추천 행 하나만 멱등 저장합니다. `show`는 저장 시점 기록이므로 현재 인벤토리의 유효성을 의미하지 않습니다. `accept`는 추천 전체를 현재 레지스트리·인벤토리·증적·점유 상태로 다시 계산해 byte-for-byte 같은 경우에만 선택된 모든 generation 1 배포와 exact 노드·GPU·rank 예약을 한 DB 트랜잭션으로 만듭니다. 최소 복제본이나 예비 노드 정책 미충족, 인벤토리 drift, 자원 중복이 하나라도 있으면 아무 Fleet도 만들지 않습니다. 같은 추천의 반복 수락은 기존 Fleet를 검증해 반환합니다.
+
+수락 결과의 배포 상태는 `CREATED`입니다. 수락만으로 모델 다운로드, 이미지 pull, Agent task, 컨테이너 실행·중지나 기존 서비스 변경은 일어나지 않습니다. Fleet 준비·적용 명령은 후속 단계이며, 현재 Fleet 소속 세대를 기존 단일 배포 준비·task·rollout API로 실행하려 하면 `FLEET_RUNTIME_NOT_AVAILABLE`로 거부합니다. 그 전까지 활성 예약이 다른 단일 배포·qualification·benchmark·아티팩트 준비·무관한 작업의 노드 선점을 차단합니다.
 
 ## stage artifact 생성·검증 운영
 

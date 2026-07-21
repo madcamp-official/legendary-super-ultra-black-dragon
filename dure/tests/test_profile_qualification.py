@@ -5,17 +5,24 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import func, select
 
 from dure.control.benchmark import promote_model_release
 from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.fleet import FleetEvaluationError, evaluate_fleet_schedule
+from dure.control.fleet_acceptance import (
+    FleetAcceptanceError,
+    accept_fleet_recommendation,
+)
 from dure.control.fleet_recommendation import recommend_fleet
 from dure.control.models import (
     Deployment,
     DeploymentRecommendationRecord,
     FleetRecommendationRecord,
+    FleetRecord,
+    FleetResourceReservation,
     Node,
     NodeProfileRecord,
     PlacementProfileRecord,
@@ -368,6 +375,21 @@ class ProfileQualificationTests(unittest.TestCase):
                     for item in stored_evaluation["schedule"]["selected"]
                 )
             )
+            selected_candidate_ids = sorted(
+                item["candidate_id"]
+                for item in stored_evaluation["schedule"]["selected"]
+            )
+            self.assertEqual(
+                selected_candidate_ids,
+                stored_evaluation["selected_candidate_ids"],
+            )
+            self.assertTrue(
+                all(
+                    candidate_id.startswith("sha256:")
+                    and len(candidate_id) == 71
+                    for candidate_id in selected_candidate_ids
+                )
+            )
             self.assertEqual(
                 session.scalar(
                     select(func.count()).select_from(
@@ -383,6 +405,208 @@ class ProfileQualificationTests(unittest.TestCase):
             self.assertEqual(
                 session.scalar(select(func.count()).select_from(Deployment)),
                 0,
+            )
+
+            overlapping = recommend_fleet(
+                session,
+                node_ids=node_ids,
+                all_online=False,
+                minimum_replicas={"qwen2.5-72b-awq": 2},
+            )
+            self.assertNotEqual(
+                stored["recommendation"]["id"],
+                overlapping["recommendation"]["id"],
+            )
+
+            stale_node_id = stored_evaluation["schedule"]["selected"][0][
+                "bindings"
+            ][0]["node_id"]
+            stale_profile = session.get(NodeProfileRecord, stale_node_id)
+            original_profile = copy.deepcopy(stale_profile.profile)
+            original_updated_at = stale_profile.updated_at
+            changed = copy.deepcopy(original_profile)
+            changed["gpus"][0]["memory_mib"] -= 1
+            stale_profile.profile = changed
+            stale_profile.updated_at = utcnow()
+            session.commit()
+
+            with self.assertRaises(FleetAcceptanceError) as stale:
+                accept_fleet_recommendation(
+                    session,
+                    stored["recommendation"]["id"],
+                )
+            self.assertEqual(stale.exception.code, "FLEET_RECOMMENDATION_STALE")
+            for model in (
+                FleetRecord,
+                Deployment,
+                FleetResourceReservation,
+                Task,
+            ):
+                self.assertEqual(
+                    session.scalar(select(func.count()).select_from(model)),
+                    0,
+                )
+
+            stale_profile = session.get(NodeProfileRecord, stale_node_id)
+            stale_profile.profile = original_profile
+            stale_profile.updated_at = original_updated_at
+            session.commit()
+
+            accepted = accept_fleet_recommendation(
+                session,
+                stored["recommendation"]["id"],
+            )
+            self.assertTrue(accepted["created"])
+            fleet = accepted["fleet"]
+            self.assertEqual(fleet["status"], "ACCEPTED")
+            self.assertEqual(
+                fleet["source_recommendation_id"],
+                stored["recommendation"]["id"],
+            )
+            self.assertEqual(len(fleet["deployments"]), 4)
+            self.assertEqual(len(fleet["reservations"]), 8)
+            self.assertEqual(
+                sorted(
+                    item["fleet_candidate_id"]
+                    for item in fleet["deployments"]
+                ),
+                selected_candidate_ids,
+            )
+            self.assertTrue(
+                all(
+                    item["generation"] == 1
+                    and item["status"] == "CREATED"
+                    and item["plan"]["tensor_parallel_size"] == 1
+                    and item["plan"]["generation"] == 1
+                    for item in fleet["deployments"]
+                )
+            )
+            reservation_node_ids = [
+                item["node_id"] for item in fleet["reservations"]
+            ]
+            reservation_gpu_uuids = [
+                item["gpu_uuid"] for item in fleet["reservations"]
+            ]
+            self.assertEqual(
+                len(reservation_node_ids), len(set(reservation_node_ids))
+            )
+            self.assertEqual(
+                len(reservation_gpu_uuids), len(set(reservation_gpu_uuids))
+            )
+            self.assertTrue(
+                all(item["released_at"] is None for item in fleet["reservations"])
+            )
+
+            expected_bindings = {
+                (
+                    item["node_id"],
+                    item["gpu_index"],
+                    item["gpu_uuid"],
+                    item["rank"],
+                )
+                for candidate in stored_evaluation["schedule"]["selected"]
+                for item in candidate["bindings"]
+            }
+            self.assertEqual(
+                {
+                    (
+                        item["node_id"],
+                        item["gpu_index"],
+                        item["gpu_uuid"],
+                        item["rank"],
+                    )
+                    for item in fleet["reservations"]
+                },
+                expected_bindings,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(FleetRecord)),
+                1,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Deployment)),
+                4,
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(FleetResourceReservation)
+                ),
+                8,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Task)),
+                0,
+            )
+
+            repeated = accept_fleet_recommendation(
+                session,
+                stored["recommendation"]["id"],
+            )
+            self.assertFalse(repeated["created"])
+            self.assertEqual(repeated["fleet"], fleet)
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(FleetRecord)),
+                1,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Deployment)),
+                4,
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(FleetResourceReservation)
+                ),
+                8,
+            )
+
+            tampered_deployment = session.get(
+                Deployment, fleet["deployments"][0]["id"]
+            )
+            original_plan = copy.deepcopy(tampered_deployment.plan)
+            changed_plan = copy.deepcopy(original_plan)
+            changed_plan["image"] = (
+                "registry.example/tampered@sha256:" + "9" * 64
+            )
+            tampered_deployment.plan = changed_plan
+            session.commit()
+            with self.assertRaises(FleetAcceptanceError) as tampered:
+                accept_fleet_recommendation(
+                    session,
+                    stored["recommendation"]["id"],
+                )
+            self.assertEqual(
+                tampered.exception.code,
+                "FLEET_GENERATION_IDENTITY_MISMATCH",
+            )
+            tampered_deployment = session.get(
+                Deployment, tampered_deployment.id
+            )
+            tampered_deployment.plan = original_plan
+            session.commit()
+
+            with patch(
+                "dure.control.fleet_acceptance.evaluate_fleet_recommendation",
+                return_value=overlapping["recommendation"],
+            ):
+                with self.assertRaises(FleetAcceptanceError) as conflict:
+                    accept_fleet_recommendation(
+                        session,
+                        overlapping["recommendation"]["id"],
+                    )
+            self.assertEqual(conflict.exception.code, "FLEET_RESOURCE_CONFLICT")
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(FleetRecord)),
+                1,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Deployment)),
+                4,
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(FleetResourceReservation)
+                ),
+                8,
             )
 
     def test_exact_gpu_evidence_validates_activates_and_feeds_recommendation(self):

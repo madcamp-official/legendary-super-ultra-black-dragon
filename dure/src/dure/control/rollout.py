@@ -27,6 +27,11 @@ from .models import (
     utcnow,
 )
 from .qualification import active_profile_qualification_nodes
+from .resource_reservation import (
+    FleetResourceReservationError,
+    ensure_fleet_reservation_scope,
+    lock_fleet_reservation_gate,
+)
 
 
 ROLLOUT_AGENT_VERSION = (0, 3, 12)
@@ -764,6 +769,34 @@ def _activate_operation(
 ) -> None:
     if operation.active_lineage_id == operation.lineage_id:
         return
+    lock_fleet_reservation_gate(session)
+    deployment = session.scalar(
+        select(Deployment)
+        .where(Deployment.id == operation.deployment_id)
+        .with_for_update()
+    )
+    if deployment is not None and deployment.fleet_id is not None:
+        raise DeploymentRolloutConflictError(
+            "Fleet deployment runtime requires the dedicated Fleet workflow",
+            code="FLEET_RUNTIME_NOT_AVAILABLE",
+            details={
+                "fleet_id": deployment.fleet_id,
+                "deployment_id": deployment.id,
+            },
+        )
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=operation.node_ids,
+            deployment=deployment,
+            gate_locked=True,
+        )
+    except FleetResourceReservationError as exc:
+        raise DeploymentRolloutConflictError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
     active = next(
         (
             item
@@ -855,8 +888,9 @@ def prepare_or_apply_rollback(
         )
     normalized_node_ids = _canonical_node_ids(node_ids)
     if apply:
-        # Mutation producers lock the complete node set before the lineage
-        # root. Generic task creation follows the same global order.
+        # Every resource mutation follows reservation gate -> ordered nodes ->
+        # lineage rows. This matches Fleet acceptance and generic task creation.
+        lock_fleet_reservation_gate(session)
         list(
             session.scalars(
                 select(Node)

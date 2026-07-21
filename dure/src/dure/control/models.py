@@ -20,6 +20,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -34,6 +35,26 @@ def utcnow() -> datetime:
 def _deployment_lineage_default(context: Any) -> str:
     """Keep legacy/manual deployments in a one-record lineage by default."""
     return str(context.get_current_parameters()["id"])
+
+
+def _canonical_uuid_check(column: str = "id") -> str:
+    hyphen_positions = {9, 14, 19, 24}
+    hexadecimal = ", ".join(
+        repr(character) for character in "0123456789abcdef"
+    )
+    character_checks = " AND ".join(
+        f"substr({column}, {position}, 1) IN ({hexadecimal})"
+        for position in range(1, 37)
+        if position not in hyphen_positions
+    )
+    return (
+        f"length({column}) = 36 AND {column} = lower({column}) "
+        f"AND substr({column}, 9, 1) = '-' "
+        f"AND substr({column}, 14, 1) = '-' "
+        f"AND substr({column}, 19, 1) = '-' "
+        f"AND substr({column}, 24, 1) = '-' "
+        f"AND {character_checks}"
+    )
 
 
 class Node(Base):
@@ -193,6 +214,54 @@ class FleetRecommendationRecord(Base):
         }
 
 
+class FleetRecord(Base):
+    """수락된 불변 Fleet 추천의 원자적 생성 단위."""
+
+    __tablename__ = "fleets"
+    __table_args__ = (
+        CheckConstraint(
+            _canonical_uuid_check(),
+            name="ck_fleets_id_canonical_uuid",
+        ),
+        CheckConstraint(
+            "status = 'ACCEPTED'",
+            name="ck_fleets_status",
+        ),
+        UniqueConstraint(
+            "source_recommendation_id",
+            name="uq_fleets_source_recommendation_id",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    source_recommendation_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "fleet_recommendations.id",
+            name="fk_fleets_source_recommendation_id",
+        ),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default="ACCEPTED", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source_recommendation_id": self.source_recommendation_id,
+            "status": self.status,
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+        }
+
+
 class Deployment(Base):
     __tablename__ = "deployments"
     __table_args__ = (
@@ -208,6 +277,27 @@ class Deployment(Base):
         UniqueConstraint(
             "source_recommendation_id",
             name="uq_deployments_source_recommendation_id",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "fleet_candidate_id",
+            name="uq_deployments_fleet_candidate_id",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "id",
+            name="uq_deployments_fleet_ownership",
+        ),
+        CheckConstraint(
+            "(fleet_id IS NULL AND fleet_candidate_id IS NULL) OR "
+            "(fleet_id IS NOT NULL AND fleet_candidate_id IS NOT NULL)",
+            name="ck_deployments_fleet_binding",
+        ),
+        CheckConstraint(
+            "fleet_candidate_id IS NULL OR "
+            "(length(fleet_candidate_id) = 71 "
+            "AND fleet_candidate_id LIKE 'sha256:%')",
+            name="ck_deployments_fleet_candidate_sha256",
         ),
     )
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -226,6 +316,13 @@ class Deployment(Base):
             name="fk_deployments_source_recommendation_id",
         )
     )
+    fleet_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "fleets.id",
+            name="fk_deployments_fleet_id",
+        )
+    )
+    fleet_candidate_id: Mapped[str | None] = mapped_column(String(71))
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     plan: Mapped[dict] = mapped_column(JSON, nullable=False)
     accept_model_download: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -233,6 +330,112 @@ class Deployment(Base):
     status: Mapped[str] = mapped_column(String(40), default="CREATED", nullable=False)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FleetResourceReservation(Base):
+    """Fleet 수락 트랜잭션에서 고정한 활성 노드·GPU 예약."""
+
+    __tablename__ = "fleet_resource_reservations"
+    __table_args__ = (
+        CheckConstraint(
+            _canonical_uuid_check(),
+            name="ck_fleet_resource_reservation_id_canonical_uuid",
+        ),
+        CheckConstraint(
+            "gpu_index >= 0",
+            name="ck_fleet_resource_reservation_gpu_index",
+        ),
+        CheckConstraint(
+            "gpu_uuid LIKE 'GPU-%' AND length(gpu_uuid) BETWEEN 5 AND 128",
+            name="ck_fleet_resource_reservation_gpu_uuid",
+        ),
+        CheckConstraint(
+            "rank >= 0",
+            name="ck_fleet_resource_reservation_rank",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "node_id",
+            name="uq_fleet_resource_reservations_fleet_node",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "gpu_uuid",
+            name="uq_fleet_resource_reservations_fleet_gpu_uuid",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "deployment_id",
+            "rank",
+            name="uq_fleet_resource_reservations_fleet_deployment_rank",
+        ),
+        ForeignKeyConstraint(
+            ["fleet_id", "deployment_id"],
+            ["deployments.fleet_id", "deployments.id"],
+            name="fk_fleet_resource_reservations_fleet_deployment",
+        ),
+        Index(
+            "ux_fleet_resource_reservations_active_node",
+            "node_id",
+            unique=True,
+            sqlite_where=text("released_at IS NULL"),
+            postgresql_where=text("released_at IS NULL"),
+        ),
+        Index(
+            "ux_fleet_resource_reservations_active_gpu_uuid",
+            "gpu_uuid",
+            unique=True,
+            sqlite_where=text("released_at IS NULL"),
+            postgresql_where=text("released_at IS NULL"),
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    fleet_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "fleets.id",
+            ondelete="CASCADE",
+            name="fk_fleet_resource_reservations_fleet_id",
+        ),
+        nullable=False,
+    )
+    deployment_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "nodes.id",
+            name="fk_fleet_resource_reservations_node_id",
+        ),
+        nullable=False,
+    )
+    gpu_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    gpu_uuid: Mapped[str] = mapped_column(String(128), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "fleet_id": self.fleet_id,
+            "deployment_id": self.deployment_id,
+            "node_id": self.node_id,
+            "gpu_index": self.gpu_index,
+            "gpu_uuid": self.gpu_uuid,
+            "rank": self.rank,
+            "released_at": (
+                self.released_at.isoformat()
+                if self.released_at is not None
+                else None
+            ),
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+        }
 
 
 class DeploymentOperation(Base):
