@@ -240,9 +240,16 @@ def validate_strict_pipeline_node(
     matching_gpus = [
         gpu for gpu in healthy_gpus if gpu.index == assignment.gpu_index
     ]
-    if len(healthy_gpus) != 1 or len(matching_gpus) != 1:
+    if len(matching_gpus) != 1:
         raise PipelineRuntimeContractError(
             "strict pipeline requires exactly one selected healthy GPU on this node"
+        )
+    if (
+        assignment.gpu_uuid is not None
+        and matching_gpus[0].uuid != assignment.gpu_uuid
+    ):
+        raise PipelineRuntimeContractError(
+            "selected GPU UUID no longer matches the deployment plan"
         )
     if (
         type(matching_gpus[0].memory_mib) is not int
@@ -556,7 +563,7 @@ def strict_runtime_contract_digest(
             "restart": "unless-stopped",
             "network": "host",
             "shm_size": shm_size,
-            "gpu_device": assignment.gpu_index,
+            "gpu_device": assignment.gpu_uuid or assignment.gpu_index,
             "mount": {
                 "source": str(strict_model_mount_path(plan, assignment)),
                 "target": "/models/model",

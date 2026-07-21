@@ -721,7 +721,7 @@ class ContainerRuntime:
             "--shm-size",
             "16g",
             "--gpus",
-            f"device={assignment.gpu_index}",
+            f"device={assignment.gpu_uuid or assignment.gpu_index}",
             "--label",
             f"dure.deployment={plan.deployment_id}",
             "--label",
@@ -879,7 +879,7 @@ class ContainerRuntime:
             "--shm-size",
             "4g",
             "--gpus",
-            f"device={assignment.gpu_index}",
+            f"device={assignment.gpu_uuid or assignment.gpu_index}",
             "--mount",
             "type=bind,src="
             f"{strict_model_mount_path(plan, assignment) if strict else plan.model_path},"

@@ -296,6 +296,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run[0:3], ("docker", "run", "-d"))
         self.assertIn("dure.node=camp-7", run)
         self.assertIn("dure.model=qwen2.5-32b-awq", run)
+        gpu_flag = run.index("--gpus")
+        self.assertEqual(run[gpu_flag + 1], "device=GPU-camp-7")
         entrypoint = run.index("--entrypoint")
         self.assertEqual(run[entrypoint + 1], "ray")
         image = run.index("registry.example/vllm@sha256:abc")
@@ -882,12 +884,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(runner.calls, [])
 
-    def test_strict_node_drift_is_rejected_before_docker(self):
+    def test_strict_gpu_uuid_drift_is_rejected_before_docker(self):
         plan, _, worker = strict_pipeline_fixture()
-        second_gpu = copy.deepcopy(worker.gpus[0])
-        second_gpu.index = 1
-        second_gpu.uuid = "GPU-second"
-        worker.gpus.append(second_gpu)
+        plan.assignments[1].gpu_uuid = worker.gpus[0].uuid
+        worker.gpus[0].uuid = "GPU-replaced"
         runner = FakeRunner()
 
         result = ContainerRuntime(runner).start_ray(
@@ -895,7 +895,7 @@ class RuntimeTests(unittest.TestCase):
         )
 
         self.assertFalse(result.ok)
-        self.assertIn("exactly one selected healthy GPU", result.detail)
+        self.assertIn("GPU UUID no longer matches", result.detail)
         self.assertEqual(runner.calls, [])
 
     def test_strict_cache_marker_must_match_manifest_addressed_path(self):

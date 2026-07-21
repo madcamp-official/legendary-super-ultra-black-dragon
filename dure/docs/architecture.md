@@ -117,7 +117,7 @@ variant identity는 원본 매니페스트, 런타임 OCI 다이제스트, vLLM 
 
 ```text
 서버 UUID와 최신 NodeProfile
-        ↓ 정상 GPU 정확히 한 장·고유 RFC1918 IPv4 검사
+        ↓ 사용할 정상 GPU 한 장의 index·UUID 선택·고유 RFC1918 IPv4 검사
 head를 rank 0으로 고정, worker를 IPv4 문자열로 정렬
         ↓ TP=1, PP=노드 수(2 또는 3)
 VLLM_RAY_PP_V1 / vLLM 0.9.0 / V0 / Ray 계획
@@ -127,7 +127,7 @@ VLLM_RAY_PP_V1 / vLLM 0.9.0 / V0 / Ray 계획
 source-pinned pipeline-rank-contract + API readiness
 ```
 
-계획의 각 assignment에는 서버가 발급한 정규 노드 UUID, `runtime_address`, pipeline rank와 기대 runtime rank가 들어갑니다. head assignment는 항상 rank 0이고, 나머지 worker는 계획에 선택된 고유한 canonical RFC1918 IPv4 문자열의 오름차순입니다. 각 노드는 정상 GPU가 정확히 한 장이어야 합니다. probe는 전체 주소와 별도로 기본 interface에 실제 결합된 `default_interface_addresses`를 보고하며, 선택 주소가 이 목록에 정확히 하나 존재하고 모든 노드의 기본 interface 이름이 같아야 합니다. 주소가 없거나 여러 개라 모호하면 새 probe와 네트워크 설정 정리가 필요합니다. `FULL_SNAPSHOT`은 `/var/lib/dure/models/sha256-<manifesthex>`, `STAGE`는 assignment마다 `/var/lib/dure/models/stages/sha256-<cache-identity>`의 marker와 전체 파일이 정확히 일치해야 합니다. 현재 지원 범위는 `TP=1`, `PP=2` 또는 `PP=3`입니다.
+계획의 각 assignment에는 서버가 발급한 정규 노드 UUID, 선택한 GPU index·UUID, `runtime_address`, pipeline rank와 기대 runtime rank가 들어갑니다. head assignment는 항상 rank 0이고, 나머지 worker는 계획에 선택된 고유한 canonical RFC1918 IPv4 문자열의 오름차순입니다. 각 노드는 계획에 정확히 GPU 한 장만 배정하며 Agent는 실행 직전에 index와 UUID가 같은 장치를 가리키는지 다시 검사합니다. 물리적으로 정상 GPU가 여러 장이어도 선택되지 않은 장치는 이 배포에 노출하지 않습니다. probe는 전체 주소와 별도로 기본 interface에 실제 결합된 `default_interface_addresses`를 보고하며, 선택 주소가 이 목록에 정확히 하나 존재하고 모든 노드의 기본 interface 이름이 같아야 합니다. 주소가 없거나 여러 개라 모호하면 새 probe와 네트워크 설정 정리가 필요합니다. `FULL_SNAPSHOT`은 `/var/lib/dure/models/sha256-<manifesthex>`, `STAGE`는 assignment마다 `/var/lib/dure/models/stages/sha256-<cache-identity>`의 marker와 전체 파일이 정확히 일치해야 합니다. 현재 개별 다중 노드 실행 지원 범위는 `TP=1`, `PP=2` 또는 `PP=3`입니다.
 
 엄격한 Ray 컨테이너는 `--node-ip-address`와 `VLLM_HOST_IP`를 같은 계획 주소로 고정하고, 서버 UUID에서 계산한 `dure_node_<uuidhex>` Ray custom resource를 정확히 하나 게시합니다. GCS는 `6379`, worker 범위는 `20000-21000`이며 vLLM API는 head의 `127.0.0.1:8000`에만 바인딩합니다. 모든 컨테이너는 기존 `dure.deployment`·`dure.generation`·`dure.node` 외에 `dure.backend`, `dure.pipeline-rank`, `dure.runtime-rank`, `dure.component`, `dure.runtime-contract` 레이블을 가집니다. 마지막 값은 이미지·모델 mount·GPU·network·entrypoint·고정 환경·명령을 포함한 정규 계약의 SHA-256입니다. 시작·재사용·readiness는 이 digest까지 정확히 비교합니다. incident containment용 `STOP`은 준비 경로가 손상되거나 원본 계획과 effective path가 달라도 동작해야 하므로 기존 배포·세대·노드·backend·rank·component만 정확히 확인하고 runtime-contract 값은 재계산하지 않습니다.
 

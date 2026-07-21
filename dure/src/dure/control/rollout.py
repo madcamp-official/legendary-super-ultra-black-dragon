@@ -275,7 +275,12 @@ def _plan_assignments(
                     {
                         field: assignment[field]
                         for field in assignment_topology_fields
-                    },
+                    }
+                    | (
+                        {"gpu_uuid": assignment["gpu_uuid"]}
+                        if "gpu_uuid" in assignment
+                        else {}
+                    ),
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,

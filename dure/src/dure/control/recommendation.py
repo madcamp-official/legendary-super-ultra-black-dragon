@@ -1316,7 +1316,7 @@ def _lock_recommendation_inputs(
     list(session.scalars(profile_statement.with_for_update()))
 
 
-def _best_gpu_index(profile: NodeProfile, minimum_mib: int) -> int:
+def _best_gpu(profile: NodeProfile, minimum_mib: int):
     eligible = [
         gpu
         for gpu in profile.gpus
@@ -1328,7 +1328,10 @@ def _best_gpu_index(profile: NodeProfile, minimum_mib: int) -> int:
             code="GENERATION_GPU_UNAVAILABLE",
             details={"node_id": profile.node_id},
         )
-    return max(eligible, key=lambda item: (item.memory_mib, -item.index)).index
+    return min(
+        eligible,
+        key=lambda item: (-item.memory_mib, item.uuid, item.index),
+    )
 
 
 def _layer_partitions(layer_count: int, stages: int) -> list[tuple[int, int]]:
@@ -1621,6 +1624,7 @@ def _build_generation_plan(
             NodeAssignment(
                 node_id=binding.profile.node_id,
                 gpu_index=binding.gpu_index,
+                gpu_uuid=binding.gpu_uuid,
                 rank=rank,
                 pipeline_rank=rank,
                 layer_start=partitions[rank][0],
@@ -1678,12 +1682,14 @@ def _build_generation_plan(
                 code="GENERATION_MODEL_CACHE_UNSUPPORTED",
             )
         ordered_profiles = profiles
+        selected_gpu = _best_gpu(
+            profiles[0], placement.min_gpu_memory_mib
+        )
         assignments = [
             NodeAssignment(
                 node_id=profiles[0].node_id,
-                gpu_index=_best_gpu_index(
-                    profiles[0], placement.min_gpu_memory_mib
-                ),
+                gpu_index=selected_gpu.index,
+                gpu_uuid=selected_gpu.uuid,
                 rank=0,
                 pipeline_rank=0,
                 layer_start=partitions[0][0],

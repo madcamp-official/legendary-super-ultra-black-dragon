@@ -43,6 +43,7 @@ class StrictRayPPTopologyError(ValueError):
 class StrictRayPPNode:
     profile: NodeProfile
     gpu_index: int
+    gpu_uuid: str
     runtime_address: str
 
 
@@ -136,29 +137,49 @@ def strict_vllm_ray_pp_order(
                 node_ids=(profile.node_id,),
             )
         healthy_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
-        if len(healthy_gpus) != 1:
+        if not healthy_gpus:
             raise StrictRayPPTopologyError(
-                "strict Ray pipeline requires exactly one healthy GPU per node",
+                "strict Ray pipeline requires a healthy GPU on every selected node",
                 reason="HEALTHY_GPU_COUNT",
                 node_ids=(profile.node_id,),
             )
-        gpu = healthy_gpus[0]
+        eligible_gpus = [
+            gpu
+            for gpu in healthy_gpus
+            if type(gpu.memory_mib) is int
+            and gpu.memory_mib >= minimum_gpu_memory_mib
+        ]
+        if not eligible_gpus:
+            raise StrictRayPPTopologyError(
+                "strict Ray pipeline node does not meet the GPU memory requirement",
+                reason="GPU_MEMORY_INSUFFICIENT",
+                node_ids=(profile.node_id,),
+            )
+        gpu = min(
+            eligible_gpus,
+            key=lambda item: (-item.memory_mib, item.uuid, item.index),
+        )
         if type(gpu.index) is not int or gpu.index < 0:
             raise StrictRayPPTopologyError(
                 "strict Ray pipeline GPU index is invalid",
                 reason="GPU_INDEX_INVALID",
                 node_ids=(profile.node_id,),
             )
-        if type(gpu.memory_mib) is not int or gpu.memory_mib < minimum_gpu_memory_mib:
+        if (
+            type(gpu.uuid) is not str
+            or not gpu.uuid.startswith("GPU-")
+            or len(gpu.uuid) > 128
+        ):
             raise StrictRayPPTopologyError(
-                "strict Ray pipeline node does not meet the GPU memory requirement",
-                reason="GPU_MEMORY_INSUFFICIENT",
+                "strict Ray pipeline selected GPU UUID is invalid",
+                reason="GPU_UUID_INVALID",
                 node_ids=(profile.node_id,),
             )
         bindings.append(
             StrictRayPPNode(
                 profile=profile,
                 gpu_index=gpu.index,
+                gpu_uuid=gpu.uuid,
                 runtime_address=_private_runtime_address(profile),
             )
         )
@@ -267,7 +288,10 @@ def build_plan(
         if node_gpus:
             # The MVP launches one Ray container per node. Prefer the largest GPU
             # until multi-GPU-per-node assignments are implemented explicitly.
-            gpu = max(node_gpus, key=lambda item: item.memory_mib)
+            gpu = min(
+                node_gpus,
+                key=lambda item: (-item.memory_mib, item.uuid, item.index),
+            )
             healthy.append((profile, gpu.index))
             leftover = [g for g in node_gpus if g.index != gpu.index]
             if leftover:
@@ -346,6 +370,7 @@ def build_plan(
             NodeAssignment(
                 node_id=profile.node_id,
                 gpu_index=gpu_index,
+                gpu_uuid=_gpu_for(profile, gpu_index).uuid,
                 rank=rank,
                 pipeline_rank=rank,
                 layer_start=start,
