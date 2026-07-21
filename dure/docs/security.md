@@ -177,7 +177,7 @@ probe는 최대 256개의 marker metadata만 보고합니다. `scan_complete=tru
 
 따라서 관리자 token, executor, 원본 결과 저장소를 같은 신뢰된 운영 경계에서 관리해야 합니다. 이 경계의 전체 계약은 [자동 배치 프로필 qualification](profile-qualification.md)을 참고합니다.
 
-Fleet 평가기는 유효한 PRIMARY·SUPPLEMENTARY 증적 하나를 정확한 node/GPU/rank 집합 하나로만 투영합니다. 같은 evidence ID의 digest나 결합이 달라지면 닫히고, 새 실패·진행 중 실행이 있는 exact 집합에서는 오래된 통과 결과를 사용하지 않습니다. 선택된 후보끼리 노드 또는 GPU UUID가 한 개라도 겹치면 동시에 선택할 수 없습니다. 평가는 읽기 전용이며 추천·예약·task·컨테이너 권한이 아닙니다. 상세 목적 순서와 계산 한도는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
+Fleet 평가기는 유효한 PRIMARY·SUPPLEMENTARY 증적 하나를 정확한 node/GPU/rank 집합 하나로만 투영합니다. 같은 evidence ID의 digest나 결합이 달라지면 닫히고, 새 실패·진행 중 실행이 있는 exact 집합에서는 오래된 통과 결과를 사용하지 않습니다. 선택된 후보끼리 노드 또는 GPU UUID가 한 개라도 겹치면 동시에 선택할 수 없습니다. 관리자 추천 API는 평가 전체를 별도 콘텐츠 주소 행으로 멱등 저장하지만 예약·deployment·task·컨테이너 권한은 만들지 않습니다. `show`는 저장 기록이며 현재 유효성 보증이 아닙니다. 클라이언트는 계산 한도나 network zone을 입력해 점수를 조작할 수 없습니다. 상세 목적 순서와 계산 한도는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
 
 ## 모델 레지스트리, 승격 게이트와 추천 수락의 경계
 

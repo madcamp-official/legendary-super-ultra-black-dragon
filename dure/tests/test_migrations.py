@@ -47,6 +47,7 @@ from dure.control.models import (
     DeploymentOperation,
     DeploymentOperationNode,
     DeploymentRecommendationRecord,
+    FleetRecommendationRecord,
     ModelArtifact,
     ModelRelease,
     NodeArtifactCache,
@@ -114,6 +115,7 @@ HEAD_TABLES = REGISTRY_TABLES | {
     "deployment_operation_nodes",
     "deployment_operations",
     "deployment_recommendations",
+    "fleet_recommendations",
 }
 STAGE_VARIANT_CHECKS = {
     "ck_stage_variant_architecture",
@@ -225,6 +227,22 @@ RECOMMENDATION_INDEXES = {"ix_deployment_recommendations_created_at"}
 RECOMMENDATION_CHECKS = {
     "ck_deployment_recommendation_id_sha256",
     "ck_deployment_recommendation_selection_mode",
+}
+FLEET_RECOMMENDATION_INDEXES = {
+    "ix_fleet_recommendations_created_at"
+}
+FLEET_RECOMMENDATION_CHECKS = {
+    "ck_fleet_recommendation_candidate_policy_version",
+    "ck_fleet_recommendation_catalog_version_sha256",
+    "ck_fleet_recommendation_catalog_policy_version",
+    "ck_fleet_recommendation_id_sha256",
+    "ck_fleet_recommendation_inventory_sha256",
+    "ck_fleet_recommendation_objective",
+    "ck_fleet_recommendation_reserve_nonnegative",
+    "ck_fleet_recommendation_scheduler_version",
+    "ck_fleet_recommendation_schema_version",
+    "ck_fleet_recommendation_selection_mode",
+    "ck_fleet_recommendation_source_inventory_sha256",
 }
 DEPLOYMENT_GENERATION_UNIQUES = {
     ("lineage_id", "generation"),
@@ -2033,6 +2051,72 @@ class MigrationTests(unittest.TestCase):
                 )
             },
         )
+        fleet_recommendation_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("fleet_recommendations")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "schema_version",
+                "objective",
+                "selection_mode",
+                "requested_node_ids",
+                "minimum_replicas",
+                "minimum_reserve_nodes",
+                "reserve_node_ids",
+                "inventory_fingerprint",
+                "source_inventory_fingerprint",
+                "catalog_version",
+                "catalog_policy_version",
+                "candidate_policy_version",
+                "scheduler_version",
+                "recommendation_snapshot",
+                "created_at",
+            },
+            set(fleet_recommendation_columns),
+        )
+        self.assertTrue(
+            all(
+                not column["nullable"]
+                for column in fleet_recommendation_columns.values()
+            )
+        )
+        self.assertEqual(
+            fleet_recommendation_columns["catalog_version"]["type"].length,
+            71,
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_INDEXES,
+            {
+                item["name"]
+                for item in inspector.get_indexes("fleet_recommendations")
+            },
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_INDEXES,
+            {
+                index.name
+                for index in FleetRecommendationRecord.__table__.indexes
+            },
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_CHECKS,
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "fleet_recommendations"
+                )
+            },
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_CHECKS,
+            {
+                constraint.name
+                for constraint in FleetRecommendationRecord.__table__.constraints
+                if isinstance(constraint, CheckConstraint)
+            },
+        )
         deployment_columns = {
             item["name"]: item for item in inspector.get_columns("deployments")
         }
@@ -2371,12 +2455,132 @@ class MigrationTests(unittest.TestCase):
             revision_module._append_only_guard_downgrade_sql("postgresql"),
         )
 
-    def test_migration_history_has_single_0012_head(self):
+    def test_migration_history_has_single_0013_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0012"])
+            self.assertEqual(heads, ["0013"])
+
+    def test_0013_fleet_recommendation_schema_constraints_and_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'fleet-recommendations.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            recommendation_id = "sha256:" + "a" * 64
+            with factory() as session:
+                record = FleetRecommendationRecord(
+                    id=recommendation_id,
+                    schema_version=1,
+                    objective="quality-first",
+                    selection_mode="explicit_nodes",
+                    requested_node_ids=["node-a", "node-b"],
+                    minimum_replicas={"qwen2.5-72b-awq": 1},
+                    minimum_reserve_nodes=1,
+                    reserve_node_ids=["node-b"],
+                    inventory_fingerprint="sha256:" + "b" * 64,
+                    source_inventory_fingerprint="sha256:" + "c" * 64,
+                    catalog_version="sha256:" + "1" * 64,
+                    catalog_policy_version="fleet-policy-v1",
+                    candidate_policy_version="fleet-candidate-v1",
+                    scheduler_version="fleet-scheduler-v1",
+                    recommendation_snapshot={
+                        "selected_candidate_ids": ["candidate-a"]
+                    },
+                )
+                session.add(record)
+                session.commit()
+                serialized = record.to_dict()
+                self.assertEqual(serialized["id"], recommendation_id)
+                self.assertEqual(serialized["schema_version"], 1)
+                self.assertEqual(
+                    serialized["minimum_replicas"],
+                    {"qwen2.5-72b-awq": 1},
+                )
+                self.assertEqual(serialized["reserve_node_ids"], ["node-b"])
+                self.assertIsNotNone(serialized["created_at"])
+
+                session.add(
+                    FleetRecommendationRecord(
+                        id="sha256:" + "d" * 64,
+                        schema_version=1,
+                        objective="quality-first",
+                        selection_mode="all_online",
+                        requested_node_ids=[],
+                        minimum_replicas={},
+                        minimum_reserve_nodes=-1,
+                        reserve_node_ids=[],
+                        inventory_fingerprint="sha256:" + "e" * 64,
+                        source_inventory_fingerprint="sha256:" + "f" * 64,
+                        catalog_version="sha256:" + "2" * 64,
+                        catalog_policy_version="fleet-policy-v1",
+                        candidate_policy_version="fleet-candidate-v1",
+                        scheduler_version="fleet-scheduler-v1",
+                        recommendation_snapshot={},
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+            engine.dispose()
+            with self.assertRaisesRegex(RuntimeError, "downgrade 0013"):
+                command.downgrade(migration_config, "0012")
+
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                stored = session.get(
+                    FleetRecommendationRecord, recommendation_id
+                )
+                self.assertIsNotNone(stored)
+                session.delete(stored)
+                session.commit()
+            engine.dispose()
+
+            command.downgrade(migration_config, "0012")
+            engine = make_engine(url)
+            self.assertNotIn(
+                "fleet_recommendations", inspect(engine).get_table_names()
+            )
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.scalar(
+                        text("SELECT version_num FROM alembic_version")
+                    ),
+                    "0012",
+                )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+
+    def test_0013_postgresql_offline_upgrade_is_deterministic(self):
+        output = io.StringIO()
+        migration_config = config("postgresql://dure@localhost/dure")
+
+        with redirect_stdout(output):
+            command.upgrade(migration_config, "0012:0013", sql=True)
+
+        sql = output.getvalue()
+        self.assertIn("CREATE TABLE fleet_recommendations", sql)
+        self.assertIn("ck_fleet_recommendation_id_sha256", sql)
+        self.assertIn("ck_fleet_recommendation_objective", sql)
+        revision_module = ScriptDirectory.from_config(
+            migration_config
+        ).get_revision("0013").module
+        self.assertEqual(
+            (
+                "LOCK TABLE fleet_recommendations "
+                "IN ACCESS EXCLUSIVE MODE",
+            ),
+            revision_module._destructive_downgrade_lock_sql("postgresql"),
+        )
+        self.assertEqual(
+            (), revision_module._destructive_downgrade_lock_sql("sqlite")
+        )
 
     def test_0012_postgresql_offline_upgrade_is_deterministic(self):
         output = io.StringIO()

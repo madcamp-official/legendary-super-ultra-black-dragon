@@ -1,3 +1,11 @@
+dure (0.3.30) UNRELEASED; urgency=medium
+
+  * 다중 배포 Fleet 추천을 콘텐츠 주소 불변 스냅샷으로 저장합니다.
+  * 관리자 Fleet recommend·show API와 CLI를 추가합니다.
+  * 추천 생성·조회와 수락·예약·호스트 변경 권한을 분리합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:30:00 +0900
+
 dure (0.3.29) UNRELEASED; urgency=medium
 
   * PRIMARY·SUPPLEMENTARY exact 증적을 여러 독립 배포 후보로 투영합니다.

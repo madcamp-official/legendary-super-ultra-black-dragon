@@ -397,8 +397,24 @@ DURE_RUN_VLLM_RAY_PP_ACCEPTANCE=1 \
 - `POST /v1/admin/deployment-recommendations`: 저장 인벤토리와 `ACTIVE` 릴리스 평가 및 불변 스냅샷 저장
 - `GET /v1/admin/deployment-recommendations/{id}`: 추천·인벤토리 스냅샷과 수락된 세대 조회
 - `POST /v1/admin/deployment-recommendations/{id}/accept`: 현재 유효성 재검사 후 적용 전 배포 세대 생성
+- `POST /v1/admin/fleet-recommendations`: 네 모델의 exact 증적을 여러 비중첩 배포로 조합한 불변 Fleet 추천 저장
+- `GET /v1/admin/fleet-recommendations/{id}`: 저장 당시 Fleet 정책·후보·선택·미배정·증적 스냅샷 조회
 
 모든 경로는 관리자 전달자 인증을 요구합니다. 모델 리비전, 매니페스트, 런타임 이미지가 고정되지 않으면 등록할 수 없고, 허용 목록 밖의 Docker 인자·환경 변수·마운트·호스트 경로는 요청 단계에서 거부됩니다. 레지스트리 등록이나 상태 전이만으로 에이전트 작업 또는 호스트 변경이 발생하지 않습니다.
+
+Fleet 추천은 다음처럼 생성·조회합니다.
+
+```bash
+dure admin fleet recommend --all-online --objective quality-first
+dure admin fleet recommend \
+  --node <node-a> <node-b> <node-c> \
+  --minimum-replica qwen2.5-72b-awq=1 \
+  --minimum-reserve-nodes 1 \
+  --reserve-node <node-c>
+dure admin fleet show sha256:<64-hex>
+```
+
+`recommend`는 불변 추천 행 하나만 멱등 저장합니다. 모델 다운로드, 이미지 pull, 배포 세대, 노드·GPU 예약, Agent task와 컨테이너 변경은 만들지 않습니다. `show`는 저장 시점 기록이므로 현재 인벤토리의 유효성을 의미하지 않습니다. Fleet 수락·준비·적용 명령은 아직 제공하지 않습니다.
 
 ## stage artifact 생성·검증 운영
 

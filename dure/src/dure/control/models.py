@@ -87,6 +87,112 @@ class DeploymentRecommendationRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class FleetRecommendationRecord(Base):
+    """여러 배포 후보를 한 번에 고정한 콘텐츠 주소 Fleet 추천."""
+
+    __tablename__ = "fleet_recommendations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 71 AND id LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_id_sha256",
+        ),
+        CheckConstraint(
+            "schema_version = 1",
+            name="ck_fleet_recommendation_schema_version",
+        ),
+        CheckConstraint(
+            "objective = 'quality-first'",
+            name="ck_fleet_recommendation_objective",
+        ),
+        CheckConstraint(
+            "selection_mode IN ('all_online', 'explicit_nodes')",
+            name="ck_fleet_recommendation_selection_mode",
+        ),
+        CheckConstraint(
+            "minimum_reserve_nodes >= 0",
+            name="ck_fleet_recommendation_reserve_nonnegative",
+        ),
+        CheckConstraint(
+            "length(inventory_fingerprint) = 71 "
+            "AND inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_inventory_sha256",
+        ),
+        CheckConstraint(
+            "length(source_inventory_fingerprint) = 71 "
+            "AND source_inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_source_inventory_sha256",
+        ),
+        CheckConstraint(
+            "length(catalog_version) = 71 "
+            "AND catalog_version LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_catalog_version_sha256",
+        ),
+        CheckConstraint(
+            "length(catalog_policy_version) BETWEEN 1 AND 64",
+            name="ck_fleet_recommendation_catalog_policy_version",
+        ),
+        CheckConstraint(
+            "length(candidate_policy_version) BETWEEN 1 AND 64",
+            name="ck_fleet_recommendation_candidate_policy_version",
+        ),
+        CheckConstraint(
+            "length(scheduler_version) BETWEEN 1 AND 64",
+            name="ck_fleet_recommendation_scheduler_version",
+        ),
+        Index("ix_fleet_recommendations_created_at", "created_at"),
+    )
+    id: Mapped[str] = mapped_column(String(71), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    objective: Mapped[str] = mapped_column(
+        String(40), default="quality-first", nullable=False
+    )
+    selection_mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    requested_node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    minimum_replicas: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    minimum_reserve_nodes: Mapped[int] = mapped_column(Integer, nullable=False)
+    reserve_node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    inventory_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    source_inventory_fingerprint: Mapped[str] = mapped_column(
+        String(71), nullable=False
+    )
+    catalog_version: Mapped[str] = mapped_column(String(71), nullable=False)
+    catalog_policy_version: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    candidate_policy_version: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    scheduler_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    recommendation_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "schema_version": self.schema_version,
+            "objective": self.objective,
+            "selection_mode": self.selection_mode,
+            "requested_node_ids": list(self.requested_node_ids),
+            "minimum_replicas": dict(self.minimum_replicas),
+            "minimum_reserve_nodes": self.minimum_reserve_nodes,
+            "reserve_node_ids": list(self.reserve_node_ids),
+            "inventory_fingerprint": self.inventory_fingerprint,
+            "source_inventory_fingerprint": self.source_inventory_fingerprint,
+            "catalog_version": self.catalog_version,
+            "catalog_policy_version": self.catalog_policy_version,
+            "candidate_policy_version": self.candidate_policy_version,
+            "scheduler_version": self.scheduler_version,
+            "recommendation_snapshot": dict(self.recommendation_snapshot),
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+        }
+
+
 class Deployment(Base):
     __tablename__ = "deployments"
     __table_args__ = (

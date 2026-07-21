@@ -503,6 +503,242 @@ class DeploymentRecommendCLITests(unittest.TestCase):
         self.assertEqual(FakeJSONClient.calls, [])
 
 
+class FleetRecommendationCLITests(unittest.TestCase):
+    NODE_A = "00000000-0000-4000-8000-000000000001"
+    NODE_B = "00000000-0000-4000-8000-000000000002"
+    NODE_C = "00000000-0000-4000-8000-000000000003"
+    NODE_D = "00000000-0000-4000-8000-000000000004"
+
+    def setUp(self):
+        FakeJSONClient.calls = []
+        FakeJSONClient.response = {
+            "recommendation": {
+                "id": "sha256:" + "f" * 64,
+                "selected_deployments": [],
+            },
+            "recorded_at": "2026-07-21T00:00:00+00:00",
+            "created": True,
+        }
+
+    def run_cli(self, *arguments: str) -> tuple[int, str, str]:
+        output = io.StringIO()
+        error = io.StringIO()
+        with patch(
+            "dure.agent.resolve_join_settings",
+            return_value=("https://packaged", False),
+        ), patch("dure.http.JSONClient", FakeJSONClient), redirect_stdout(
+            output
+        ), redirect_stderr(error):
+            result = main(
+                [
+                    "admin",
+                    "--server",
+                    "https://control.example",
+                    "--token",
+                    "admin-token",
+                    "fleet",
+                    *arguments,
+                ]
+            )
+        return result, output.getvalue(), error.getvalue()
+
+    def test_recommend_all_online_posts_the_closed_default_policy(self):
+        result, output, error = self.run_cli(
+            "recommend",
+            "--all-online",
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            FakeJSONClient.calls,
+            [
+                (
+                    "https://control.example",
+                    "admin-token",
+                    "POST",
+                    "/v1/admin/fleet-recommendations",
+                    {
+                        "node_ids": [],
+                        "all_online": True,
+                        "objective": "quality-first",
+                        "minimum_replicas": {},
+                        "minimum_reserve_nodes": 0,
+                        "reserve_node_ids": [],
+                    },
+                )
+            ],
+        )
+        self.assertEqual(
+            output,
+            json.dumps(FakeJSONClient.response, indent=2, sort_keys=True) + "\n",
+        )
+
+    def test_recommend_flattens_nodes_and_parses_the_explicit_policy(self):
+        result, output, error = self.run_cli(
+            "recommend",
+            "--node",
+            self.NODE_B,
+            self.NODE_A,
+            "--node",
+            self.NODE_C,
+            self.NODE_D,
+            "--objective",
+            "quality-first",
+            "--minimum-replica",
+            "qwen2.5-72b-awq=2",
+            "--minimum-replica",
+            "qwen2.5-7b-awq=1",
+            "--minimum-reserve-nodes",
+            "2",
+            "--reserve-node",
+            self.NODE_C,
+            "--reserve-node",
+            self.NODE_D,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(json.loads(output), FakeJSONClient.response)
+        self.assertEqual(
+            FakeJSONClient.calls[0][2:],
+            (
+                "POST",
+                "/v1/admin/fleet-recommendations",
+                {
+                    "node_ids": [
+                        self.NODE_B,
+                        self.NODE_A,
+                        self.NODE_C,
+                        self.NODE_D,
+                    ],
+                    "all_online": False,
+                    "objective": "quality-first",
+                    "minimum_replicas": {
+                        "qwen2.5-72b-awq": 2,
+                        "qwen2.5-7b-awq": 1,
+                    },
+                    "minimum_reserve_nodes": 2,
+                    "reserve_node_ids": [self.NODE_C, self.NODE_D],
+                },
+            ),
+        )
+
+    def test_show_uses_the_exact_read_only_endpoint(self):
+        recommendation_id = "sha256:" + "a" * 64
+        FakeJSONClient.response = {
+            "recommendation": {"id": recommendation_id},
+            "recorded_at": "2026-07-21T00:00:00+00:00",
+        }
+
+        result, output, error = self.run_cli("show", recommendation_id)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            FakeJSONClient.calls,
+            [
+                (
+                    "https://control.example",
+                    "admin-token",
+                    "GET",
+                    f"/v1/admin/fleet-recommendations/{recommendation_id}",
+                    None,
+                )
+            ],
+        )
+        self.assertEqual(
+            output,
+            json.dumps(FakeJSONClient.response, indent=2, sort_keys=True) + "\n",
+        )
+
+    def test_recommend_rejects_invalid_policy_syntax_before_any_request(self):
+        common = [
+            "admin",
+            "--server",
+            "https://control.example",
+            "--token",
+            "admin-token",
+            "fleet",
+            "recommend",
+        ]
+        invalid_arguments = (
+            common,
+            [*common, "--all-online", "--node", self.NODE_A],
+            [*common, "--all-online", "--objective", "throughput-first"],
+            [*common, "--all-online", "--minimum-replica", "qwen2.5-7b-awq"],
+            [*common, "--all-online", "--minimum-replica", "unknown=1"],
+            [*common, "--all-online", "--minimum-replica", "qwen2.5-7b-awq=-1"],
+            [*common, "--all-online", "--minimum-replica", "qwen2.5-7b-awq=1.5"],
+            [*common, "--all-online", "--minimum-reserve-nodes", "-1"],
+            [*common, "--node", ""],
+            [*common, "--node", "not-a-canonical-uuid"],
+            [*common, "--all-online", "--network-zone", "zone-a"],
+            [*common, "--all-online", "--max-candidates", "10"],
+        )
+
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    main(arguments)
+                self.assertEqual(raised.exception.code, 2)
+
+        self.assertEqual(FakeJSONClient.calls, [])
+
+    def test_recommend_rejects_duplicate_policy_keys_before_any_request(self):
+        duplicate_arguments = (
+            (
+                "--minimum-replica",
+                "qwen2.5-14b-awq=1",
+                "--minimum-replica",
+                "qwen2.5-14b-awq=2",
+            ),
+            (
+                "--reserve-node",
+                self.NODE_A,
+                "--reserve-node",
+                self.NODE_A,
+            ),
+        )
+
+        for arguments in duplicate_arguments:
+            with self.subTest(arguments=arguments):
+                FakeJSONClient.calls = []
+                result, output, error = self.run_cli(
+                    "recommend",
+                    "--all-online",
+                    *arguments,
+                )
+                self.assertEqual(result, 2)
+                self.assertEqual(output, "")
+                self.assertIn("error:", error)
+                self.assertEqual(FakeJSONClient.calls, [])
+
+        result, output, error = self.run_cli(
+            "recommend",
+            "--node",
+            self.NODE_A,
+            "--node",
+            self.NODE_A,
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(output, "")
+        self.assertIn("--node values must be unique", error)
+        self.assertEqual(FakeJSONClient.calls, [])
+
+        result, output, error = self.run_cli(
+            "recommend",
+            "--node",
+            self.NODE_A,
+            "--reserve-node",
+            self.NODE_B,
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(output, "")
+        self.assertIn("explicit --node pool", error)
+        self.assertEqual(FakeJSONClient.calls, [])
+
+
 class RecommendationCLITests(unittest.TestCase):
     def setUp(self):
         FakeJSONClient.calls = []

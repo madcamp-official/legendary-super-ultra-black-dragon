@@ -15,6 +15,7 @@ from .orchestrator import InitOrchestrator
 from .planner import build_plan, classify_node, recommend_local_model
 from .probe import NodeProbe
 from .readiness import ReadinessVerifier
+from .resource_pool import FLEET_MODEL_IDS
 from .runtime import read_plan, write_plan
 from .state import StateStore
 
@@ -62,6 +63,38 @@ def _canonical_uuid_argument(value: str) -> str:
     except (AttributeError, ValueError) as exc:
         raise argparse.ArgumentTypeError("must be a canonical UUID") from exc
     return value
+
+
+def _non_empty_identifier_argument(value: str) -> str:
+    if not value or value != value.strip():
+        raise argparse.ArgumentTypeError(
+            "must be a non-empty identifier without surrounding whitespace"
+        )
+    return value
+
+
+def _non_negative_integer_argument(value: str) -> int:
+    if not value.isascii() or not value.isdigit():
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return int(value)
+
+
+def _minimum_replica_argument(value: str) -> tuple[str, int]:
+    if value.count("=") != 1:
+        raise argparse.ArgumentTypeError("must use MODEL=COUNT")
+    model_id, count_text = value.split("=", 1)
+    if model_id not in FLEET_MODEL_IDS:
+        allowed = ", ".join(sorted(FLEET_MODEL_IDS))
+        raise argparse.ArgumentTypeError(
+            f"model must be one of: {allowed}"
+        )
+    try:
+        count = _non_negative_integer_argument(count_text)
+    except argparse.ArgumentTypeError as exc:
+        raise argparse.ArgumentTypeError(
+            "COUNT must be a non-negative integer"
+        ) from exc
+    return model_id, count
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -186,6 +219,64 @@ def _parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="Queue exactly one quarantine task after all references are clear",
+    )
+    fleet = admin_sub.add_parser(
+        "fleet", help="Create or inspect an immutable multi-deployment recommendation"
+    )
+    fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
+    fleet_recommend = fleet_sub.add_parser(
+        "recommend", help="Evaluate the selected GPU pool without changing hosts"
+    )
+    fleet_nodes = fleet_recommend.add_mutually_exclusive_group(required=True)
+    fleet_nodes.add_argument(
+        "--all-online",
+        action="store_true",
+        help="Consider every approved online node",
+    )
+    fleet_nodes.add_argument(
+        "--node",
+        dest="nodes",
+        action="append",
+        nargs="+",
+        type=_canonical_uuid_argument,
+        metavar="NODE_ID",
+        help="Consider only these node IDs; accepts a list and may be repeated",
+    )
+    fleet_recommend.add_argument(
+        "--objective",
+        choices=("quality-first",),
+        default="quality-first",
+        help="Fleet scheduling objective",
+    )
+    fleet_recommend.add_argument(
+        "--minimum-replica",
+        action="append",
+        type=_minimum_replica_argument,
+        default=[],
+        metavar="MODEL=COUNT",
+        help="Require at least COUNT replicas of an allowlisted model; may be repeated",
+    )
+    fleet_recommend.add_argument(
+        "--minimum-reserve-nodes",
+        type=_non_negative_integer_argument,
+        default=0,
+        metavar="COUNT",
+        help="Leave at least COUNT selected nodes unused",
+    )
+    fleet_recommend.add_argument(
+        "--reserve-node",
+        dest="reserve_nodes",
+        action="append",
+        type=_canonical_uuid_argument,
+        default=[],
+        metavar="NODE_ID",
+        help="Keep this exact node unused; may be repeated",
+    )
+    fleet_show = fleet_sub.add_parser(
+        "show", help="Show one stored immutable Fleet recommendation"
+    )
+    fleet_show.add_argument(
+        "recommendation_id", type=_non_empty_identifier_argument
     )
     deployment = admin_sub.add_parser("deployment")
     deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
@@ -702,6 +793,49 @@ def _admin(args: argparse.Namespace) -> int:
                     f"{path}/quarantine",
                     {"apply": args.apply},
                 )
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return 0
+    if args.admin_command == "fleet":
+        if args.fleet_command == "show":
+            value = client.request(
+                "GET",
+                f"/v1/admin/fleet-recommendations/{args.recommendation_id}",
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        node_ids = [
+            node_id
+            for node_group in (args.nodes or [])
+            for node_id in node_group
+        ]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("--node values must be unique")
+        minimum_replicas: dict[str, int] = {}
+        for model_id, count in args.minimum_replica:
+            if model_id in minimum_replicas:
+                raise ValueError(
+                    f"--minimum-replica may name {model_id} only once"
+                )
+            minimum_replicas[model_id] = count
+        reserve_node_ids = list(args.reserve_nodes)
+        if len(reserve_node_ids) != len(set(reserve_node_ids)):
+            raise ValueError("--reserve-node values must be unique")
+        if node_ids and not set(reserve_node_ids).issubset(node_ids):
+            raise ValueError(
+                "--reserve-node values must belong to the explicit --node pool"
+            )
+        value = client.request(
+            "POST",
+            "/v1/admin/fleet-recommendations",
+            {
+                "node_ids": node_ids,
+                "all_online": args.all_online,
+                "objective": args.objective,
+                "minimum_replicas": minimum_replicas,
+                "minimum_reserve_nodes": args.minimum_reserve_nodes,
+                "reserve_node_ids": reserve_node_ids,
+            },
+        )
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0
     if args.admin_command == "recommendation":

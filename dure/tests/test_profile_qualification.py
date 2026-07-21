@@ -11,9 +11,11 @@ from sqlalchemy import func, select
 from dure.control.benchmark import promote_model_release
 from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.fleet import FleetEvaluationError, evaluate_fleet_schedule
+from dure.control.fleet_recommendation import recommend_fleet
 from dure.control.models import (
     Deployment,
     DeploymentRecommendationRecord,
+    FleetRecommendationRecord,
     Node,
     NodeProfileRecord,
     PlacementProfileRecord,
@@ -295,6 +297,14 @@ class ProfileQualificationTests(unittest.TestCase):
                 ),
                 0,
             )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(
+                        FleetRecommendationRecord
+                    )
+                ),
+                0,
+            )
 
             zoned_result = evaluate_fleet_schedule(
                 session,
@@ -338,6 +348,41 @@ class ProfileQualificationTests(unittest.TestCase):
             self.assertEqual(
                 invalid_zone.exception.code,
                 "FLEET_NETWORK_ZONE_INVALID",
+            )
+
+            stored = recommend_fleet(
+                session,
+                node_ids=node_ids,
+                all_online=False,
+            )
+            stored_evaluation = stored["recommendation"]["evaluation"]
+            self.assertEqual(stored_evaluation, result)
+            self.assertEqual(
+                len(stored_evaluation["schedule"]["selected"]),
+                4,
+            )
+            self.assertTrue(
+                all(
+                    item["evidence_id"]
+                    and item["gpu_bindings"]
+                    for item in stored_evaluation["schedule"]["selected"]
+                )
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(
+                        FleetRecommendationRecord
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Task)),
+                0,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Deployment)),
+                0,
             )
 
     def test_exact_gpu_evidence_validates_activates_and_feeds_recommendation(self):
