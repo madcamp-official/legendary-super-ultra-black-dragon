@@ -183,6 +183,7 @@ def _qualification_occupancy(
     inventory: list[InventoryNode],
     *,
     exclude_run_id: str | None = None,
+    exclude_fleet_id: str | None = None,
 ) -> dict[str, str]:
     requested = {item.node_id for item in inventory}
     reasons: dict[str, str] = {}
@@ -197,6 +198,8 @@ def _qualification_occupancy(
         node_ids=requested,
         gpu_uuids=gpu_nodes,
     ):
+        if reservation.fleet_id == exclude_fleet_id:
+            continue
         affected = set(gpu_nodes.get(reservation.gpu_uuid, set()))
         if reservation.node_id in requested:
             affected.add(reservation.node_id)
@@ -392,6 +395,7 @@ def _qualification_context(
     now,
     qualification_run_id: str | None = None,
     qualification_purpose: str | None = "PRIMARY",
+    reservation_fleet_id: str | None = None,
 ) -> dict[str, Any]:
     if placement.origin != AUTO_PROFILE_ORIGIN or placement.spec_digest is None:
         raise ProfileQualificationError(
@@ -436,6 +440,7 @@ def _qualification_context(
         session,
         inventory,
         exclude_run_id=qualification_run_id,
+        exclude_fleet_id=reservation_fleet_id,
     )
     snapshot = build_gpu_pool_snapshot(
         inventory,
@@ -584,6 +589,7 @@ def validate_profile_qualification_evidence(
     run: ProfileQualificationRun,
     now=None,
     require_primary: bool = True,
+    reservation_fleet_id: str | None = None,
 ) -> dict[str, Any]:
     purpose = _qualification_purpose(run)
     if (
@@ -631,6 +637,7 @@ def validate_profile_qualification_evidence(
         node_ids=list(run.node_ids),
         now=checked_at,
         qualification_purpose=run.workload.get("qualification_purpose"),
+        reservation_fleet_id=reservation_fleet_id,
     )
     if (
         context["inventory_fingerprint"] != run.inventory_fingerprint

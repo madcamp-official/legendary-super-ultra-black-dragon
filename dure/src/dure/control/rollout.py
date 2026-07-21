@@ -489,13 +489,20 @@ def _phase_payload(
             )
         deployment = target
     plan = deployment.plan
-    if deployment.source_recommendation_id is not None:
+    if (
+        deployment.source_recommendation_id is not None
+        or deployment.fleet_id is not None
+    ):
         from .preparation import effective_deployment_plan
 
         plan = effective_deployment_plan(
             session,
             deployment,
             require_prepared=phase != "STOP_SOURCE",
+            # The explicit Fleet APPLY gate already checked this exact
+            # qualification. Its own queued/running tasks legitimately occupy
+            # the nodes during later phases and must not invalidate themselves.
+            revalidate_fleet_qualification=deployment.fleet_id is None,
         )
     payload: dict[str, Any] = {
         "plan": plan,
@@ -508,11 +515,13 @@ def _phase_payload(
         payload["accept_model_download"] = bool(
             deployment.accept_model_download
             if deployment.source_recommendation_id is None
+            and deployment.fleet_id is None
             else False
         )
         payload["pull_image"] = bool(
             deployment.pull_image
             if deployment.source_recommendation_id is None
+            and deployment.fleet_id is None
             else False
         )
     elif phase == "START_TARGET":
@@ -1330,6 +1339,13 @@ def claim_operation_task(session: Session, task: Task, node_id: str) -> bool:
     if binding is None:
         return task.operation_node_id is None
     locked_task, record, operation = binding
+    from .fleet_runtime import (
+        fleet_operation_is_current,
+        sync_fleet_operation_status,
+    )
+
+    if not fleet_operation_is_current(session, operation, lock=True):
+        return False
     if not _binding_is_current(locked_task, record, operation):
         return False
     if locked_task.status != TaskStatus.RUNNING.value:
@@ -1342,6 +1358,7 @@ def claim_operation_task(session: Session, task: Task, node_id: str) -> bool:
     record.updated_at = utcnow()
     operation.status = "RUNNING"
     operation.updated_at = utcnow()
+    sync_fleet_operation_status(session, operation)
     return True
 
 
@@ -1543,6 +1560,50 @@ def _all_operation_nodes_support_rollout(
 def _finish_generic_operation(
     session: Session, operation: DeploymentOperation, deployment: Deployment
 ) -> None:
+    if deployment.fleet_id is not None:
+        from .fleet_runtime import fleet_operation_is_current
+
+        if (
+            operation.kind != "APPLY"
+            or operation.serve is not True
+            or operation.api is not True
+            or not fleet_operation_is_current(session, operation, lock=True)
+        ):
+            raise DeploymentRolloutConflictError(
+                "Fleet operation binding is invalid",
+                code="FLEET_RUNTIME_OPERATION_INVALID",
+            )
+        if operation.phase == "APPLY":
+            _queue_phase(session, operation, "START_API")
+            return
+        if operation.phase == "START_API":
+            _queue_phase(session, operation, "VERIFY_API")
+            return
+        if operation.phase == "VERIFY_API":
+            _queue_phase(session, operation, "VERIFY")
+            return
+        if operation.phase != "VERIFY":
+            raise DeploymentRolloutConflictError(
+                "Fleet operation phase cannot advance",
+                code="FLEET_RUNTIME_OPERATION_INVALID",
+            )
+        now = utcnow()
+        operation.status = "SUCCEEDED"
+        operation.phase = "COMPLETE"
+        operation.active_lineage_id = None
+        operation.updated_at = now
+        operation.completed_at = now
+        deployment.status = "VERIFIED"
+        deployment.verified_at = now
+        _operation_audit(
+            session,
+            "deployment_operation.complete",
+            operation,
+            "success",
+            kind="FLEET_APPLY_VERIFY",
+            deployment_id=deployment.id,
+        )
+        return
     if operation.kind == "APPLY" and operation.serve:
         if operation.phase == "APPLY":
             _queue_phase(session, operation, "START_API")
@@ -1743,6 +1804,13 @@ def finish_operation_task(
             and locked_task.result == result
             and locked_task.error == error
         )
+    from .fleet_runtime import (
+        fleet_operation_is_current,
+        sync_fleet_operation_status,
+    )
+
+    if not fleet_operation_is_current(session, operation, lock=True):
+        return False
     if not _binding_is_current(locked_task, record, operation):
         return False
     if locked_task.status != TaskStatus.RUNNING.value or record.status != "RUNNING":
@@ -1765,6 +1833,8 @@ def finish_operation_task(
         record.failure_code = "TASK_RESULT_INVALID"
     elif error == "TASK_LEASE_EXPIRED":
         record.failure_code = "TASK_LEASE_EXPIRED"
+    elif error == "NODE_REVOKED":
+        record.failure_code = "NODE_REVOKED"
     elif error is not None:
         record.failure_code = "TASK_FAILED"
     else:
@@ -1798,6 +1868,7 @@ def finish_operation_task(
                     task_id=locked_task.id,
                 )
         _update_failed_operation(session, operation)
+        sync_fleet_operation_status(session, operation)
         return True
 
     current_records = _phase_nodes(
@@ -1805,10 +1876,12 @@ def finish_operation_task(
     )
     if any(item.status in {"FAILED", "CANCELED"} for item in current_records):
         _update_failed_operation(session, operation)
+        sync_fleet_operation_status(session, operation)
         return True
     if not all(item.status == "SUCCEEDED" for item in current_records):
         operation.status = "RUNNING"
         operation.updated_at = now
+        sync_fleet_operation_status(session, operation)
         return True
     if operation.kind == "ROLLBACK":
         _advance_rollback(session, operation)
@@ -1817,6 +1890,7 @@ def finish_operation_task(
         if deployment is None:
             raise DeploymentRolloutNotFoundError()
         _finish_generic_operation(session, operation, deployment)
+    sync_fleet_operation_status(session, operation)
     return True
 
 
@@ -1832,6 +1906,13 @@ def cancel_operation_task(session: Session, task: Task) -> bool:
     ):
         return True
     if not _binding_is_current(locked_task, record, operation):
+        return False
+    from .fleet_runtime import (
+        fleet_operation_is_current,
+        sync_fleet_operation_status,
+    )
+
+    if not fleet_operation_is_current(session, operation, lock=True):
         return False
     if (
         locked_task.status != TaskStatus.QUEUED.value
@@ -1849,7 +1930,49 @@ def cancel_operation_task(session: Session, task: Task) -> bool:
     if node is not None:
         node.desired_state = None
     _update_failed_operation(session, operation)
+    sync_fleet_operation_status(session, operation)
     return True
+
+
+def revoke_operation_tasks_for_node(session: Session, node_id: str) -> int:
+    """Fence queued/running operation work after credential revocation."""
+
+    tasks = list(
+        session.scalars(
+            select(Task)
+            .where(
+                Task.node_id == node_id,
+                Task.operation_node_id.is_not(None),
+                Task.status.in_(
+                    {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+                ),
+            )
+            .order_by(Task.created_at, Task.id)
+        )
+    )
+    for task in tasks:
+        handled = (
+            cancel_operation_task(session, task)
+            if task.status == TaskStatus.QUEUED.value
+            else finish_operation_task(
+                session,
+                task,
+                node_id,
+                result=None,
+                error="NODE_REVOKED",
+            )
+        )
+        if not handled:
+            session.add(
+                AuditEvent(
+                    actor="controller",
+                    action="deployment_operation.revoke_cleanup",
+                    target=task.id,
+                    outcome="failure",
+                    detail={"code": "DEPLOYMENT_OPERATION_TASK_CONFLICT"},
+                )
+            )
+    return len(tasks)
 
 
 # Alternative hook-oriented names for integration call sites.
@@ -1874,4 +1997,5 @@ __all__ = [
     "operation_task_claimed",
     "operation_task_terminal",
     "prepare_or_apply_rollback",
+    "revoke_operation_tasks_for_node",
 ]

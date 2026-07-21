@@ -81,6 +81,7 @@ from .rollout import (
     cancel_operation_task,
     claim_operation_task,
     finish_operation_task,
+    revoke_operation_tasks_for_node,
     valid_deployment_task_success_result,
 )
 
@@ -1401,6 +1402,7 @@ def revoke_node(session: Session, node_id: str) -> bool:
     canceled_preparations = revoke_preparation_tasks_for_node(
         session, node_id
     )
+    canceled_operations = revoke_operation_tasks_for_node(session, node_id)
     node.desired_state = None
     audit(
         session,
@@ -1409,6 +1411,7 @@ def revoke_node(session: Session, node_id: str) -> bool:
         node_id,
         "success",
         canceled_preparation_tasks=canceled_preparations,
+        canceled_operation_tasks=canceled_operations,
     )
     session.commit()
     return True
@@ -2821,6 +2824,7 @@ def create_tasks(
     task_type: TaskType,
     deployment_id: str | None,
     options: dict,
+    _fleet_runtime_id: str | None = None,
 ) -> tuple[str, list[Task], dict[str, str]]:
     if task_type == TaskType.BENCHMARK:
         raise ValueError(
@@ -2850,6 +2854,7 @@ def create_tasks(
             deployment is not None
             and deployment.fleet_id is not None
             and task_type in DEPLOYMENT_TASK_TYPES
+            and _fleet_runtime_id is None
         ):
             raise DeploymentRolloutConflictError(
                 "Fleet deployment runtime requires the dedicated Fleet workflow",
@@ -2858,6 +2863,19 @@ def create_tasks(
                     "fleet_id": deployment.fleet_id,
                     "deployment_id": deployment.id,
                 },
+            )
+        if (
+            _fleet_runtime_id is not None
+            and (
+                deployment is None
+                or deployment.fleet_id is None
+                or task_type != TaskType.APPLY_DEPLOYMENT
+                or options != {"serve": True}
+            )
+        ):
+            raise DeploymentRolloutConflictError(
+                "Fleet runtime capability is invalid",
+                code="FLEET_RUNTIME_BINDING_INVALID",
             )
         if deployment is not None and task_type in DEPLOYMENT_TASK_TYPES:
             _lock_deployment_lineage_for_task_creation(session, deployment)
@@ -2876,7 +2894,10 @@ def create_tasks(
                 session, node_ids, gate_locked=True
             )
         effective_plan = deployment.plan if deployment is not None else None
-        if deployment is not None and deployment.source_recommendation_id is not None:
+        if deployment is not None and (
+            deployment.source_recommendation_id is not None
+            or deployment.fleet_id is not None
+        ):
             from .preparation import effective_deployment_plan
 
             effective_plan = effective_deployment_plan(
@@ -3012,11 +3033,13 @@ def create_tasks(
                     accept_model_download=(
                         deployment.accept_model_download
                         if deployment.source_recommendation_id is None
+                        and deployment.fleet_id is None
                         else False
                     ),
                     pull_image=(
                         deployment.pull_image
                         if deployment.source_recommendation_id is None
+                        and deployment.fleet_id is None
                         else False
                     ),
                 )
@@ -3030,14 +3053,44 @@ def create_tasks(
             session.add(task)
             tasks.append(task)
             node.desired_state = task_type.value
-        if deployment is not None:
-            attach_deployment_bulk_operation(
-                session,
-                deployment=deployment,
-                task_type=task_type,
-                tasks=tasks,
-                options=options,
+        if _fleet_runtime_id is not None and (
+            errors
+            or sorted(task.node_id for task in tasks)
+            != sorted(set(node_ids))
+            or len(tasks) != len(set(node_ids))
+        ):
+            raise DeploymentRolloutConflictError(
+                "Fleet apply must queue every exact reserved node",
+                code="FLEET_APPLY_INCOMPLETE",
+                details={"errors": errors},
             )
+        if deployment is not None:
+            # The operation payload performs one final immutable-plan check.
+            # Do not autoflush the tasks being attached before that check: a
+            # Fleet task must not make its own exact node set appear occupied
+            # and thereby invalidate the qualification it is about to use.
+            with session.no_autoflush:
+                operation = attach_deployment_bulk_operation(
+                    session,
+                    deployment=deployment,
+                    task_type=task_type,
+                    tasks=tasks,
+                    options=options,
+                )
+            if _fleet_runtime_id is not None:
+                if operation is None:
+                    raise DeploymentRolloutConflictError(
+                        "Fleet apply operation was not created",
+                        code="FLEET_RUNTIME_OPERATION_INVALID",
+                    )
+                from .fleet_runtime import bind_fleet_operation
+
+                bind_fleet_operation(
+                    session,
+                    runtime_id=_fleet_runtime_id,
+                    deployment=deployment,
+                    operation=operation,
+                )
             if tasks and task_type in {
                 TaskType.START_DEPLOYMENT,
                 TaskType.RESTART_DEPLOYMENT,

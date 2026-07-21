@@ -117,6 +117,7 @@ HEAD_TABLES = REGISTRY_TABLES | {
     "deployment_operation_nodes",
     "deployment_operations",
     "deployment_recommendations",
+    "fleet_deployment_runtime",
     "fleet_resource_reservations",
     "fleet_recommendations",
     "fleets",
@@ -266,6 +267,19 @@ FLEET_RESOURCE_RESERVATION_UNIQUES = {
     ("fleet_id", "node_id"),
     ("fleet_id", "gpu_uuid"),
     ("fleet_id", "deployment_id", "rank"),
+}
+FLEET_DEPLOYMENT_RUNTIME_CHECKS = {
+    "ck_fleet_deployment_runtime_failure",
+    "ck_fleet_deployment_runtime_id_canonical_uuid",
+    "ck_fleet_deployment_runtime_status",
+}
+FLEET_DEPLOYMENT_RUNTIME_INDEXES = {
+    "ix_fleet_deployment_runtime_fleet_status",
+}
+FLEET_DEPLOYMENT_RUNTIME_UNIQUES = {
+    ("fleet_id", "deployment_id"),
+    ("preparation_id",),
+    ("current_operation_id",),
 }
 DEPLOYMENT_GENERATION_UNIQUES = {
     ("lineage_id", "generation"),
@@ -2156,6 +2170,7 @@ class MigrationTests(unittest.TestCase):
                 "source_recommendation_id",
                 "status",
                 "created_at",
+                "updated_at",
             },
             set(fleet_columns),
         )
@@ -2269,6 +2284,100 @@ class MigrationTests(unittest.TestCase):
                 )
                 for item in inspector.get_foreign_keys(
                     "fleet_resource_reservations"
+                )
+            },
+        )
+        runtime_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("fleet_deployment_runtime")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "fleet_id",
+                "deployment_id",
+                "status",
+                "preparation_id",
+                "current_operation_id",
+                "failure_phase",
+                "failure_code",
+                "created_at",
+                "updated_at",
+            },
+            set(runtime_columns),
+        )
+        for name in (
+            "id",
+            "fleet_id",
+            "deployment_id",
+            "status",
+            "created_at",
+            "updated_at",
+        ):
+            self.assertFalse(runtime_columns[name]["nullable"], name)
+        for name in (
+            "preparation_id",
+            "current_operation_id",
+            "failure_phase",
+            "failure_code",
+        ):
+            self.assertTrue(runtime_columns[name]["nullable"], name)
+        self.assertEqual(
+            ["id"],
+            inspector.get_pk_constraint("fleet_deployment_runtime")[
+                "constrained_columns"
+            ],
+        )
+        self.assertEqual(
+            FLEET_DEPLOYMENT_RUNTIME_CHECKS,
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "fleet_deployment_runtime"
+                )
+            },
+        )
+        self.assertEqual(
+            FLEET_DEPLOYMENT_RUNTIME_UNIQUES,
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "fleet_deployment_runtime"
+                )
+            },
+        )
+        self.assertEqual(
+            FLEET_DEPLOYMENT_RUNTIME_INDEXES,
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "fleet_deployment_runtime"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("fleet_id",): ("fleets", ("id",)),
+                ("fleet_id", "deployment_id"): (
+                    "deployments",
+                    ("fleet_id", "id"),
+                ),
+                ("preparation_id",): (
+                    "artifact_preparations",
+                    ("id",),
+                ),
+                ("current_operation_id",): (
+                    "deployment_operations",
+                    ("id",),
+                ),
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "fleet_deployment_runtime"
                 )
             },
         )
@@ -2625,19 +2734,18 @@ class MigrationTests(unittest.TestCase):
             revision_module._append_only_guard_downgrade_sql("postgresql"),
         )
 
-    def test_migration_history_has_single_0014_head(self):
+    def test_migration_history_has_single_0015_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0014"])
+            self.assertEqual(heads, ["0015"])
 
     def test_0014_fleet_reservation_schema_constraints_and_downgrade(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'fleet-reservations.db'}"
             migration_config = config(url)
-            command.upgrade(migration_config, "head")
-            self.assert_benchmark_head(url)
+            command.upgrade(migration_config, "0014")
 
             engine = make_engine(url)
             factory = make_session_factory(engine)
@@ -2892,7 +3000,7 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'fleet-recommendations.db'}"
             migration_config = config(url)
-            command.upgrade(migration_config, "head")
+            command.upgrade(migration_config, "0013")
             engine = make_engine(url)
             factory = make_session_factory(engine)
             recommendation_id = "sha256:" + "a" * 64

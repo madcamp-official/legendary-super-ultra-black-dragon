@@ -285,6 +285,18 @@ def _parser() -> argparse.ArgumentParser:
     fleet_accept.add_argument(
         "recommendation_id", type=_non_empty_identifier_argument
     )
+    fleet_status = fleet_sub.add_parser(
+        "status", help="Show an accepted Fleet and each deployment runtime"
+    )
+    fleet_status.add_argument("fleet_id", type=_canonical_uuid_argument)
+    fleet_prepare = fleet_sub.add_parser(
+        "prepare", help="Explicitly prepare every eligible Fleet deployment"
+    )
+    fleet_prepare.add_argument("fleet_id", type=_canonical_uuid_argument)
+    fleet_apply = fleet_sub.add_parser(
+        "apply", help="Explicitly apply and verify every prepared Fleet deployment"
+    )
+    fleet_apply.add_argument("fleet_id", type=_canonical_uuid_argument)
     deployment = admin_sub.add_parser("deployment")
     deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
     deployment_create = deployment_sub.add_parser("create")
@@ -814,6 +826,21 @@ def _admin(args: argparse.Namespace) -> int:
             value = client.request(
                 "POST",
                 f"/v1/admin/fleet-recommendations/{args.recommendation_id}/accept",
+                {},
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.fleet_command == "status":
+            value = client.request(
+                "GET",
+                f"/v1/admin/fleets/{args.fleet_id}",
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
+        if args.fleet_command in {"prepare", "apply"}:
+            value = client.request(
+                "POST",
+                f"/v1/admin/fleets/{args.fleet_id}/{args.fleet_command}",
                 {},
             )
             print(json.dumps(value, indent=2, sort_keys=True))

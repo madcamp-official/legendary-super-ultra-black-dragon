@@ -117,6 +117,17 @@ GET  /v1/admin/model-artifacts/{artifact_id}/manifest
 
 수락은 선택한 `cache_kind`, 매니페스트·variant, loader, backend, UUID→rank와 검증 증적을 세대에 고정합니다. 이후 준비·배포 실패가 발생해도 같은 세대 안에서 다른 variant나 `FULL_SNAPSHOT`으로 자동 전환하지 않습니다. 다른 형식, 더 작은 모델 또는 다른 노드 조합이 필요하면 원인을 반영한 새 probe·recommend·accept를 수행합니다.
 
+Fleet 소속 세대는 기존 단일 배포 준비 API를 직접 사용하지 않습니다. 운영자는 먼저 읽기 전용 상태를 확인한 뒤 전용 Fleet 명령을 명시적으로 실행합니다.
+
+```bash
+dure admin fleet status <fleet-id>
+dure admin fleet prepare <fleet-id>
+```
+
+`fleet prepare`는 빈 요청 본문만 허용하고 Fleet에 저장된 각 후보의 모델·runtime·노드/GPU/rank·매니페스트·cache kind·exact qualification 증적을 현재 상태와 다시 비교합니다. 검사에 통과한 배포마다 결정론적 내부 준비 ID를 사용해 같은 `PREPARE_MODEL → PREPARE_IMAGE` 서비스를 실행합니다. Fleet 자신의 exact 예약은 유지하지만 다른 점유나 identity drift를 무시하지 않습니다. 한 배포의 실패는 그 runtime을 `PREPARE_FAILED`로 닫으며 다른 배포의 준비를 자동 취소하지 않습니다.
+
+모든 노드 준비가 성공한 배포만 별도의 `dure admin fleet apply <fleet-id>`가 소비할 수 있습니다. 이 적용도 exact `READY`, 현재 모델 준비 시도와 최신 OCI digest 이미지 증적을 다시 검사합니다. 실패해도 캐시 종류 변경, 다른 모델·노드 선택, 자동 컨테이너 중지·롤백 또는 Fleet 예약 해제는 수행하지 않습니다.
+
 같은 정규 UUID 요청 ID를 사용해 먼저 preview를 만들고, 응답을 검토한 다음에만 `--apply`를 추가합니다.
 
 ```bash
@@ -366,7 +377,7 @@ Agent 준비기는 노드 로컬 설정으로 생성한 검증된 `TrustedHTTPSO
 - 중앙 캐시의 exact final 참조 검사와 보존형 quarantine는 제공하지만 자동 경보, CAS 청크 단위 전역 참조 수집, 자동 eviction·삭제·보존 만료는 없습니다.
 - 추천기는 `STAGE` variant를 자동 선택하지만 수락 뒤 자동 fallback하지 않습니다. rank별 노드 다운로드·원자적 활성화와 stage-local `sharded_state` 소비는 제공하지만 P2P 청크 전송은 없습니다.
 - 공유 파일시스템을 모델 전달 계층으로 자동 구성하거나 여러 노드가 하나의 가변 모델 디렉터리를 함께 사용하게 하지 않습니다. erasure coding도 제공하지 않으며 각 노드는 선택된 불변 매니페스트에서 자신의 exact 파일을 로컬 캐시로 준비합니다.
-- 지원 목록 밖의 모델 family·quantization·TP/PP 조합을 자동 추정하지 않습니다. 캐시 자동 삭제·퇴출과 추천 직후 자동 준비·배포도 없으며, 준비와 배포에는 각각 운영자의 명시적 `--apply`가 필요합니다.
+- 지원 목록 밖의 모델 family·quantization·TP/PP 조합을 자동 추정하지 않습니다. 캐시 자동 삭제·퇴출과 추천 직후 자동 준비·배포도 없습니다. 단일 배포는 준비와 배포의 `--apply`, Fleet는 전용 `fleet prepare`와 `fleet apply`를 각각 운영자가 명시해야 합니다.
 
 ## 무결성과 신뢰 경계
 

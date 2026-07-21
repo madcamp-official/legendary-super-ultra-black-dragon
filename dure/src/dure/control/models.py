@@ -224,7 +224,8 @@ class FleetRecord(Base):
             name="ck_fleets_id_canonical_uuid",
         ),
         CheckConstraint(
-            "status = 'ACCEPTED'",
+            "status IN ('ACCEPTED', 'PREPARING', 'PREPARED', 'APPLYING', "
+            "'VERIFYING', 'ACTIVE', 'PARTIAL_FAILED', 'FAILED')",
             name="ck_fleets_status",
         ),
         UniqueConstraint(
@@ -248,6 +249,9 @@ class FleetRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -257,6 +261,11 @@ class FleetRecord(Base):
             "created_at": (
                 self.created_at.isoformat()
                 if self.created_at is not None
+                else None
+            ),
+            "updated_at": (
+                self.updated_at.isoformat()
+                if self.updated_at is not None
                 else None
             ),
         }
@@ -433,6 +442,122 @@ class FleetResourceReservation(Base):
             "created_at": (
                 self.created_at.isoformat()
                 if self.created_at is not None
+                else None
+            ),
+        }
+
+
+class FleetDeploymentRuntime(Base):
+    """Fleet 안의 배포 하나에 대한 준비·적용·검증 실행 상태."""
+
+    __tablename__ = "fleet_deployment_runtime"
+    __table_args__ = (
+        CheckConstraint(
+            _canonical_uuid_check(),
+            name="ck_fleet_deployment_runtime_id_canonical_uuid",
+        ),
+        CheckConstraint(
+            "status IN ('ACCEPTED', 'PREPARING', 'PREPARED', "
+            "'PREPARE_FAILED', 'APPLYING', 'VERIFYING', 'ACTIVE', "
+            "'APPLY_FAILED', 'VERIFY_FAILED')",
+            name="ck_fleet_deployment_runtime_status",
+        ),
+        CheckConstraint(
+            "(status NOT IN ('PREPARE_FAILED', 'APPLY_FAILED', "
+            "'VERIFY_FAILED') AND failure_phase IS NULL "
+            "AND failure_code IS NULL) OR "
+            "(status = 'PREPARE_FAILED' AND failure_phase = 'PREPARE' "
+            "AND failure_code IS NOT NULL "
+            "AND length(failure_code) BETWEEN 1 AND 64) OR "
+            "(status = 'APPLY_FAILED' AND failure_phase = 'APPLY' "
+            "AND failure_code IS NOT NULL "
+            "AND length(failure_code) BETWEEN 1 AND 64) OR "
+            "(status = 'VERIFY_FAILED' AND failure_phase = 'VERIFY' "
+            "AND failure_code IS NOT NULL "
+            "AND length(failure_code) BETWEEN 1 AND 64)",
+            name="ck_fleet_deployment_runtime_failure",
+        ),
+        ForeignKeyConstraint(
+            ["fleet_id", "deployment_id"],
+            ["deployments.fleet_id", "deployments.id"],
+            ondelete="CASCADE",
+            name="fk_fleet_deployment_runtime_fleet_deployment",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "deployment_id",
+            name="uq_fleet_deployment_runtime_fleet_deployment",
+        ),
+        UniqueConstraint(
+            "preparation_id",
+            name="uq_fleet_deployment_runtime_preparation",
+        ),
+        UniqueConstraint(
+            "current_operation_id",
+            name="uq_fleet_deployment_runtime_current_operation",
+        ),
+        Index(
+            "ix_fleet_deployment_runtime_fleet_status",
+            "fleet_id",
+            "status",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    fleet_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "fleets.id",
+            ondelete="CASCADE",
+            name="fk_fleet_deployment_runtime_fleet_id",
+        ),
+        nullable=False,
+    )
+    deployment_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default="ACCEPTED", nullable=False
+    )
+    preparation_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "artifact_preparations.id",
+            name="fk_fleet_deployment_runtime_preparation_id",
+        ),
+    )
+    current_operation_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "deployment_operations.id",
+            name="fk_fleet_deployment_runtime_current_operation_id",
+        ),
+    )
+    failure_phase: Mapped[str | None] = mapped_column(String(16))
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "fleet_id": self.fleet_id,
+            "deployment_id": self.deployment_id,
+            "status": self.status,
+            "preparation_id": self.preparation_id,
+            "current_operation_id": self.current_operation_id,
+            "failure_phase": self.failure_phase,
+            "failure_code": self.failure_code,
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+            "updated_at": (
+                self.updated_at.isoformat()
+                if self.updated_at is not None
                 else None
             ),
         }

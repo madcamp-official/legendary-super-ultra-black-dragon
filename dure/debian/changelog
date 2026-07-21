@@ -1,3 +1,12 @@
+dure (0.3.32) UNRELEASED; urgency=medium
+
+  * 수락된 Fleet의 배포별 모델·이미지 준비와 명시적 적용을 추가합니다.
+  * 적용 작업을 API 기동과 전체 노드 검증까지 폐쇄형 단계로 연결합니다.
+  * 한 배포의 실패를 격리하고 Fleet·배포 런타임 상태를 증적과 동기화합니다.
+  * 중복 적용 요청을 멱등 처리하고 Fleet 계보의 일반 세대 확장을 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:59:00 +0900
+
 dure (0.3.31) UNRELEASED; urgency=medium
 
   * 불변 Fleet 추천 수락 시 모든 배포 세대와 노드·GPU 예약을 원자적으로 생성합니다.

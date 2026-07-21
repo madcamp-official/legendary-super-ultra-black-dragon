@@ -1,6 +1,6 @@
 # Fleet 후보 생성과 결정론적 스케줄러
 
-> 상태: **불변 추천과 원자적 수락·예약 구현**. 네 모델의 ACTIVE 자동 배치 프로필과 현재 유효한 exact qualification 증적을 GPU 풀에 투영하고, 서로 겹치지 않는 여러 배포 단위를 결정론적으로 조합합니다. 관리자가 추천을 수락하면 모든 1세대 배포와 노드·GPU 예약을 한 트랜잭션으로 만들지만, 준비와 실제 적용은 별도 후속 단계입니다.
+> 상태: **불변 추천, 원자적 수락·예약과 전용 Fleet runtime 구현**. 네 모델의 ACTIVE 자동 배치 프로필과 현재 유효한 exact qualification 증적을 GPU 풀에 투영해 서로 겹치지 않는 여러 배포 단위를 결정론적으로 조합합니다. 추천과 수락은 호스트를 바꾸지 않으며, 운영자가 전용 준비와 적용 명령을 각각 명시한 뒤에만 모델·이미지 준비와 컨테이너 적용·검증을 수행합니다.
 
 ## 고정 계약
 
@@ -128,12 +128,14 @@ dure admin fleet show sha256:<64-hex>
 dure admin fleet accept sha256:<64-hex>
 ```
 
-대응 API는 다음 네 개이며 모두 관리자 인증을 요구합니다.
+대응 API는 다음 경로이며 모두 관리자 인증을 요구합니다.
 
 - `POST /v1/admin/fleet-recommendations`
 - `GET /v1/admin/fleet-recommendations/{recommendation-id}`
 - `POST /v1/admin/fleet-recommendations/{recommendation-id}/accept`
 - `GET /v1/admin/fleets/{fleet-id}`
+- `POST /v1/admin/fleets/{fleet-id}/prepare`
+- `POST /v1/admin/fleets/{fleet-id}/apply`
 
 저장 행은 요청 정책, 전체 인벤토리·GPU 풀, 모든 후보와 투영 탈락 사유, 선택 배포, 미배정 노드, 증적·카탈로그·스케줄러 버전과 탐색 완료 상태를 포함합니다. ID는 생성 시각을 제외한 전체 정규 스냅샷의 SHA-256입니다. 같은 입력과 관측 상태를 반복하면 같은 ID의 기존 행을 반환하며, `recorded_at`은 ID 바깥의 DB 메타데이터입니다.
 
@@ -150,8 +152,68 @@ dure admin fleet accept sha256:<64-hex>
 
 하나라도 실패하면 Fleet, 배포, 예약을 전부 롤백합니다. 같은 추천을 다시 수락하면 기존 Fleet를 검증해 멱등 반환하며 부분 Fleet를 보완하거나 새 ID로 복제하지 않습니다. 활성 예약은 노드 UUID가 달라도 같은 GPU UUID를 보고하는 경우까지 포함해 다른 단일 배포, qualification, benchmark와 무관한 작업이 같은 노드 또는 GPU를 선점하지 못하게 합니다.
 
-## 무변경 경계와 현재 제한
+## 전용 Fleet 준비·적용·검증
 
-`recommend`와 `show`는 추천 기록 외 상태를 바꾸지 않습니다. `accept`는 중앙 DB의 Fleet, `CREATED` 배포 세대와 활성 예약만 만들며 Agent task, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지 또는 기존 서비스 변경은 수행하지 않습니다. 이 버전에서는 Fleet 소속 세대를 기존 단일 배포 prepare·task·rollout API에 넘겨도 `FLEET_RUNTIME_NOT_AVAILABLE`로 거부합니다. 실제 호스트 변경은 후속 전용 Fleet 준비·적용 API에서 운영자가 별도로 명시해야 합니다.
+수락된 Fleet에는 배포마다 독립된 runtime 행이 하나씩 생깁니다. 저장된 추천·배포·예약과 실행 상태를 함께 조회합니다.
 
-현재 노드 프로필 자체에는 운영자가 지정한 네트워크 영역 값이 없습니다. 내부 평가 호출자가 서버가 신뢰하는 명시적 `node UUID → network zone` 매핑을 제공하면, 모든 rank가 같은 영역인 후보의 비용은 0이고 여러 영역을 가로지르는 후보는 서로 다른 영역 수에 따라 비용을 받습니다. 매핑이 없거나 후보의 일부 노드에만 있으면 추측하지 않고 중립값을 사용합니다. 어느 경우에도 exact NCCL 증적은 필수입니다. 수락·예약은 구현됐지만 모델·이미지 준비와 여러 배포의 실제 적용·검증·실패 격리는 후속 단계입니다.
+```bash
+dure admin fleet status <fleet-id>
+```
+
+`status`는 읽기 전용입니다. 응답의 `runtime`에는 배포 ID, 현재 상태, 준비 ID, 현재 operation ID와 실패 단계·코드가 포함됩니다.
+
+모델과 이미지는 다음 전용 명령을 명시적으로 실행한 뒤에만 준비합니다.
+
+```bash
+dure admin fleet prepare <fleet-id>
+```
+
+서버는 수락 당시 후보를 현재 모델·런타임 레지스트리, 정확한 노드·GPU 인벤토리, `STAGE` 또는 `FULL_SNAPSHOT` identity와 최신 exact qualification 증적에 다시 대입합니다. Fleet 자신이 보유한 예약은 자기 점유로 인정하지만 다른 점유를 우회하지 않습니다. 저장 후보와 현재 후보의 모델, 프로필, 노드·GPU·rank, 캐시 종류, 매니페스트, runtime, 증적이 달라졌다면 해당 배포를 `PREPARE_FAILED`로 닫고 호스트 작업을 만들지 않습니다.
+
+검사를 통과한 배포는 저장 선택을 바꾸지 않고 노드별 `PREPARE_MODEL → PREPARE_IMAGE`를 수행합니다. 다른 모델·노드·variant나 `STAGE`↔`FULL_SNAPSHOT`으로 자동 전환하지 않습니다. 모든 노드의 모델·이미지 준비와 exact `READY`·최신 OCI digest 증적이 성공해야 그 배포가 `PREPARED`가 됩니다.
+
+준비된 배포는 다음 명령으로만 적용합니다.
+
+```bash
+dure admin fleet apply <fleet-id>
+```
+
+각 배포의 하나의 펜싱된 operation 안에서 다음 순서를 강제합니다.
+
+```text
+APPLY (전체 배정 노드, serve=false)
+  → START_API (Ray head 한 대)
+  → VERIFY_API (Ray head 한 대)
+  → VERIFY (전체 배정 노드)
+  → ACTIVE
+```
+
+`apply`는 적용 직전에도 exact 캐시가 현재 `READY`인지, 준비 시도와 OCI 이미지 다이제스트 증적이 최신인지, 저장된 plan·노드·GPU·rank 결합이 그대로인지 검사합니다. 전체 노드 검증과 head API 검증이 모두 성공해야 배포의 `verified_at`과 runtime의 `ACTIVE`를 기록합니다. 현재 operation이 아닌 과거 시도의 claim·완료·취소는 상태를 전진시키지 않습니다.
+
+배포별 runtime 상태는 다음 폐쇄형 값입니다.
+
+```text
+ACCEPTED → PREPARING → PREPARED → APPLYING → VERIFYING → ACTIVE
+              └─────→ PREPARE_FAILED
+                                  └────────→ APPLY_FAILED
+                                               └──────→ VERIFY_FAILED
+```
+
+Fleet 전체 상태는 배포별 상태를 결정론적으로 집계한 `ACCEPTED`, `PREPARING`, `PREPARED`, `APPLYING`, `VERIFYING`, `ACTIVE`, `PARTIAL_FAILED`, `FAILED` 중 하나입니다. 한 배포가 실패해도 나머지 배포의 준비·적용을 계속 시도하므로 일부만 실패하면 `PARTIAL_FAILED`가 됩니다. 모두 실패한 경우에만 `FAILED`입니다.
+
+## 실패 격리와 무변경 경계
+
+`recommend`와 `show`는 추천 기록 외 상태를 바꾸지 않습니다. `accept`는 중앙 DB의 Fleet, `CREATED` 배포 세대, 배포별 runtime과 활성 예약만 만들며 Agent task, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지 또는 기존 서비스 변경은 수행하지 않습니다. `status`도 읽기 전용입니다. 실제 호스트 변경은 운영자가 `fleet prepare` 또는 `fleet apply`를 명시한 경우에만 발생합니다. 두 POST API의 본문은 빈 JSON 객체만 허용하므로 모델, 노드, 명령, Docker 인자, 다운로드 우회 값을 주입할 수 없습니다.
+
+Fleet 안의 배포는 전용 runtime ID와 저장 plan에 결합된 경로로만 준비·적용합니다. 기존 단일 배포 prepare·일반 task·rollout API에 Fleet 세대를 직접 넘겨 전용 상태와 예약 검사를 우회할 수 없습니다. 한 배포의 실패는 그 runtime에 `failure_phase`와 폐쇄형 `failure_code`를 남기고 다른 배포의 작업을 자동 취소하지 않습니다.
+
+실패 시 Dure는 다음 동작을 자동으로 수행하지 않습니다.
+
+- 다른 노드나 모델로 재스케줄링
+- 실행 중이거나 일부 적용된 컨테이너 중지
+- 과거 세대로 롤백
+- Fleet 노드·GPU 예약 해제
+
+따라서 `PARTIAL_FAILED`나 `FAILED`를 확인하면 `fleet status`의 배포별 준비·operation ID와 실패 코드를 기준으로 실제 호스트 상태를 조사해야 합니다. Fleet 예약은 조사와 명시적 복구 동안 유지되며, 현재 구현에는 Fleet 전체 취소·예약 해제 명령이 없습니다.
+
+현재 노드 프로필 자체에는 운영자가 지정한 네트워크 영역 값이 없습니다. 내부 평가 호출자가 서버가 신뢰하는 명시적 `node UUID → network zone` 매핑을 제공하면, 모든 rank가 같은 영역인 후보의 비용은 0이고 여러 영역을 가로지르는 후보는 서로 다른 영역 수에 따라 비용을 받습니다. 매핑이 없거나 후보의 일부 노드에만 있으면 추측하지 않고 중립값을 사용합니다. 어느 경우에도 exact NCCL 증적은 필수입니다. 전용 Fleet runtime은 기존에 제출된 exact 증적을 재검사해 소비할 뿐, 다중 노드 네트워크·NCCL qualification 시험을 새로 자동 실행하지 않습니다.

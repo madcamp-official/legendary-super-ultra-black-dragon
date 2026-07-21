@@ -265,6 +265,7 @@ def _network_evidence_bindings(
     placement: PlacementProfileRecord,
     inventory: list[InventoryNode],
     now: datetime,
+    reservation_fleet_id: str | None = None,
 ) -> tuple[NetworkEvidenceBinding, ...]:
     requires_network = placement.requires_network_evidence or placement.node_count > 1
     requires_qualification = placement.origin == "AUTO"
@@ -322,6 +323,7 @@ def _network_evidence_bindings(
                     run=qualification_run,
                     now=now,
                     require_primary=False,
+                    reservation_fleet_id=reservation_fleet_id,
                 )
             except ProfileQualificationError:
                 continue
@@ -684,6 +686,7 @@ def _active_catalog(
     *,
     inventory: list[InventoryNode],
     now: datetime,
+    reservation_fleet_id: str | None = None,
 ) -> tuple[ModelCatalog, dict[str, dict[str, Any]]]:
     rows = session.execute(
         select(ModelRelease, ModelArtifact, RuntimeRelease, PlacementProfileRecord)
@@ -725,6 +728,7 @@ def _active_catalog(
             placement=placement,
             inventory=inventory,
             now=now,
+            reservation_fleet_id=reservation_fleet_id,
         )
         base_context = {
             "model_id": artifact.model_id,
@@ -1929,6 +1933,15 @@ def _previous_generation(
             code="PREVIOUS_GENERATION_LINEAGE_INVALID",
             details={"previous_generation_id": previous_generation_id},
         )
+    if root.fleet_id is not None or previous.fleet_id is not None:
+        raise RecommendationGenerationConflictError(
+            "Fleet deployment lineages cannot be extended by standalone recommendations",
+            code="FLEET_LINEAGE_EXTENSION_FORBIDDEN",
+            details={
+                "previous_generation_id": previous_generation_id,
+                "fleet_id": root.fleet_id or previous.fleet_id,
+            },
+        )
     if previous.status == "ROLLED_BACK":
         raise RecommendationGenerationConflictError(
             "a rolled-back generation cannot continue its old lineage",
@@ -1991,6 +2004,40 @@ def _previous_generation(
     return previous, lineage_id, previous.generation + 1
 
 
+def _raise_if_previous_generation_belongs_to_fleet(
+    session: Session, previous_generation_id: str | None
+) -> None:
+    """Fail before recommendation drift can obscure the Fleet boundary.
+
+    This is an early read-only check.  ``_previous_generation`` repeats the
+    decision after locking the lineage in the established mutation lock order.
+    """
+
+    if previous_generation_id is None:
+        return
+    candidate = session.get(Deployment, previous_generation_id)
+    if candidate is None:
+        return
+    lineage_id = candidate.lineage_id or candidate.id
+    root = candidate if candidate.id == lineage_id else session.get(
+        Deployment, lineage_id
+    )
+    fleet_id = (
+        candidate.fleet_id
+        if candidate.fleet_id is not None
+        else root.fleet_id if root is not None else None
+    )
+    if fleet_id is not None:
+        raise RecommendationGenerationConflictError(
+            "Fleet deployment lineages cannot be extended by standalone recommendations",
+            code="FLEET_LINEAGE_EXTENSION_FORBIDDEN",
+            details={
+                "previous_generation_id": previous_generation_id,
+                "fleet_id": fleet_id,
+            },
+        )
+
+
 def _raise_if_previous_lineage_operation_is_active(
     session: Session, previous_generation_id: str | None
 ) -> None:
@@ -2038,6 +2085,9 @@ def accept_deployment_recommendation(
             details={"recommendation_id": recommendation_id}
         )
     _validate_stored_record(recommendation_record)
+    _raise_if_previous_generation_belongs_to_fleet(
+        session, previous_generation_id
+    )
     existing = session.scalar(
         select(Deployment)
         .where(Deployment.source_recommendation_id == recommendation_id)

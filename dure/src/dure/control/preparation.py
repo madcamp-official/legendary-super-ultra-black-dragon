@@ -6,6 +6,7 @@ import json
 import math
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -51,15 +52,24 @@ from .models import (
     Deployment,
     DeploymentOperation,
     DeploymentRecommendationRecord,
+    FleetRecommendationRecord,
+    FleetRecord,
     ModelArtifact,
     ModelRelease,
     Node,
     NodeProfileRecord,
+    PlacementProfileRecord,
+    ProfileQualificationEvidence,
+    ProfileQualificationRun,
     RuntimeRelease,
     Task,
     utcnow,
 )
-from .qualification import active_profile_qualification_nodes
+from .qualification import (
+    ProfileQualificationError,
+    active_profile_qualification_nodes,
+    validate_profile_qualification_evidence,
+)
 from .recommendation import RecommendationError, evaluate_deployment_recommendation
 from .resource_reservation import (
     FleetResourceReservationError,
@@ -138,6 +148,16 @@ class ArtifactPreparationNotFoundError(ArtifactPreparationError):
         details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message, code=code, details=details)
+
+
+@dataclass(frozen=True)
+class _PreparationSource:
+    kind: str
+    source_id: str
+    inventory_fingerprint: str
+    inventory_snapshot: list[dict[str, Any]]
+    selected: dict[str, Any]
+    fleet_id: str | None = None
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -462,6 +482,227 @@ def _stage_preparation_projection(
     }
 
 
+def _preparation_source(
+    session: Session,
+    deployment: Deployment,
+) -> _PreparationSource:
+    if deployment.fleet_id is None:
+        if deployment.source_recommendation_id is None:
+            raise ArtifactPreparationError(
+                "only an accepted recommendation generation can be prepared",
+                code="PREPARATION_RECOMMENDATION_REQUIRED",
+                details={"deployment_id": deployment.id},
+            )
+        recommendation = session.scalar(
+            select(DeploymentRecommendationRecord).where(
+                DeploymentRecommendationRecord.id
+                == deployment.source_recommendation_id
+            )
+        )
+        if recommendation is None:
+            raise ArtifactPreparationError(
+                "accepted recommendation snapshot is missing",
+                code="PREPARATION_RECOMMENDATION_MISSING",
+                details={"deployment_id": deployment.id},
+            )
+        selected = recommendation.recommendation_snapshot.get("selected")
+        if not isinstance(selected, dict):
+            raise ArtifactPreparationError(
+                "accepted recommendation has no selected artifact",
+                code="PREPARATION_RECOMMENDATION_INVALID",
+                details={"deployment_id": deployment.id},
+            )
+        return _PreparationSource(
+            kind="DEPLOYMENT_RECOMMENDATION",
+            source_id=recommendation.id,
+            inventory_fingerprint=recommendation.inventory_fingerprint,
+            inventory_snapshot=list(recommendation.inventory_snapshot),
+            selected=dict(selected),
+        )
+
+    if (
+        deployment.source_recommendation_id is not None
+        or deployment.fleet_candidate_id is None
+    ):
+        raise ArtifactPreparationError(
+            "Fleet deployment source binding is invalid",
+            code="PREPARATION_RECOMMENDATION_INVALID",
+            details={"deployment_id": deployment.id},
+        )
+    fleet = session.get(FleetRecord, deployment.fleet_id)
+    recommendation = (
+        session.get(FleetRecommendationRecord, fleet.source_recommendation_id)
+        if fleet is not None
+        else None
+    )
+    if fleet is None or recommendation is None:
+        raise ArtifactPreparationError(
+            "accepted Fleet recommendation snapshot is missing",
+            code="PREPARATION_RECOMMENDATION_MISSING",
+            details={"deployment_id": deployment.id},
+        )
+    from .fleet_acceptance import (
+        _assert_plan_candidate_identity,
+        _candidate_bindings,
+        _selected_candidates,
+    )
+    from .fleet_recommendation import (
+        FleetRecommendationError,
+        validate_stored_fleet_recommendation,
+    )
+
+    try:
+        validate_stored_fleet_recommendation(recommendation)
+        selected_candidates = _selected_candidates(
+            recommendation.recommendation_snapshot
+        )
+        selected = next(
+            (
+                item
+                for item in selected_candidates
+                if item.get("candidate_id") == deployment.fleet_candidate_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ArtifactPreparationError(
+                "Fleet candidate is missing from its immutable recommendation",
+                code="PREPARATION_RECOMMENDATION_INVALID",
+                details={"deployment_id": deployment.id},
+            )
+        bindings = _candidate_bindings(selected)
+        _assert_plan_candidate_identity(
+            plan=deployment.plan,
+            candidate=selected,
+            bindings=bindings,
+            deployment_id=deployment.id,
+            generation=deployment.generation,
+        )
+    except FleetRecommendationError as exc:
+        raise ArtifactPreparationError(
+            "accepted Fleet recommendation is invalid",
+            code="PREPARATION_RECOMMENDATION_INVALID",
+            details={"deployment_id": deployment.id},
+        ) from exc
+    evaluation = recommendation.recommendation_snapshot.get("evaluation")
+    inventory_snapshot = (
+        evaluation.get("inventory_snapshot")
+        if isinstance(evaluation, dict)
+        else None
+    )
+    if not isinstance(inventory_snapshot, list):
+        raise ArtifactPreparationError(
+            "Fleet recommendation inventory snapshot is invalid",
+            code="PREPARATION_RECOMMENDATION_INVALID",
+            details={"deployment_id": deployment.id},
+        )
+    normalized_selected = dict(selected)
+    normalized_selected.update(
+        {
+            "node_ids": sorted(item["node_id"] for item in bindings),
+            "feasible": True,
+            "rejections": [],
+        }
+    )
+    return _PreparationSource(
+        kind="FLEET_RECOMMENDATION",
+        source_id=recommendation.id,
+        inventory_fingerprint=recommendation.inventory_fingerprint,
+        inventory_snapshot=list(inventory_snapshot),
+        selected=normalized_selected,
+        fleet_id=fleet.id,
+    )
+
+
+def _validate_fleet_qualification(
+    session: Session,
+    *,
+    source: _PreparationSource,
+    now: datetime,
+) -> None:
+    if source.fleet_id is None:
+        return
+    selected = source.selected
+    from .fleet import FleetEvaluationError, validate_fleet_candidate_current
+
+    try:
+        current = validate_fleet_candidate_current(
+            session,
+            candidate=selected,
+            node_ids=list(selected.get("node_ids", [])),
+            now=now,
+            reservation_fleet_id=source.fleet_id,
+        )
+    except (FleetEvaluationError, RecommendationError, ValueError) as exc:
+        raise ArtifactPreparationError(
+            "Fleet candidate no longer has current registry evidence",
+            code="PREPARATION_QUALIFICATION_STALE",
+            details={"qualification_failure_code": getattr(exc, "code", None)},
+        ) from exc
+    for field in (
+        "candidate_id",
+        "catalog_candidate_id",
+        "placement_id",
+        "evidence_id",
+        "evidence_digest",
+        "rank_node_ids",
+        "gpu_bindings",
+        "model_release_id",
+        "artifact_id",
+        "artifact_manifest_digest",
+        "runtime_release_id",
+        "runtime_image",
+        "model_cache_kind",
+        "stage_artifact",
+        "stage_ranks",
+    ):
+        if current.get(field) != selected.get(field):
+            raise ArtifactPreparationError(
+                "Fleet candidate registry identity has changed",
+                code="PREPARATION_QUALIFICATION_STALE",
+                details={"changed_field": field},
+            )
+    placement = session.get(PlacementProfileRecord, selected.get("placement_id"))
+    evidence = session.get(
+        ProfileQualificationEvidence, selected.get("evidence_id")
+    )
+    run = (
+        session.get(ProfileQualificationRun, evidence.run_id)
+        if evidence is not None
+        else None
+    )
+    purpose = selected.get("qualification_purpose")
+    if (
+        placement is None
+        or evidence is None
+        or run is None
+        or purpose not in {"PRIMARY", "SUPPLEMENTARY"}
+        or evidence.evidence_digest != selected.get("evidence_digest")
+        or run.gpu_bindings != selected.get("gpu_bindings")
+        or list(run.rank_node_ids) != selected.get("rank_node_ids")
+    ):
+        raise ArtifactPreparationError(
+            "Fleet qualification identity is missing or changed",
+            code="PREPARATION_QUALIFICATION_STALE",
+        )
+    try:
+        validate_profile_qualification_evidence(
+            session,
+            placement=placement,
+            evidence=evidence,
+            run=run,
+            now=now,
+            require_primary=purpose == "PRIMARY",
+            reservation_fleet_id=source.fleet_id,
+        )
+    except ProfileQualificationError as exc:
+        raise ArtifactPreparationError(
+            "Fleet qualification evidence is no longer current",
+            code="PREPARATION_QUALIFICATION_STALE",
+            details={"qualification_failure_code": exc.code},
+        ) from exc
+
+
 def _selected_context(
     session: Session,
     deployment: Deployment,
@@ -472,39 +713,15 @@ def _selected_context(
     revalidate_inventory: bool = True,
     disk_node_ids: set[str] | None = None,
 ) -> tuple[
-    DeploymentRecommendationRecord,
+    _PreparationSource,
     dict[str, Any],
     ModelArtifact,
     ArtifactManifest,
     list[Node],
     dict[str, Any] | None,
 ]:
-    if deployment.source_recommendation_id is None:
-        raise ArtifactPreparationError(
-            "only an accepted recommendation generation can be prepared",
-            code="PREPARATION_RECOMMENDATION_REQUIRED",
-            details={"deployment_id": deployment.id},
-        )
-    recommendation = session.scalar(
-        select(DeploymentRecommendationRecord)
-        .where(
-            DeploymentRecommendationRecord.id
-            == deployment.source_recommendation_id
-        )
-    )
-    if recommendation is None:
-        raise ArtifactPreparationError(
-            "accepted recommendation snapshot is missing",
-            code="PREPARATION_RECOMMENDATION_MISSING",
-            details={"deployment_id": deployment.id},
-        )
-    selected = recommendation.recommendation_snapshot.get("selected")
-    if not isinstance(selected, dict):
-        raise ArtifactPreparationError(
-            "accepted recommendation has no selected artifact",
-            code="PREPARATION_RECOMMENDATION_INVALID",
-            details={"deployment_id": deployment.id},
-        )
+    source = _preparation_source(session, deployment)
+    selected = source.selected
     node_ids = selected.get("node_ids")
     assignment_ids = [
         item.get("node_id")
@@ -567,7 +784,7 @@ def _selected_context(
     }
     stored_inventory = {
         item.get("node_id"): item
-        for item in recommendation.inventory_snapshot
+        for item in source.inventory_snapshot
         if isinstance(item, dict) and isinstance(item.get("node_id"), str)
     }
     for node in nodes:
@@ -604,7 +821,7 @@ def _selected_context(
                 code="PREPARATION_PROFILE_INVALID",
                 details={"node_id": node.id},
             ) from exc
-        if not revalidate_inventory:
+        if source.fleet_id is not None or not revalidate_inventory:
             expected = stored_inventory.get(node.id)
             expected_profile = (
                 expected.get("profile") if isinstance(expected, dict) else None
@@ -679,7 +896,18 @@ def _selected_context(
                 },
             )
 
-    if revalidate_inventory:
+    _validate_fleet_qualification(session, source=source, now=now)
+
+    if revalidate_inventory and source.fleet_id is None:
+        recommendation = session.get(
+            DeploymentRecommendationRecord, source.source_id
+        )
+        if recommendation is None:
+            raise ArtifactPreparationError(
+                "accepted recommendation snapshot is missing",
+                code="PREPARATION_RECOMMENDATION_MISSING",
+                details={"deployment_id": deployment.id},
+            )
         try:
             current, current_inventory = evaluate_deployment_recommendation(
                 session,
@@ -833,7 +1061,7 @@ def _selected_context(
                     "available_mib": profile.disk_free_mib,
                 },
             )
-    return recommendation, selected, artifact, manifest, nodes, stage_projection
+    return source, selected, artifact, manifest, nodes, stage_projection
 
 
 def _request_identity(
@@ -869,6 +1097,14 @@ def _request_identity(
             else MODEL_CACHE_KIND_FULL_SNAPSHOT
         ),
     }
+    if deployment.fleet_id is not None:
+        value.update(
+            {
+                "schema_version": 2,
+                "fleet_id": deployment.fleet_id,
+                "fleet_candidate_id": deployment.fleet_candidate_id,
+            }
+        )
     if selected_stage_digest is not None:
         value["stage_artifact_set_digest"] = selected_stage_digest
     return value
@@ -876,7 +1112,7 @@ def _request_identity(
 
 def _plan_snapshot(
     deployment: Deployment,
-    recommendation: DeploymentRecommendationRecord,
+    source: _PreparationSource,
     selected: dict[str, Any],
     artifact: ModelArtifact,
     manifest: ArtifactManifest,
@@ -930,7 +1166,7 @@ def _plan_snapshot(
         "generation": deployment.generation,
         "source_recommendation_id": deployment.source_recommendation_id,
         "model_release_id": selected["model_release_id"],
-        "inventory_fingerprint": recommendation.inventory_fingerprint,
+        "inventory_fingerprint": source.inventory_fingerprint,
         "artifact": {
             "id": artifact.id,
             "model_id": artifact.model_id,
@@ -946,6 +1182,15 @@ def _plan_snapshot(
         "node_ids": list(selected["node_ids"]),
         "effective_plan": effective_plan,
     }
+    if source.fleet_id is not None:
+        value.update(
+            {
+                "schema_version": 2,
+                "fleet_id": source.fleet_id,
+                "fleet_candidate_id": deployment.fleet_candidate_id,
+                "source_fleet_recommendation_id": source.source_id,
+            }
+        )
     if stage_projection is not None:
         value["stage_artifact"] = copy.deepcopy(stage_projection)
     return value
@@ -1049,7 +1294,10 @@ def record_deployment_cache_verification_failure(
     original rollout failure, so callers receive ``False`` instead.
     """
 
-    if deployment.source_recommendation_id is None:
+    if (
+        deployment.source_recommendation_id is None
+        and deployment.fleet_id is None
+    ):
         return False
     preparation = session.scalar(
         select(ArtifactPreparation).where(
@@ -1332,6 +1580,9 @@ def _recompute_status(
         )
         preparation.completed_at = now
     preparation.updated_at = now
+    from .fleet_runtime import sync_fleet_preparation_status
+
+    sync_fleet_preparation_status(session, preparation)
 
 
 def _queue_for_apply(
@@ -1399,6 +1650,7 @@ def prepare_deployment_artifacts(
     artifact_set_digest: str | None = None,
     apply: bool = False,
     now: datetime | None = None,
+    _fleet_runtime_id: str | None = None,
 ) -> tuple[ArtifactPreparation, list[Task], bool]:
     _canonical_uuid(request_id, "request_id")
     lock_fleet_reservation_gate(session)
@@ -1446,7 +1698,7 @@ def prepare_deployment_artifacts(
             code="PREPARATION_PLAN_CONFLICT",
             details={"deployment_id": deployment_id},
         )
-    if deployment.fleet_id is not None:
+    if deployment.fleet_id is not None and _fleet_runtime_id is None:
         raise ArtifactPreparationError(
             "Fleet deployment runtime requires the dedicated Fleet workflow",
             code="FLEET_RUNTIME_NOT_AVAILABLE",
@@ -1454,6 +1706,24 @@ def prepare_deployment_artifacts(
                 "fleet_id": deployment.fleet_id,
                 "deployment_id": deployment.id,
             },
+        )
+    if deployment.fleet_id is None and _fleet_runtime_id is not None:
+        raise ArtifactPreparationError(
+            "Fleet runtime binding cannot target a standalone deployment",
+            code="FLEET_RUNTIME_BINDING_INVALID",
+            details={"deployment_id": deployment.id},
+        )
+
+    def bind_runtime(preparation: ArtifactPreparation) -> None:
+        if _fleet_runtime_id is None:
+            return
+        from .fleet_runtime import bind_fleet_preparation
+
+        bind_fleet_preparation(
+            session,
+            runtime_id=_fleet_runtime_id,
+            deployment=deployment,
+            preparation=preparation,
         )
     try:
         ensure_fleet_reservation_scope(
@@ -1566,6 +1836,9 @@ def prepare_deployment_artifacts(
         if not apply or existing.status == "SUCCEEDED" or _active_attempts(
             session, existing.id
         ):
+            bind_runtime(existing)
+            if _fleet_runtime_id is not None:
+                session.commit()
             return existing, [], False
         initial_apply = existing.status == "PREPARED"
         (
@@ -1601,6 +1874,7 @@ def prepare_deployment_artifacts(
                 details={"preparation_id": existing.id},
             )
         tasks = _queue_for_apply(session, existing)
+        bind_runtime(existing)
         session.add(
             AuditEvent(
                 actor="admin",
@@ -1668,6 +1942,7 @@ def prepare_deployment_artifacts(
             )
         session.flush()
         tasks = _queue_for_apply(session, preparation) if apply else []
+        bind_runtime(preparation)
         session.add(
             AuditEvent(
                 actor="admin",
@@ -1710,6 +1985,7 @@ def prepare_deployment_artifacts(
                 artifact_set_digest=artifact_set_digest,
                 apply=apply,
                 now=now,
+                _fleet_runtime_id=_fleet_runtime_id,
             )
         raise ArtifactPreparationError(
             "preparation request conflicts with an existing immutable binding",
@@ -2711,14 +2987,37 @@ def manifest_for_preparation_task(
     }
 
 
+def _snapshot_matches_deployment_source(
+    snapshot: dict[str, Any], deployment: Deployment
+) -> bool:
+    if snapshot.get("source_recommendation_id") != deployment.source_recommendation_id:
+        return False
+    if deployment.fleet_id is None:
+        return (
+            "fleet_id" not in snapshot
+            and "fleet_candidate_id" not in snapshot
+            and "source_fleet_recommendation_id" not in snapshot
+        )
+    return (
+        snapshot.get("schema_version") == 2
+        and snapshot.get("fleet_id") == deployment.fleet_id
+        and snapshot.get("fleet_candidate_id") == deployment.fleet_candidate_id
+        and isinstance(snapshot.get("source_fleet_recommendation_id"), str)
+    )
+
+
 def effective_deployment_plan(
     session: Session,
     deployment: Deployment,
     *,
     require_prepared: bool = True,
     lock_ready_caches: bool = True,
+    revalidate_fleet_qualification: bool = True,
 ) -> dict[str, Any]:
-    if deployment.source_recommendation_id is None:
+    if (
+        deployment.source_recommendation_id is None
+        and deployment.fleet_id is None
+    ):
         return deployment.plan
     preparation = session.scalar(
         select(ArtifactPreparation).where(
@@ -2767,8 +3066,7 @@ def effective_deployment_plan(
                 and normalized == original
                 and snapshot.get("deployment_id") == deployment.id
                 and snapshot.get("generation") == deployment.generation
-                and snapshot.get("source_recommendation_id")
-                == deployment.source_recommendation_id
+                and _snapshot_matches_deployment_source(snapshot, deployment)
             ):
                 return copy.deepcopy(projected)
         return copy.deepcopy(deployment.plan)
@@ -2778,23 +3076,11 @@ def effective_deployment_plan(
             code="DEPLOYMENT_ARTIFACTS_NOT_PREPARED",
             details={"deployment_id": deployment.id},
         )
-    recommendation = session.scalar(
-        select(DeploymentRecommendationRecord).where(
-            DeploymentRecommendationRecord.id
-            == deployment.source_recommendation_id
-        )
-    )
-    selected = (
-        recommendation.recommendation_snapshot.get("selected")
-        if recommendation is not None
-        and isinstance(recommendation.recommendation_snapshot, dict)
-        else None
-    )
-    release_id = (
-        selected.get("model_release_id")
-        if isinstance(selected, dict)
-        else None
-    )
+    source = _preparation_source(session, deployment)
+    selected = source.selected
+    release_id = selected.get("model_release_id")
+    if source.fleet_id is not None and revalidate_fleet_qualification:
+        _validate_fleet_qualification(session, source=source, now=utcnow())
     # Mutation callers lock their complete node scope before reaching this
     # gate.  Hold the release transition barrier through their task-creation
     # commit so a concurrent revoke cannot slip between validation and queueing.
@@ -2834,8 +3120,12 @@ def effective_deployment_plan(
         or not isinstance(artifact, dict)
         or snapshot.get("deployment_id") != deployment.id
         or snapshot.get("generation") != deployment.generation
-        or snapshot.get("source_recommendation_id")
-        != deployment.source_recommendation_id
+        or not _snapshot_matches_deployment_source(snapshot, deployment)
+        or (
+            source.fleet_id is not None
+            and snapshot.get("source_fleet_recommendation_id")
+            != source.source_id
+        )
         or snapshot.get("model_release_id") != release_id
         or snapshot.get("node_ids") != expected_node_ids
         or plan.get("deployment_id") != deployment.id

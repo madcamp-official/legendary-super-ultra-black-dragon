@@ -400,7 +400,9 @@ DURE_RUN_VLLM_RAY_PP_ACCEPTANCE=1 \
 - `POST /v1/admin/fleet-recommendations`: 네 모델의 exact 증적을 여러 비중첩 배포로 조합한 불변 Fleet 추천 저장
 - `GET /v1/admin/fleet-recommendations/{id}`: 저장 당시 Fleet 정책·후보·선택·미배정·증적 스냅샷 조회
 - `POST /v1/admin/fleet-recommendations/{id}/accept`: 현재 입력을 잠금 안에서 재평가하고 모든 배포 세대·노드·GPU 예약을 원자 생성
-- `GET /v1/admin/fleets/{id}`: 수락된 Fleet의 배포 세대와 exact 활성 예약 조회
+- `GET /v1/admin/fleets/{id}`: 수락된 Fleet의 배포 세대, exact 활성 예약과 배포별 runtime 조회
+- `POST /v1/admin/fleets/{id}/prepare`: 현재 exact 입력을 재검사하고 적격 배포의 모델·이미지 준비를 명시적으로 시작
+- `POST /v1/admin/fleets/{id}/apply`: 준비된 배포의 적용·API 시작·전체 검증을 명시적으로 시작
 
 모든 경로는 관리자 전달자 인증을 요구합니다. 모델 리비전, 매니페스트, 런타임 이미지가 고정되지 않으면 등록할 수 없고, 허용 목록 밖의 Docker 인자·환경 변수·마운트·호스트 경로는 요청 단계에서 거부됩니다. 레지스트리 등록이나 상태 전이만으로 에이전트 작업 또는 호스트 변경이 발생하지 않습니다.
 
@@ -415,11 +417,34 @@ dure admin fleet recommend \
   --reserve-node <node-c>
 dure admin fleet show sha256:<64-hex>
 dure admin fleet accept sha256:<64-hex>
+dure admin fleet status <fleet-id>
 ```
 
 `recommend`는 불변 추천 행 하나만 멱등 저장합니다. `show`는 저장 시점 기록이므로 현재 인벤토리의 유효성을 의미하지 않습니다. `accept`는 추천 전체를 현재 레지스트리·인벤토리·증적·점유 상태로 다시 계산해 byte-for-byte 같은 경우에만 선택된 모든 generation 1 배포와 exact 노드·GPU·rank 예약을 한 DB 트랜잭션으로 만듭니다. 최소 복제본이나 예비 노드 정책 미충족, 인벤토리 drift, 자원 중복이 하나라도 있으면 아무 Fleet도 만들지 않습니다. 같은 추천의 반복 수락은 기존 Fleet를 검증해 반환합니다.
 
-수락 결과의 배포 상태는 `CREATED`입니다. 수락만으로 모델 다운로드, 이미지 pull, Agent task, 컨테이너 실행·중지나 기존 서비스 변경은 일어나지 않습니다. Fleet 준비·적용 명령은 후속 단계이며, 현재 Fleet 소속 세대를 기존 단일 배포 준비·task·rollout API로 실행하려 하면 `FLEET_RUNTIME_NOT_AVAILABLE`로 거부합니다. 그 전까지 활성 예약이 다른 단일 배포·qualification·benchmark·아티팩트 준비·무관한 작업의 노드 선점을 차단합니다.
+수락 결과의 배포 상태는 `CREATED`입니다. 수락만으로 모델 다운로드, 이미지 pull, Agent task, 컨테이너 실행·중지나 기존 서비스 변경은 일어나지 않습니다. `fleet status`도 중앙 기록만 읽습니다. 활성 예약은 다른 단일 배포·qualification·benchmark·아티팩트 준비·무관한 작업의 노드 선점을 차단하며 Fleet가 실패해도 자동 해제되지 않습니다.
+
+모델·이미지 준비는 다음 명령을 운영자가 별도로 실행한 뒤에만 시작합니다.
+
+```bash
+dure admin fleet prepare <fleet-id>
+dure admin fleet status <fleet-id>
+```
+
+`prepare`는 수락 당시 후보를 현재 레지스트리·노드/GPU 인벤토리·정확한 qualification 증적·매니페스트·runtime과 다시 비교합니다. Fleet 자신의 예약은 유지한 채 검사하고, 다른 작업·점유 또는 identity drift는 우회하지 않습니다. 통과한 배포에만 노드별 `PREPARE_MODEL → PREPARE_IMAGE`를 만들며 모든 노드가 exact `READY`와 최신 OCI digest 이미지 증적을 얻어야 `PREPARED`가 됩니다. 한 배포가 `PREPARE_FAILED`여도 나머지 배포 준비는 계속 시도합니다.
+
+준비된 배포의 컨테이너 적용과 검증도 별도 명령이 필요합니다.
+
+```bash
+dure admin fleet apply <fleet-id>
+dure admin fleet status <fleet-id>
+```
+
+배포 하나의 operation은 `APPLY(전체 노드) → START_API(head) → VERIFY_API(head) → VERIFY(전체 노드) → ACTIVE` 순서입니다. `apply` 시점에도 저장 plan, exact 캐시 `READY`, 현재 준비 시도, 이미지 digest 증적과 전체 노드 집합을 다시 검사합니다. Fleet 소속 세대를 기존 단일 배포 prepare·일반 task·rollout API로 직접 실행해 이 경계를 우회할 수 없습니다.
+
+배포별 상태는 `ACCEPTED`, `PREPARING`, `PREPARED`, `PREPARE_FAILED`, `APPLYING`, `VERIFYING`, `ACTIVE`, `APPLY_FAILED`, `VERIFY_FAILED`입니다. Fleet 전체는 이를 `ACCEPTED`, `PREPARING`, `PREPARED`, `APPLYING`, `VERIFYING`, `ACTIVE`, `PARTIAL_FAILED`, `FAILED`로 집계합니다. `fleet status`에서 배포별 `preparation_id`, `current_operation_id`, `failure_phase`, `failure_code`를 먼저 확인합니다.
+
+부분 실패는 자동 보상 트랜잭션이 아닙니다. Dure는 성공한 다른 배포를 취소하거나 실패 배포의 컨테이너를 자동 중지하지 않고, 다른 모델·노드로 재스케줄링하거나 과거 세대로 자동 롤백하지 않으며, Fleet 예약도 해제하지 않습니다. 실제 Agent 작업과 컨테이너 상태를 확인하고 실패 코드를 해결한 뒤 같은 전용 명령을 운영자가 다시 명시해야 합니다. 현재 Fleet 전체 취소·예약 해제 명령은 없습니다.
 
 ## stage artifact 생성·검증 운영
 
@@ -704,7 +729,7 @@ curl -sS -X POST \
 
 증적이 모두 통과하면 서버가 프로필을 `VALIDATED`로 만들지만 자동 활성화하지 않습니다. 운영자가 마지막 API를 호출하고 현재 인벤토리·레지스트리·정규화 binding이 그대로여야 `ACTIVE`가 됩니다. 단일·다중 노드 AUTO 추천에는 exact 노드·rank·GPU UUID 결합과 현재 정책·suite·작업 부하가 같은 24시간 이내 증적만 사용할 수 있습니다. preview, 적용, 증적 등록과 활성화 자체는 모델 다운로드·이미지 pull·컨테이너 실행·기존 서비스 변경을 수행하지 않습니다. 전체 요청 스키마와 실패 코드는 [자동 배치 프로필 qualification](profile-qualification.md)을 참고합니다.
 
-내부 Fleet 평가기는 이 PRIMARY·SUPPLEMENTARY 증적들을 현재 GPU 풀에 대입해 여러 독립 배포 조합과 미배정 사유를 계산합니다. 이 단계는 아직 별도 관리자 CLI/API로 공개하거나 DB에 저장하지 않으며, task·예약·배포 세대를 만들지 않습니다. 계산 계약과 한도는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
+Fleet 평가기는 이 PRIMARY·SUPPLEMENTARY 증적들을 현재 GPU 풀에 대입해 여러 독립 배포 조합과 미배정 사유를 계산합니다. 관리자 Fleet CLI/API는 평가 전체를 불변 추천으로 저장하고, 명시적 수락 시 generation 1 배포와 노드·GPU 예약을 원자 생성합니다. 추천과 수락은 task나 호스트 변경을 만들지 않으며, 이후에도 전용 `fleet prepare`와 `fleet apply`를 각각 명시해야 합니다. 계산 계약과 한도는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
 
 ## 벤치마크 증적 등록과 승격
 

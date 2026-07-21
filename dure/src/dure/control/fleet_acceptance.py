@@ -24,6 +24,7 @@ from .fleet_recommendation import (
 from .models import (
     AuditEvent,
     Deployment,
+    FleetDeploymentRuntime,
     FleetRecommendationRecord,
     FleetRecord,
     FleetResourceReservation,
@@ -589,6 +590,8 @@ def fleet_detail(session: Session, fleet: FleetRecord) -> dict[str, Any]:
             )
         )
     )
+    from .fleet_runtime import fleet_runtime_projection
+
     return {
         "id": fleet.id,
         "source_recommendation_id": fleet.source_recommendation_id,
@@ -601,7 +604,9 @@ def fleet_detail(session: Session, fleet: FleetRecord) -> dict[str, Any]:
             for deployment in deployments
         ],
         "reservations": [_reservation_dict(item) for item in reservations],
+        "runtime": fleet_runtime_projection(session, fleet.id),
         "created_at": aware(fleet.created_at).isoformat(),
+        "updated_at": aware(fleet.updated_at).isoformat(),
     }
 
 
@@ -708,6 +713,36 @@ def _validated_existing_fleet(
     ):
         raise _error(
             "stored Fleet acceptance is incomplete or inconsistent",
+            code="FLEET_ACCEPTANCE_RECORD_INVALID",
+            details={"fleet_id": fleet.id},
+        )
+    runtime_rows = list(
+        session.scalars(
+            select(FleetDeploymentRuntime)
+            .where(FleetDeploymentRuntime.fleet_id == fleet.id)
+            .order_by(FleetDeploymentRuntime.deployment_id)
+        )
+    )
+    if (
+        [row.deployment_id for row in runtime_rows]
+        != sorted(expected_deployments.values())
+        or any(
+            row.status not in {
+                "ACCEPTED",
+                "PREPARING",
+                "PREPARED",
+                "PREPARE_FAILED",
+                "APPLYING",
+                "VERIFYING",
+                "ACTIVE",
+                "APPLY_FAILED",
+                "VERIFY_FAILED",
+            }
+            for row in runtime_rows
+        )
+    ):
+        raise _error(
+            "stored Fleet runtime is incomplete or inconsistent",
             code="FLEET_ACCEPTANCE_RECORD_INVALID",
             details={"fleet_id": fleet.id},
         )
@@ -962,6 +997,20 @@ def accept_fleet_recommendation(
             session,
             recommendation=recommendation,
             error=exc,
+        )
+    for deployment in deployments:
+        session.add(
+            FleetDeploymentRuntime(
+                id=str(
+                    uuid.uuid5(
+                        FLEET_ACCEPTANCE_NAMESPACE,
+                        f"fleet-runtime:{fleet_id}:{deployment.id}",
+                    )
+                ),
+                fleet_id=fleet_id,
+                deployment_id=deployment.id,
+                status="ACCEPTED",
+            )
         )
     for _, bindings, deployment_id, _ in planned:
         for binding in bindings:

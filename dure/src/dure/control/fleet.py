@@ -613,6 +613,52 @@ def _project_candidates(
     )
 
 
+def validate_fleet_candidate_current(
+    session: Session,
+    *,
+    candidate: dict[str, Any],
+    node_ids: list[str],
+    now: datetime,
+    reservation_fleet_id: str,
+) -> dict[str, Any]:
+    """Rebuild one exact candidate without treating its own reservation as free."""
+
+    candidate_id = candidate.get("candidate_id")
+    if type(candidate_id) is not str:
+        raise FleetEvaluationError(
+            "Fleet candidate identity is invalid",
+            code="FLEET_CANDIDATE_INVALID",
+        )
+    inventory = _inventory_nodes(
+        session,
+        node_ids=sorted(node_ids),
+        all_online=False,
+        now=now,
+    )
+    catalog, contexts = _active_catalog(
+        session,
+        inventory=inventory,
+        now=now,
+        reservation_fleet_id=reservation_fleet_id,
+    )
+    _candidates, details, _rejections = _project_candidates(
+        session,
+        inventory=inventory,
+        available_node_ids=set(node_ids),
+        catalog=catalog,
+        contexts=contexts,
+        network_zones={},
+    )
+    current = details.get(candidate_id)
+    if current is None:
+        raise FleetEvaluationError(
+            "Fleet candidate no longer has current qualification evidence",
+            code="FLEET_CANDIDATE_STALE",
+            details={"candidate_id": candidate_id},
+        )
+    return current
+
+
 def evaluate_fleet_schedule(
     session: Session,
     *,

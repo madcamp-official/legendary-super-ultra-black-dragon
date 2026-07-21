@@ -127,6 +127,12 @@ from .fleet_acceptance import (
     accept_fleet_recommendation,
     show_fleet,
 )
+from .fleet_runtime import (
+    FleetRuntimeError,
+    FleetRuntimeNotFoundError,
+    apply_fleet,
+    prepare_fleet,
+)
 from .qualification import (
     QUALIFICATION_STEPS,
     ProfileQualificationError,
@@ -550,6 +556,10 @@ class FleetRecommendationCreate(StrictBody):
 
 
 class FleetRecommendationAccept(StrictBody):
+    pass
+
+
+class FleetRuntimeAction(StrictBody):
     pass
 
 
@@ -1867,6 +1877,52 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 status.HTTP_404_NOT_FOUND, exc.to_detail()
             ) from exc
         except FleetRecommendationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
+
+    @app.post(
+        "/v1/admin/fleets/{fleet_id}/prepare",
+        dependencies=[Depends(admin_auth)],
+    )
+    def fleet_prepare(
+        fleet_id: str,
+        body: FleetRuntimeAction,
+        session: Session = Depends(get_session),
+    ):
+        del body
+        try:
+            result = prepare_fleet(session, fleet_id)
+            result.update(show_fleet(session, fleet_id))
+            return result
+        except FleetRuntimeNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except (FleetRuntimeError, FleetRecommendationError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
+
+    @app.post(
+        "/v1/admin/fleets/{fleet_id}/apply",
+        dependencies=[Depends(admin_auth)],
+    )
+    def fleet_apply(
+        fleet_id: str,
+        body: FleetRuntimeAction,
+        session: Session = Depends(get_session),
+    ):
+        del body
+        try:
+            result = apply_fleet(session, fleet_id)
+            result.update(show_fleet(session, fleet_id))
+            return result
+        except FleetRuntimeNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except (FleetRuntimeError, FleetRecommendationError) as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, exc.to_detail()
             ) from exc

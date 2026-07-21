@@ -27,6 +27,7 @@
 | 벤치마크 증적 바꿔치기 | 릴리스·배치·정확한 정렬 노드 UUID 조합·현재 프로필 지문과 고정 아티팩트·런타임 식별자 결합, Agent·서버의 폐쇄형 결과 재검증, 중앙 추천의 24시간 TTL과 최신 결과 검사 | 서명된 Agent 결과와 원본 증적 provenance |
 | 작업 재생 | 임대, 세대 검사, 로컬 완료 저널, operation 단계·노드·시도 번호 펜싱 | 서명된 봉투와 암호학적 펜싱 토큰 |
 | 동시 변경 | 노드 행 잠금, 한 개의 활성 임대와 계보당 한 개의 활성 변경 | PostgreSQL 동시성 부하 시험 |
+| Fleet 부분 실패의 파급 | 배포별 runtime·current operation 펜싱, 실패 코드 격리, 다른 배포 자동 취소 금지, 예약 유지 | Fleet 전체 취소·검토된 예약 해제 절차 |
 | 컨테이너 오조작 | 배포·세대·노드와 엄격한 backend·pipeline rank·runtime rank·component 레이블의 조회 후 재검사 | 격리와 실제 Docker 경쟁 조건 검토 |
 | 잘못된 롤백 대상 | 서버가 직접 직전 검증 세대를 선택하고 전체 노드·토폴로지 재검사 | 실제 다중 노드 복구 수용 검사 |
 | 공개 Ray 노출 | 사설망 사용 문서화 | WireGuard와 firewall 검증 자동화 |
@@ -181,7 +182,13 @@ Fleet 평가기는 유효한 PRIMARY·SUPPLEMENTARY 증적 하나를 정확한 n
 
 Fleet 수락은 저장 스냅샷의 콘텐츠 무결성을 먼저 확인하고, 전용 트랜잭션 잠금과 고정 인벤토리 행 잠금 안에서 레지스트리·인벤토리·qualification·task·operation·예약 입력으로 전체 추천을 다시 계산합니다. 선택된 각 후보는 `TP=1`, exact 노드·GPU index·GPU UUID·rank·STAGE/FULL identity와 전체 실행 plan 정규 digest가 생성 plan과 다시 일치해야 합니다. 모든 generation 1 배포와 활성 예약은 한 트랜잭션으로 생성되며, 일부만 성공한 Fleet는 허용하지 않습니다. 활성 노드와 GPU UUID에는 전역 조건부 unique 제약을 적용하고 Fleet 내부에도 노드·GPU·deployment/rank 중복 금지를 둡니다. 노드 UUID가 달라도 같은 GPU UUID를 보고하면 충돌로 취급하며 다른 단일 배포, qualification, benchmark, 캐시 격리와 무관한 task는 이 예약을 우회할 수 없습니다.
 
-추천 수락이 만드는 권한은 중앙 DB의 `CREATED` 배포와 예약뿐입니다. Agent task, 자격 증명, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지 또는 기존 서비스 변경 권한은 부여하지 않습니다. 후속 전용 Fleet runtime이 추가되기 전에는 기존 단일 배포 준비·task·rollout API도 Fleet 소속 세대를 `FLEET_RUNTIME_NOT_AVAILABLE`로 거부합니다. 상세 목적 순서와 계산 한도, 수락 경계는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
+추천 수락이 만드는 권한은 중앙 DB의 `CREATED` 배포, 배포별 runtime과 예약뿐입니다. Agent task, 자격 증명, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지 또는 기존 서비스 변경 권한은 부여하지 않습니다. 상태 조회도 읽기 전용입니다. 실제 호스트 작업은 운영자가 별도의 Fleet prepare 또는 apply API를 호출한 경우에만 만들며 두 API는 빈 JSON 본문 외의 모델·노드·명령·Docker 옵션을 거부합니다.
+
+Fleet prepare는 서버 내부 runtime capability와 저장 후보를 결합해 기존 폐쇄형 준비기를 호출합니다. 수락 당시 plan을 현재 모델·런타임 레지스트리, 인벤토리, exact qualification 증적과 다시 비교하고 Fleet 자신의 정확한 예약만 자기 점유로 인정합니다. Fleet apply도 runtime에 연결된 준비 성공, 전체 예약 노드, exact `READY` 캐시와 최신 OCI digest 증적을 요구합니다. 기존 단일 배포 prepare·일반 task·rollout API로 Fleet 세대를 직접 실행하거나 runtime ID와 노드 부분집합을 클라이언트가 주입할 수 없습니다.
+
+일반 추천 수락은 Fleet 세대를 `previous_generation_id`로 받아 같은 계보를 확장할 수 없습니다. 평가 전 경계와 잠긴 계보의 권위 있는 경계가 모두 `FLEET_LINEAGE_EXTENSION_FORBIDDEN`을 강제하므로, Fleet runtime 밖의 일반 세대가 Fleet operation을 가로막는 혼합 계보를 만들 수 없습니다.
+
+각 배포는 하나의 current preparation과 current operation으로 펜싱됩니다. 적용은 `APPLY(전체 노드) → START_API(head) → VERIFY_API(head) → VERIFY(전체 노드)`의 폐쇄형 단계만 허용하고 과거 시도의 claim·완료·취소는 현재 상태를 바꾸지 못합니다. 한 배포의 준비·적용·검증 실패는 다른 배포의 권한을 넓히거나 자동 취소하지 않습니다. Dure는 실패 시 컨테이너를 자동 중지하거나 과거 세대로 롤백하지 않고, 노드·GPU 예약을 해제하거나 다른 후보로 재배치하지 않습니다. 이 보수적 경계는 운영자가 실제 호스트 상태를 조사하는 동안 중복 사용을 막지만, Fleet 전체 자동 복구나 서비스 연속성을 제공한다는 뜻은 아닙니다. 상세 목적 순서와 계산 한도, 수락·실행 경계는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
 
 ## 모델 레지스트리, 승격 게이트와 추천 수락의 경계
 
