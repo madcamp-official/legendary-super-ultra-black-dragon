@@ -50,7 +50,9 @@
 
 `dure admin`은 현재 작업 디렉터리의 `dure/.env`, `.env` 또는 명시적 `--env-file`에서 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`만 읽을 수 있습니다. 파일을 shell로 source하지 않으므로 command substitution, 변수 확장과 임의 shell 문법을 실행하지 않습니다. 두 설정은 같은 파일에 모두 있어야 하며, 파일 설정을 사용하기로 한 뒤 프로세스 환경의 token이나 server와 섞지 않습니다. 명시적 `--server`·`--token`만 개별 값을 덮어쓸 수 있습니다.
 
-credential 파일은 64KiB 이하의 현재 사용자 소유 regular file이어야 하고 group·other 접근 비트가 없어야 합니다. final-component symlink, 비일반 파일, 중복·빈 값, 불완전한 Dure 설정과 잘못된 UTF-8은 네트워크 요청 전에 거부합니다. 자동 발견은 Dure 설정이 없는 일반 dotenv를 credential 파일로 사용하지 않으며 `.env`는 저장소의 ignore 규칙에 포함됩니다. 그러나 ignore는 secret 저장소나 접근 통제가 아니므로 파일을 commit, artifact, backup 또는 지원 자료에 포함하지 않아야 합니다. 현재 작업 디렉터리는 설정 발견 입력이므로 신뢰하지 않는 디렉터리에서 관리자 명령을 실행하지 말고, 자동 발견을 피하려면 신뢰 경로를 `--env-file`로 명시합니다.
+수동 `dure-server`도 같은 위치와 `--env-file`에서 `DURE_DATABASE_URL`과 `DURE_ADMIN_TOKEN`만 읽으며 두 값을 한 쌍으로 요구합니다. DB URL의 명시적 `--database-url`만 파일 값을 덮어쓸 수 있고, 파일에서 선택한 admin token을 프로세스 환경의 값과 섞지 않습니다. migration 전용 실행을 제외하고 admin token이 없으면 서버는 시작하지 않습니다. 서버는 listen과 migration 전에 DB 연결을 검사하고 인증 실패 시 credential이나 URL을 오류에 포함하지 않습니다. systemd unit의 `/etc/dure/server.env`는 서비스 관리자가 프로세스 환경으로 주입하며 작업 디렉터리 자동 탐색에 의존하지 않습니다.
+
+credential 파일은 64KiB 이하의 현재 사용자 소유 regular file이어야 하고 group·other 접근 비트가 없어야 합니다. final-component symlink, 비일반 파일, 중복·빈 값, 불완전한 Dure 설정과 잘못된 UTF-8은 네트워크 요청이나 서버 listen 전에 거부합니다. 자동 발견은 해당 명령이 사용하는 Dure 설정이 없는 일반 dotenv를 credential 파일로 사용하지 않으며 `.env`는 저장소의 ignore 규칙에 포함됩니다. 그러나 ignore는 secret 저장소나 접근 통제가 아니므로 파일을 commit, artifact, backup 또는 지원 자료에 포함하지 않아야 합니다. 현재 작업 디렉터리는 설정 발견 입력이므로 신뢰하지 않는 디렉터리에서 관리자·서버 명령을 실행하지 말고, 자동 발견을 피하려면 신뢰 경로를 `--env-file`로 명시합니다.
 
 ## 로컬 host bootstrap의 신뢰 경계
 

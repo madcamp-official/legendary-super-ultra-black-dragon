@@ -242,7 +242,14 @@ DISCOVERED → PROBING → ELIGIBLE → PLANNED
 
 ## 중앙 노드 관리
 
-Dure에는 선택형 FastAPI/PostgreSQL 제어면과 외부 방향 폴링 노드 에이전트가 있습니다. `dure-server --migrate`를 실행하고 `DURE_DATABASE_URL`, `DURE_ADMIN_TOKEN`을 설정한 뒤 TLS 역방향 프록시 뒤에서 `dure-server`를 시작합니다.
+Dure에는 선택형 FastAPI/PostgreSQL 제어면과 외부 방향 폴링 노드 에이전트가 있습니다. `dure-server`는 현재 작업 디렉터리의 `dure/.env` 또는 `.env`에서 `DURE_DATABASE_URL`과 `DURE_ADMIN_TOKEN`을 한 쌍으로 읽으며 `--env-file`로 안전한 파일을 명시할 수도 있습니다. migration과 서버 시작 전에 실제 DB 연결을 검사하므로 잘못된 PostgreSQL credential로 API를 열지 않습니다. migration을 적용한 뒤 TLS 역방향 프록시 뒤에서 서버를 시작합니다.
+
+```bash
+cd ~/workspace/dure
+chmod 600 dure/.env
+dure-server --env-file dure/.env --migrate
+dure-server --env-file dure/.env --host 0.0.0.0 --port 8081
+```
 
 관리자 CLI는 명령행 credential을 매번 적지 않아도 현재 작업 디렉터리의 `dure/.env` 또는 `.env`에서 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`을 한 쌍으로 읽습니다. 파일은 현재 사용자 소유의 일반 파일이고 group·other 접근 권한이 없어야 합니다. 파일을 셸로 실행하거나 다른 환경 변수를 가져오지 않습니다.
 
