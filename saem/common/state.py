@@ -89,6 +89,22 @@ def upsert_head_registry_entry(ip: str, role: str, port: Optional[int]) -> None:
     write_head_registry(entries)
 
 
+def remove_head_registry_entry(ip: str) -> bool:
+    entries = read_head_registry()
+    remaining = [e for e in entries if e["ip"] != ip]
+    if len(remaining) == len(entries):
+        return False
+    write_head_registry(remaining)
+    return True
+
+
+def clear_role() -> bool:
+    if not ROLE_FILE.exists():
+        return False
+    ROLE_FILE.unlink()
+    return True
+
+
 # --- LLM backend registry (head-side: every known dure cluster) ---
 
 
@@ -135,3 +151,21 @@ def write_backend(name: str, url: str, model: str) -> dict:
     data = {"name": name, "url": url, "model": model}
     BACKEND_FILE.write_text(yaml.safe_dump(data), encoding="utf-8")
     return data
+
+
+def clear_backend() -> bool:
+    if not BACKEND_FILE.exists():
+        return False
+    BACKEND_FILE.unlink()
+    return True
+
+
+def remove_backend_registry_entry(name: str) -> Optional[dict]:
+    """Returns the removed entry (so head can tell whether it was the active
+    one and therefore needs clearing on the consumer nodes), or None."""
+    entries = read_backend_registry()
+    removed = next((e for e in entries if e["name"] == name), None)
+    if removed is None:
+        return None
+    write_backend_registry([e for e in entries if e["name"] != name])
+    return removed

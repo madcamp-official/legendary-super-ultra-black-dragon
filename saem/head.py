@@ -16,6 +16,8 @@ from saem.common.state import (
     read_backend_registry,
     read_head_registry,
     read_token,
+    remove_backend_registry_entry,
+    remove_head_registry_entry,
     upsert_backend_registry_entry,
     upsert_head_registry_entry,
 )
@@ -56,6 +58,35 @@ def register(ip: str, role: str, port: Optional[int] = None, timeout: float = 10
     return resp.json()
 
 
+def unregister(ip: str, timeout: float = 10.0, force: bool = False) -> dict:
+    """Drop the node's role and remove it from the registry.
+
+    If the node is unreachable the registry entry is kept, so the cluster
+    view doesn't silently lose a node that is merely rebooting — pass
+    `force` to drop it anyway (e.g. the VM is gone for good).
+    """
+    token = read_token()
+    node_result: dict = {}
+    try:
+        resp = httpx.request(
+            "DELETE",
+            f"http://{ip}:{AGENT_PORT}/role",
+            headers={"x-saem-token": token},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        node_result = resp.json()
+    except Exception as e:
+        if not force:
+            raise RuntimeError(
+                f"{ip} unreachable ({e}); registry left intact. "
+                f"Re-run with --force to drop it anyway."
+            )
+        node_result = {"status": "unreachable", "error": str(e)}
+    removed = remove_head_registry_entry(ip)
+    return {"ip": ip, "removed_from_registry": removed, "node": node_result}
+
+
 def status() -> list[dict]:
     return read_head_registry()
 
@@ -82,6 +113,32 @@ def register_backend(
             resp.raise_for_status()
             pushed_to[c["ip"]] = resp.json()
     return {"registered": name, "active": active, "pushed_to": pushed_to}
+
+
+def unregister_backend(name: str, timeout: float = 10.0) -> dict:
+    """Forget a backend. If it was the active one, the consumer nodes are
+    told to clear it too — otherwise they would keep calling a cluster head
+    considers retired."""
+    removed = remove_backend_registry_entry(name)
+    if removed is None:
+        raise RuntimeError(f"no such backend: {name}")
+    cleared: dict[str, dict] = {}
+    if removed.get("active"):
+        token = read_token()
+        consumers = [e for e in read_head_registry() if e["role"] in BACKEND_CONSUMER_ROLES]
+        for c in consumers:
+            try:
+                resp = httpx.request(
+                    "DELETE",
+                    f"http://{c['ip']}:{AGENT_PORT}/backend",
+                    headers={"x-saem-token": token},
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                cleared[c["ip"]] = resp.json()
+            except Exception as e:
+                cleared[c["ip"]] = {"status": "unreachable", "error": str(e)}
+    return {"unregistered": name, "was_active": bool(removed.get("active")), "cleared": cleared}
 
 
 def backend_status() -> list[dict]:

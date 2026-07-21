@@ -43,6 +43,22 @@ def head_register(ip: str, role: str, port: int | None):
     click.echo(f"{ip} -> {result}")
 
 
+@head.command("unregister")
+@click.argument("ip")
+@click.option(
+    "--force", is_flag=True, help="drop from the registry even if the node is unreachable"
+)
+def head_unregister(ip: str, force: bool):
+    """Stop the role on the node at IP and drop it from the registry."""
+    if not head_mod.is_head():
+        raise click.ClickException("this node is not head; run `saem head start` first")
+    try:
+        result = head_mod.unregister(ip, force=force)
+    except RuntimeError as e:
+        raise click.ClickException(str(e))
+    click.echo(result)
+
+
 @head.command("status")
 def head_status():
     """List every node this head has registered."""
@@ -67,6 +83,19 @@ def head_register_backend(name: str, url: str, model: str, active: bool):
     if not head_mod.is_head():
         raise click.ClickException("this node is not head; run `saem head start` first")
     result = head_mod.register_backend(name, url, model, active=active)
+    click.echo(result)
+
+
+@head.command("unregister-backend")
+@click.argument("name")
+def head_unregister_backend(name: str):
+    """Forget a backend; if it was active, consumer nodes are cleared too."""
+    if not head_mod.is_head():
+        raise click.ClickException("this node is not head; run `saem head start` first")
+    try:
+        result = head_mod.unregister_backend(name)
+    except RuntimeError as e:
+        raise click.ClickException(str(e))
     click.echo(result)
 
 

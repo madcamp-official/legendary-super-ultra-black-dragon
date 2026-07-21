@@ -11,9 +11,17 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from saem.common.config import AGENT_PORT
-from saem.common.state import read_backend, read_role, read_token, write_backend, write_role
+from saem.common.state import (
+    clear_backend,
+    clear_role,
+    read_backend,
+    read_role,
+    read_token,
+    write_backend,
+    write_role,
+)
 from saem.roles import ROLE_ENTRYPOINTS
-from saem.systemd import install_role_service, restart_role_service
+from saem.systemd import install_role_service, remove_role_service, restart_role_service
 
 app = FastAPI(title="saem-agent")
 
@@ -53,6 +61,18 @@ def get_role():
     return read_role() or {"role": None}
 
 
+@app.delete("/role")
+def delete_role(x_saem_token: Optional[str] = Header(None)):
+    """Drop this node's role: stop and remove the unit, forget role.yaml.
+    The agent itself keeps running, so head can re-assign a role later
+    without anyone SSHing back in."""
+    _check_token(x_saem_token)
+    previous = read_role()
+    remove_role_service()
+    clear_role()
+    return {"status": "ok", "previous": previous}
+
+
 @app.post("/backend")
 def set_backend(assignment: BackendAssignment, x_saem_token: Optional[str] = Header(None)):
     """head pushes this whenever it registers/switches the active dure backend
@@ -67,6 +87,18 @@ def set_backend(assignment: BackendAssignment, x_saem_token: Optional[str] = Hea
 @app.get("/backend")
 def get_backend():
     return read_backend() or {"name": None}
+
+
+@app.delete("/backend")
+def delete_backend(x_saem_token: Optional[str] = Header(None)):
+    """Forget the active backend. The role keeps running and falls back to
+    the env-var default in get_llm_backend()."""
+    _check_token(x_saem_token)
+    previous = read_backend()
+    clear_backend()
+    if read_role():
+        restart_role_service()
+    return {"status": "ok", "previous": previous}
 
 
 def run() -> None:

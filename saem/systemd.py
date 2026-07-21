@@ -7,6 +7,7 @@ assigned role survives a reboot and gets auto-restarted on crash.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Optional
 
@@ -37,3 +38,15 @@ def install_role_service(role: str, port: Optional[int], python: str = "/usr/bin
 
 def restart_role_service() -> None:
     subprocess.run(["systemctl", "restart", "saem-role"], check=True)
+
+
+def remove_role_service() -> None:
+    """Stop and disable the unit, then delete it. check=False throughout: a
+    node that never had a role assigned has nothing to stop, and that is a
+    successful unregister, not an error."""
+    subprocess.run(["systemctl", "disable", "--now", "saem-role"], check=False)
+    try:
+        os.remove(UNIT_PATH)
+    except FileNotFoundError:
+        pass
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
