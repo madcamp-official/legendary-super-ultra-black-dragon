@@ -898,6 +898,20 @@ class PlacementProfileRecord(Base):
             name="ck_placement_auto_pp_nodes",
         ),
         CheckConstraint(
+            "origin != 'AUTO' OR status IN ('DRAFT', 'QUALIFYING') "
+            "OR qualification_evidence_id IS NOT NULL",
+            name="ck_placement_auto_evidence",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR status NOT IN ('VALIDATED', 'ACTIVE') "
+            "OR qualified_at IS NOT NULL",
+            name="ck_placement_auto_qualified_at",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR status != 'ACTIVE' OR activated_at IS NOT NULL",
+            name="ck_placement_auto_activation",
+        ),
+        CheckConstraint(
             "max_packet_loss_pct IS NULL OR (max_packet_loss_pct >= 0 AND max_packet_loss_pct <= 100)",
             name="ck_placement_packet_loss_range",
         ),
@@ -936,6 +950,15 @@ class PlacementProfileRecord(Base):
     origin: Mapped[str] = mapped_column(String(20), default="MANUAL", nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE", nullable=False)
     spec_digest: Mapped[str | None] = mapped_column(String(71))
+    qualification_evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "profile_qualification_evidence.id",
+            name="fk_placement_profiles_qualification_evidence",
+            use_alter=True,
+        )
+    )
+    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     requires_network_evidence: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     requires_nccl: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     min_bandwidth_mbps: Mapped[int | None] = mapped_column(Integer)
@@ -948,6 +971,172 @@ class PlacementProfileRecord(Base):
     min_vram_headroom_pct: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
     min_throughput_tps: Mapped[float] = mapped_column(Float, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProfileQualificationRun(Base):
+    __tablename__ = "profile_qualification_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('QUALIFYING', 'PASSED', 'FAILED', 'CANCELED')",
+            name="ck_profile_qualification_run_status",
+        ),
+        CheckConstraint(
+            "length(inventory_fingerprint) = 71 "
+            "AND inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_profile_qualification_run_inventory_sha256",
+        ),
+        CheckConstraint(
+            "length(profile_spec_digest) = 71 "
+            "AND profile_spec_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_run_spec_sha256",
+        ),
+        CheckConstraint(
+            "length(workload_digest) = 71 "
+            "AND workload_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_run_workload_sha256",
+        ),
+        CheckConstraint(
+            "max_model_len > 0",
+            name="ck_profile_qualification_run_context_positive",
+        ),
+        CheckConstraint(
+            "max_concurrency > 0",
+            name="ck_profile_qualification_run_concurrency_positive",
+        ),
+        CheckConstraint(
+            "(status = 'QUALIFYING' AND evidence_id IS NULL "
+            "AND failure_code IS NULL) OR "
+            "(status = 'PASSED' AND evidence_id IS NOT NULL "
+            "AND failure_code IS NULL) OR "
+            "(status IN ('FAILED', 'CANCELED') AND failure_code IS NOT NULL)",
+            name="ck_profile_qualification_run_outcome",
+        ),
+        Index("ix_profile_qualification_runs_placement", "placement_id"),
+        Index("ix_profile_qualification_runs_status", "status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    release_id: Mapped[str] = mapped_column(
+        ForeignKey("model_releases.id"), nullable=False
+    )
+    placement_id: Mapped[str] = mapped_column(
+        ForeignKey("placement_profiles.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    rank_node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    gpu_bindings: Mapped[list[dict]] = mapped_column(JSON, nullable=False)
+    inventory_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    profile_spec_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    required_steps: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    workload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    workload_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    max_model_len: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False)
+    artifact_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_manifest_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    runtime_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    runtime_vllm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "profile_qualification_evidence.id",
+            name="fk_profile_qualification_runs_evidence",
+            use_alter=True,
+        )
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ProfileQualificationBinding(Base):
+    __tablename__ = "profile_qualification_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "node_id",
+            name="uq_profile_qualification_binding_node",
+        ),
+        UniqueConstraint(
+            "run_id",
+            "gpu_uuid",
+            name="uq_profile_qualification_binding_gpu_uuid",
+        ),
+        CheckConstraint(
+            "rank >= 0", name="ck_profile_qualification_binding_rank"
+        ),
+        CheckConstraint(
+            "gpu_index >= 0", name="ck_profile_qualification_binding_gpu_index"
+        ),
+        CheckConstraint(
+            "gpu_uuid LIKE 'GPU-%'",
+            name="ck_profile_qualification_binding_gpu_uuid",
+        ),
+        CheckConstraint(
+            "memory_mib > 0",
+            name="ck_profile_qualification_binding_memory",
+        ),
+        Index("ix_profile_qualification_bindings_node", "node_id"),
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("profile_qualification_runs.id"), primary_key=True
+    )
+    rank: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    gpu_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    gpu_uuid: Mapped[str] = mapped_column(String(128), nullable=False)
+    memory_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    compute_capability: Mapped[str | None] = mapped_column(String(32))
+
+
+class ProfileQualificationEvidence(Base):
+    __tablename__ = "profile_qualification_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PASSED', 'FAILED')",
+            name="ck_profile_qualification_evidence_status",
+        ),
+        CheckConstraint(
+            "length(evidence_digest) = 71 "
+            "AND evidence_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_evidence_sha256",
+        ),
+        CheckConstraint(
+            "executor_image LIKE '%@sha256:%'",
+            name="ck_profile_qualification_executor_digest",
+        ),
+        CheckConstraint(
+            "length(workload_digest) = 71 "
+            "AND workload_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_evidence_workload_sha256",
+        ),
+        UniqueConstraint("run_id"),
+        UniqueConstraint("evidence_digest"),
+        Index("ix_profile_qualification_evidence_run", "run_id"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("profile_qualification_runs.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    steps: Mapped[list[dict]] = mapped_column(JSON, nullable=False)
+    metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    workload_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    executor_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    dure_commit: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class BenchmarkEvidence(Base):

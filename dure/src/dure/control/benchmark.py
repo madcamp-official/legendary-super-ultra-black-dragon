@@ -26,8 +26,14 @@ from .models import (
     Node,
     NodeProfileRecord,
     PlacementProfileRecord,
+    ProfileQualificationEvidence,
+    ProfileQualificationRun,
     RuntimeRelease,
     utcnow,
+)
+from .qualification import (
+    ProfileQualificationError,
+    validate_profile_qualification_evidence,
 )
 
 
@@ -703,6 +709,56 @@ def _qualifying_evidence_ids(session: Session, release: ModelRelease) -> list[st
     selected: list[str] = []
     blocked: list[dict[str, Any]] = []
     for placement in placements:
+        if placement.origin == "AUTO":
+            qualification = (
+                session.get(
+                    ProfileQualificationEvidence,
+                    placement.qualification_evidence_id,
+                )
+                if placement.qualification_evidence_id
+                else None
+            )
+            qualification_run = (
+                session.get(ProfileQualificationRun, qualification.run_id)
+                if qualification is not None
+                else None
+            )
+            if (
+                placement.status != "ACTIVE"
+                or qualification is None
+                or qualification_run is None
+            ):
+                blocked.append(
+                    {
+                        "placement_id": placement.id,
+                        "profile_id": placement.profile_id,
+                        "evidence_id": (
+                            qualification.id if qualification else None
+                        ),
+                        "code": "QUALIFICATION_EVIDENCE_INVALID",
+                    }
+                )
+                continue
+            try:
+                validate_profile_qualification_evidence(
+                    session,
+                    placement=placement,
+                    evidence=qualification,
+                    run=qualification_run,
+                )
+            except ProfileQualificationError as exc:
+                blocked.append(
+                    {
+                        "placement_id": placement.id,
+                        "profile_id": placement.profile_id,
+                        "evidence_id": qualification.id,
+                        "code": exc.code,
+                        "reason": str(exc),
+                    }
+                )
+                continue
+            selected.append(qualification.id)
+            continue
         evidence = session.scalar(
             select(BenchmarkEvidence)
             .where(
@@ -822,14 +878,21 @@ def promote_model_release(
                 "ACTIVE release has no valid frozen promotion evidence set",
                 code="PROMOTION_RECORD_INVALID",
             )
-        existing_ids = set(
+        benchmark_ids = set(
             session.scalars(
                 select(BenchmarkEvidence.id).where(
                     BenchmarkEvidence.id.in_(evidence_ids)
                 )
             )
         )
-        if existing_ids != set(evidence_ids):
+        qualification_ids = set(
+            session.scalars(
+                select(ProfileQualificationEvidence.id).where(
+                    ProfileQualificationEvidence.id.in_(evidence_ids)
+                )
+            )
+        )
+        if benchmark_ids | qualification_ids != set(evidence_ids):
             raise BenchmarkPromotionError(
                 "ACTIVE release promotion evidence is missing",
                 code="PROMOTION_RECORD_INVALID",

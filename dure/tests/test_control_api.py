@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 try:
@@ -11,6 +12,7 @@ except ImportError:  # pragma: no cover
 
 from dure.control.api import create_app
 from dure.control.models import Node
+from dure.control.qualification import QUALIFICATION_STEPS
 from dure.planner import build_plan
 from tests.helpers import profile
 
@@ -381,3 +383,141 @@ class ControlAPITests(unittest.TestCase):
             self.client.post(path, headers=self.admin, json={"apply": 1}).status_code,
             422,
         )
+
+    def test_profile_qualification_api_is_strict_and_operator_activated(self):
+        artifact = self.client.post(
+            "/v1/admin/model-artifacts",
+            headers=self.admin,
+            json={
+                "model_id": "qwen2.5-7b-awq",
+                "repository": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+                "revision": "a" * 40,
+                "manifest_digest": "sha256:" + "b" * 64,
+                "quantization": "awq",
+                "size_mib": 4916,
+                "default_max_model_len": 8192,
+                "layer_count": 28,
+                "license_id": "apache-2.0",
+            },
+        ).json()["artifact"]
+        runtime = self.client.post(
+            "/v1/admin/runtime-releases",
+            headers=self.admin,
+            json={
+                "version": "qualification-api",
+                "image": "registry.example/vllm@sha256:" + "c" * 64,
+                "vllm_version": "0.9.0",
+                "cuda_version": "12.8",
+                "gpu_architectures": ["ampere"],
+            },
+        ).json()["runtime"]
+        release = self.client.post(
+            "/v1/admin/model-releases",
+            headers=self.admin,
+            json={
+                "artifact_id": artifact["id"],
+                "runtime_id": runtime["id"],
+                "quality_rank": 7,
+            },
+        ).json()["release"]
+        self.client.post(
+            f"/v1/admin/model-releases/{release['id']}/placements/generate",
+            headers=self.admin,
+            json={"apply": True},
+        )
+        placement = self.client.get(
+            f"/v1/admin/model-releases/{release['id']}",
+            headers=self.admin,
+        ).json()["release"]["placements"][0]
+        joined = self.client.post(
+            "/v1/nodes/join",
+            json={
+                "install_id": "qualification-api-node",
+                "agent_version": "0.3.28",
+                "profile": profile("qualification-api-node").to_dict(),
+            },
+        ).json()
+        self.client.post(
+            f"/v1/admin/nodes/{joined['node_id']}/approve",
+            headers=self.admin,
+        )
+        request_id = str(uuid.uuid4())
+        body = {
+            "request_id": request_id,
+            "placement_id": placement["id"],
+            "node_ids": [joined["node_id"]],
+            "apply": True,
+        }
+        self.assertEqual(
+            self.client.post(
+                "/v1/admin/profile-qualifications/prepare", json=body
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/v1/admin/profile-qualifications/prepare",
+                headers=self.admin,
+                json={**body, "command": "id"},
+            ).status_code,
+            422,
+        )
+        prepared = self.client.post(
+            "/v1/admin/profile-qualifications/prepare",
+            headers=self.admin,
+            json=body,
+        )
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        run = prepared.json()["qualification"]
+        self.assertTrue(prepared.json()["created"])
+        repeated = self.client.post(
+            "/v1/admin/profile-qualifications/prepare",
+            headers=self.admin,
+            json=body,
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertFalse(repeated.json()["created"])
+        workload = run["workload"]
+        evidence_body = {
+            "steps": [
+                {"step_id": step, "status": "PASSED", "failure_code": None}
+                for step in QUALIFICATION_STEPS
+            ],
+            "metrics": {
+                "model_load_seconds": 30.0,
+                "request_count": 200,
+                "restart_count": 1,
+                "max_model_len": run["max_model_len"],
+                "concurrency": run["max_concurrency"],
+                "input_tokens": workload["input_tokens"],
+                "output_tokens": workload["output_tokens"],
+                "warmup_requests": workload["warmup_requests"],
+                "ttft_p95_ms": 100.0,
+                "tpot_p95_ms": 20.0,
+                "e2e_p95_ms": 1000.0,
+                "throughput_tps": 20.0,
+                "success_rate": 1.0,
+                "vram_headroom_pct": 20.0,
+                "network_bandwidth_mbps": None,
+                "network_rtt_ms": None,
+                "packet_loss_pct": None,
+                "nccl_all_reduce_ok": None,
+            },
+            "executor_image": (
+                "registry.example/qualification@sha256:" + "d" * 64
+            ),
+            "dure_commit": "e" * 40,
+        }
+        evidence = self.client.post(
+            f"/v1/admin/profile-qualifications/{request_id}/evidence",
+            headers=self.admin,
+            json=evidence_body,
+        )
+        self.assertEqual(evidence.status_code, 200, evidence.text)
+        self.assertEqual(evidence.json()["evidence"]["status"], "PASSED")
+        activated = self.client.post(
+            f"/v1/admin/placement-profiles/{placement['id']}/activate",
+            headers=self.admin,
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(activated.json()["placement"]["status"], "ACTIVE")

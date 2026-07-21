@@ -15,6 +15,7 @@
 
 - [모델 선택 정책](model-selection.md): GPU 인벤토리 기반 결정론적 선택기, 모델 레지스트리·승격 게이트, 결정론적 추천 스냅샷, 배포 세대 상태와 명시적 롤백 — 부분 구현
 - [벤치마크 및 모델 자격 검증](benchmarking.md): 구조화된 증적, 단일 노드 폐쇄형 실행과 후보 모델의 품질·성능·안정성 승격 기준 — 부분 구현
+- [자동 배치 프로필 qualification](profile-qualification.md): `DRAFT → QUALIFYING → VALIDATED → ACTIVE`, 8단계 폐쇄형 증적과 exact rank·노드·GPU 결합을 강제하는 중앙 계약
 - [모델 아티팩트 매니페스트와 배포 계약](artifact-distribution.md): 불변 파일·청크 레지스트리, 결정론적 `STAGE`·`FULL_SNAPSHOT` 선택, 중앙 캐시 수명 주기, 명시적 준비·격리와 배포·롤백 소비 게이트
 - [vLLM 단계 아티팩트 생성·검증·배포](stage-artifacts.md): 제한된 vLLM 0.9.0 stage builder, variant·rank 매니페스트, 추천에 고정된 rank별 준비와 `sharded_state` 소비
 - [제품 제안서](dure-proposal.md): 장기 제품 비전과 MVP 가설

@@ -59,6 +59,7 @@ from .models import (
     Task,
     utcnow,
 )
+from .qualification import active_profile_qualification_nodes
 from .recommendation import RecommendationError, evaluate_deployment_recommendation
 from .stage_artifacts import (
     StageArtifactConflictError,
@@ -640,6 +641,20 @@ def _selected_context(
             "an assigned node already has an active task",
             code="PREPARATION_NODE_BUSY",
             details={"task_id": active_task.id, "node_id": active_task.node_id},
+        )
+
+    active_qualifications = active_profile_qualification_nodes(session, node_ids)
+    if active_qualifications:
+        overlap = sorted(active_qualifications)
+        raise ArtifactPreparationError(
+            "assigned nodes belong to active profile qualification runs",
+            code="PREPARATION_NODE_BUSY",
+            details={
+                "node_ids": overlap,
+                "qualification_run_ids": sorted(
+                    {active_qualifications[node_id] for node_id in overlap}
+                ),
+            },
         )
 
     requested_nodes = set(node_ids)

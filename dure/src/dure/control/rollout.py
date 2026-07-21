@@ -26,6 +26,7 @@ from .models import (
     Task,
     utcnow,
 )
+from .qualification import active_profile_qualification_nodes
 
 
 ROLLOUT_AGENT_VERSION = (0, 3, 12)
@@ -813,6 +814,21 @@ def _activate_operation(
             "deployment lineage already has a queued or running mutation",
             code="DEPLOYMENT_MUTATION_ACTIVE",
             details={"task_id": active_task_id},
+        )
+    active_qualifications = active_profile_qualification_nodes(
+        session, operation.node_ids
+    )
+    if active_qualifications:
+        overlap = sorted(active_qualifications)
+        raise DeploymentRolloutConflictError(
+            "deployment nodes belong to active profile qualification runs",
+            code="DEPLOYMENT_NODE_QUALIFICATION_ACTIVE",
+            details={
+                "node_ids": overlap,
+                "qualification_run_ids": sorted(
+                    {active_qualifications[node_id] for node_id in overlap}
+                ),
+            },
         )
     operation.active_lineage_id = operation.lineage_id
     operation.updated_at = utcnow()

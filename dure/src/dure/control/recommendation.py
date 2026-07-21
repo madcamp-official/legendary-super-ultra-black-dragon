@@ -43,6 +43,10 @@ from dure.task import (
 )
 
 from .benchmark import BENCHMARK_POLICY_VERSION, BENCHMARK_SUITE_ID
+from .qualification import (
+    ProfileQualificationError,
+    validate_profile_qualification_evidence,
+)
 
 from .models import (
     AuditEvent,
@@ -60,6 +64,8 @@ from .models import (
     Node,
     NodeProfileRecord,
     PlacementProfileRecord,
+    ProfileQualificationEvidence,
+    ProfileQualificationRun,
     RuntimeRelease,
     StageArtifactRank,
     StageArtifactValidationEvidence,
@@ -256,10 +262,98 @@ def _network_evidence_bindings(
     now: datetime,
 ) -> tuple[NetworkEvidenceBinding, ...]:
     requires_network = placement.requires_network_evidence or placement.node_count > 1
-    if not requires_network:
+    requires_qualification = placement.origin == "AUTO"
+    if not requires_network and not requires_qualification:
         return ()
 
     inventory_by_id = {node.node_id: node for node in inventory}
+    if requires_qualification:
+        if not placement.qualification_evidence_id:
+            return ()
+        qualification = session.get(
+            ProfileQualificationEvidence,
+            placement.qualification_evidence_id,
+        )
+        qualification_run = (
+            session.get(ProfileQualificationRun, qualification.run_id)
+            if qualification is not None
+            else None
+        )
+        if qualification is None or qualification_run is None:
+            return ()
+        try:
+            validate_profile_qualification_evidence(
+                session,
+                placement=placement,
+                evidence=qualification,
+                run=qualification_run,
+                now=now,
+            )
+        except ProfileQualificationError:
+            return ()
+        registered_at = aware(qualification.created_at)
+        age = now - registered_at
+        node_set = _exact_node_set(
+            qualification_run.node_ids,
+            node_count=placement.node_count,
+        )
+        rank_node_ids = qualification_run.rank_node_ids
+        rank_node_set = (
+            tuple(sorted(rank_node_ids))
+            if isinstance(rank_node_ids, list)
+            and len(rank_node_ids) == placement.node_count
+            and all(isinstance(item, str) for item in rank_node_ids)
+            and len(rank_node_ids) == len(set(rank_node_ids))
+            else None
+        )
+        selected_inventory = [
+            inventory_by_id[node_id]
+            for node_id in (node_set or ())
+            if node_id in inventory_by_id
+        ]
+        metrics = qualification.metrics
+        network_ok = not requires_network or (
+            type(metrics) is dict
+            and type(metrics.get("network_bandwidth_mbps")) in {int, float}
+            and (
+                placement.min_bandwidth_mbps is None
+                or metrics["network_bandwidth_mbps"]
+                >= placement.min_bandwidth_mbps
+            )
+            and type(metrics.get("network_rtt_ms")) in {int, float}
+            and (
+                placement.max_rtt_ms is None
+                or metrics["network_rtt_ms"] <= placement.max_rtt_ms
+            )
+            and type(metrics.get("packet_loss_pct")) in {int, float}
+            and (
+                placement.max_packet_loss_pct is None
+                or metrics["packet_loss_pct"] <= placement.max_packet_loss_pct
+            )
+            and (
+                not placement.requires_nccl
+                or metrics.get("nccl_all_reduce_ok") is True
+            )
+        )
+        if (
+            node_set is not None
+            and rank_node_set == node_set
+            and len(selected_inventory) == placement.node_count
+            and timedelta(0) <= age <= NETWORK_EVIDENCE_MAX_AGE
+            and network_ok
+        ):
+            return (
+                NetworkEvidenceBinding(
+                    evidence_id=qualification.id,
+                    evidence_digest=qualification.evidence_digest,
+                    node_ids=node_set,
+                    registered_at=registered_at.isoformat(),
+                    rank_node_ids=tuple(qualification_run.rank_node_ids),
+                ),
+            )
+        # AUTO profiles never fall back to generic network verification or
+        # benchmark evidence: deployment must use the exact qualified nodes.
+        return ()
     evidence_rows = list(
         session.scalars(
             select(BenchmarkEvidence)
@@ -650,7 +744,19 @@ def _active_catalog(
             "origin": placement.origin,
             "status": placement.status,
             "spec_digest": placement.spec_digest,
+            "qualification_evidence_id": placement.qualification_evidence_id,
+            "qualified_at": (
+                aware(placement.qualified_at).isoformat()
+                if placement.qualified_at is not None
+                else None
+            ),
+            "activated_at": (
+                aware(placement.activated_at).isoformat()
+                if placement.activated_at is not None
+                else None
+            ),
             "requires_network_evidence": placement.requires_network_evidence,
+            "requires_qualification_evidence": placement.origin == "AUTO",
             "requires_nccl": placement.requires_nccl,
             "min_bandwidth_mbps": placement.min_bandwidth_mbps,
             "max_rtt_ms": placement.max_rtt_ms,
@@ -691,6 +797,7 @@ def _active_catalog(
             requires_network_evidence=(
                 placement.requires_network_evidence or placement.node_count > 1
             ),
+            requires_qualification_evidence=placement.origin == "AUTO",
         )
 
         delivery_candidates: list[

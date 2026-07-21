@@ -22,6 +22,10 @@ class PlacementProfile:
     requires_engine_ready: bool = True
     requires_nvidia_runtime: bool = True
     requires_network_evidence: bool = False
+    # 중앙에서 생성한 AUTO 프로필은 단일 노드라도 qualification을
+    # 통과한 exact node/GPU 결합만 선택해야 한다. 정적 로컬 카탈로그는
+    # 기본값을 유지해 기존 오프라인 계획 동작을 보존한다.
+    requires_qualification_evidence: bool = False
 
 
 @dataclass(frozen=True)

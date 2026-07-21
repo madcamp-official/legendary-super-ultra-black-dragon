@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+from contextlib import redirect_stdout
 import tempfile
 import unittest
 import uuid
@@ -12,6 +14,7 @@ from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from sqlalchemy import (
     BigInteger,
+    bindparam,
     CheckConstraint,
     ForeignKeyConstraint,
     MetaData,
@@ -48,6 +51,7 @@ from dure.control.models import (
     ModelRelease,
     NodeArtifactCache,
     PlacementProfileRecord,
+    ProfileQualificationRun,
     RuntimeRelease,
     StageArtifactRank,
     StageArtifactValidationEvidence,
@@ -94,11 +98,17 @@ ARTIFACT_CACHE_TABLES = {
     "node_artifact_caches",
     "artifact_cache_events",
 }
+PROFILE_QUALIFICATION_TABLES = {
+    "profile_qualification_runs",
+    "profile_qualification_bindings",
+    "profile_qualification_evidence",
+}
 HEAD_TABLES = REGISTRY_TABLES | {
     *ARTIFACT_MANIFEST_TABLES,
     *ARTIFACT_PREPARATION_TABLES,
     *STAGE_ARTIFACT_TABLES,
     *ARTIFACT_CACHE_TABLES,
+    *PROFILE_QUALIFICATION_TABLES,
     "benchmark_evidence",
     "benchmark_runs",
     "deployment_operation_nodes",
@@ -1708,6 +1718,9 @@ class MigrationTests(unittest.TestCase):
                 "origin",
                 "status",
                 "spec_digest",
+                "qualification_evidence_id",
+                "qualified_at",
+                "activated_at",
             }
             <= set(placement_columns)
         )
@@ -1734,6 +1747,9 @@ class MigrationTests(unittest.TestCase):
                 "ck_placement_status",
                 "ck_placement_auto_tp1",
                 "ck_placement_auto_pp_nodes",
+                "ck_placement_auto_evidence",
+                "ck_placement_auto_activation",
+                "ck_placement_auto_qualified_at",
             }
             <= placement_checks
         )
@@ -1742,6 +1758,241 @@ class MigrationTests(unittest.TestCase):
             {
                 item["name"]
                 for item in inspector.get_indexes("placement_profiles")
+            },
+        )
+        self.assertIn(
+            (
+                ("qualification_evidence_id",),
+                "profile_qualification_evidence",
+                ("id",),
+            ),
+            {
+                (
+                    tuple(item["constrained_columns"]),
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys("placement_profiles")
+            },
+        )
+        qualification_run_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("profile_qualification_runs")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "release_id",
+                "placement_id",
+                "status",
+                "node_ids",
+                "rank_node_ids",
+                "gpu_bindings",
+                "inventory_fingerprint",
+                "profile_spec_digest",
+                "policy_version",
+                "suite_id",
+                "required_steps",
+                "workload",
+                "workload_digest",
+                "max_model_len",
+                "max_concurrency",
+                "artifact_revision",
+                "artifact_manifest_digest",
+                "runtime_image",
+                "runtime_vllm_version",
+                "evidence_id",
+                "failure_code",
+                "created_at",
+                "updated_at",
+            },
+            set(qualification_run_columns),
+        )
+        self.assertEqual(
+            {
+                "ix_profile_qualification_runs_placement",
+                "ix_profile_qualification_runs_status",
+            },
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "profile_qualification_runs"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "ck_profile_qualification_run_status",
+                "ck_profile_qualification_run_inventory_sha256",
+                "ck_profile_qualification_run_spec_sha256",
+                "ck_profile_qualification_run_workload_sha256",
+                "ck_profile_qualification_run_context_positive",
+                "ck_profile_qualification_run_concurrency_positive",
+                "ck_profile_qualification_run_outcome",
+            },
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "profile_qualification_runs"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("release_id",): ("model_releases", ("id",)),
+                ("placement_id",): ("placement_profiles", ("id",)),
+                ("evidence_id",): (
+                    "profile_qualification_evidence",
+                    ("id",),
+                ),
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "profile_qualification_runs"
+                )
+            },
+        )
+        qualification_evidence_columns = {
+            item["name"]: item
+            for item in inspector.get_columns(
+                "profile_qualification_evidence"
+            )
+        }
+        self.assertEqual(
+            {
+                "run_id",
+                "rank",
+                "node_id",
+                "gpu_index",
+                "gpu_uuid",
+                "memory_mib",
+                "compute_capability",
+            },
+            {
+                item["name"]
+                for item in inspector.get_columns(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {"ix_profile_qualification_bindings_node"},
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "ck_profile_qualification_binding_rank",
+                "ck_profile_qualification_binding_gpu_index",
+                "ck_profile_qualification_binding_gpu_uuid",
+                "ck_profile_qualification_binding_memory",
+            },
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("run_id", "node_id"),
+                ("run_id", "gpu_uuid"),
+            },
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("run_id",): ("profile_qualification_runs", ("id",)),
+                ("node_id",): ("nodes", ("id",)),
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "id",
+                "run_id",
+                "status",
+                "steps",
+                "metrics",
+                "policy_version",
+                "suite_id",
+                "workload_digest",
+                "executor_image",
+                "dure_commit",
+                "evidence_digest",
+                "created_at",
+            },
+            set(qualification_evidence_columns),
+        )
+        self.assertEqual(
+            {"ix_profile_qualification_evidence_run"},
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "profile_qualification_evidence"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "ck_profile_qualification_evidence_status",
+                "ck_profile_qualification_evidence_sha256",
+                "ck_profile_qualification_executor_digest",
+                "ck_profile_qualification_evidence_workload_sha256",
+            },
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "profile_qualification_evidence"
+                )
+            },
+        )
+        self.assertEqual(
+            {("run_id",), ("evidence_digest",)},
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "profile_qualification_evidence"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("run_id",): (
+                    "profile_qualification_runs",
+                    ("id",),
+                )
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "profile_qualification_evidence"
+                )
             },
         )
         recommendation_columns = {
@@ -2120,12 +2371,51 @@ class MigrationTests(unittest.TestCase):
             revision_module._append_only_guard_downgrade_sql("postgresql"),
         )
 
-    def test_migration_history_has_single_0011_head(self):
+    def test_migration_history_has_single_0012_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0011"])
+            self.assertEqual(heads, ["0012"])
+
+    def test_0012_postgresql_offline_upgrade_is_deterministic(self):
+        output = io.StringIO()
+        migration_config = config("postgresql://dure@localhost/dure")
+
+        with redirect_stdout(output):
+            command.upgrade(migration_config, "0011:0012", sql=True)
+
+        sql = output.getvalue()
+        self.assertIn(
+            "upgrade 0012 requires legacy AUTO placement profiles to remain DRAFT",
+            sql,
+        )
+        self.assertIn(
+            "LOCK TABLE placement_profiles IN ACCESS EXCLUSIVE MODE",
+            sql,
+        )
+        self.assertIn("CREATE TABLE profile_qualification_runs", sql)
+        self.assertIn("CREATE TABLE profile_qualification_bindings", sql)
+        self.assertIn("CREATE TABLE profile_qualification_evidence", sql)
+        self.assertIn(
+            "fk_placement_profiles_qualification_evidence",
+            sql,
+        )
+        self.assertIn("fk_profile_qualification_runs_evidence", sql)
+        revision_module = ScriptDirectory.from_config(
+            migration_config
+        ).get_revision("0012").module
+        self.assertEqual(
+            (
+                "LOCK TABLE placement_profiles, profile_qualification_runs, "
+                "profile_qualification_bindings, "
+                "profile_qualification_evidence IN ACCESS EXCLUSIVE MODE",
+            ),
+            revision_module._destructive_downgrade_lock_sql("postgresql"),
+        )
+        self.assertEqual(
+            (), revision_module._destructive_downgrade_lock_sql("sqlite")
+        )
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2186,6 +2476,187 @@ class MigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "downgrade 0011"):
                 command.downgrade(migration_config, "0010")
             engine.dispose()
+
+    def test_0012_rejects_invalid_auto_lifecycle_and_data_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'qualification-head.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                artifact = create_model_artifact(
+                    session,
+                    model_id="qwen2.5-7b-awq",
+                    repository="Qwen/Qwen2.5-7B-Instruct-AWQ",
+                    revision="d" * 40,
+                    manifest_digest="sha256:" + "e" * 64,
+                    quantization="awq",
+                    size_mib=4916,
+                    default_max_model_len=8192,
+                    layer_count=28,
+                    license_id="apache-2.0",
+                )
+                runtime = create_runtime_release(
+                    session,
+                    version="vllm-qualification-head",
+                    image="registry.example/vllm@sha256:" + "f" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+                release = create_model_release(
+                    session,
+                    artifact_id=artifact.id,
+                    runtime_id=runtime.id,
+                    quality_rank=7,
+                )
+                generate_auto_placement_profiles(
+                    session, release_id=release.id, apply=True
+                )
+                placement = session.scalar(
+                    select(PlacementProfileRecord).where(
+                        PlacementProfileRecord.release_id == release.id
+                    )
+                )
+                placement.status = "VALIDATED"
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                node_id = str(uuid.uuid4())
+                run = ProfileQualificationRun(
+                    id=str(uuid.uuid4()),
+                    release_id=release.id,
+                    placement_id=placement.id,
+                    status="QUALIFYING",
+                    node_ids=[node_id],
+                    rank_node_ids=[node_id],
+                    gpu_bindings=[],
+                    inventory_fingerprint="sha256:" + "1" * 64,
+                    profile_spec_digest=placement.spec_digest,
+                    policy_version="profile-qualification-v1",
+                    suite_id="dure-profile-qualification-v1",
+                    required_steps=["STATIC_COMPATIBILITY"],
+                    workload={"contract": "migration-test"},
+                    workload_digest="sha256:" + "2" * 64,
+                    max_model_len=placement.max_model_len,
+                    max_concurrency=placement.max_concurrency,
+                    artifact_revision=artifact.revision,
+                    artifact_manifest_digest=artifact.manifest_digest,
+                    runtime_image=runtime.image,
+                    runtime_vllm_version=runtime.vllm_version,
+                )
+                session.add(run)
+                session.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "downgrade 0012"):
+                command.downgrade(migration_config, "0011")
+            engine.dispose()
+
+    def test_true_0011_auto_profile_preflight_is_atomic_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'true-0011.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                artifact = create_model_artifact(
+                    session,
+                    model_id="qwen2.5-72b-awq",
+                    repository="Qwen/Qwen2.5-72B-Instruct-AWQ",
+                    revision="3" * 40,
+                    manifest_digest="sha256:" + "4" * 64,
+                    quantization="awq",
+                    size_mib=39670,
+                    default_max_model_len=8192,
+                    layer_count=80,
+                    license_id="apache-2.0",
+                )
+                runtime = create_runtime_release(
+                    session,
+                    version="vllm-true-0011",
+                    image="registry.example/vllm@sha256:" + "5" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+                release = create_model_release(
+                    session,
+                    artifact_id=artifact.id,
+                    runtime_id=runtime.id,
+                    quality_rank=72,
+                )
+                generate_auto_placement_profiles(
+                    session, release_id=release.id, apply=True
+                )
+                placement_ids = sorted(
+                    session.scalars(
+                        select(PlacementProfileRecord.id).where(
+                            PlacementProfileRecord.release_id == release.id
+                        )
+                    )
+                )
+            engine.dispose()
+
+            command.downgrade(migration_config, "0011")
+            engine = make_engine(url)
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE placement_profiles SET status = 'ACTIVE' "
+                        "WHERE id = :placement_id"
+                    ),
+                    {"placement_id": placement_ids[0]},
+                )
+            with self.assertRaisesRegex(RuntimeError, "legacy AUTO"):
+                command.upgrade(migration_config, "head")
+
+            inspector = inspect(engine)
+            self.assertNotIn(
+                "qualification_evidence_id",
+                {
+                    item["name"]
+                    for item in inspector.get_columns("placement_profiles")
+                },
+            )
+            self.assertFalse(
+                PROFILE_QUALIFICATION_TABLES
+                & set(inspector.get_table_names())
+            )
+            with engine.begin() as connection:
+                self.assertEqual(
+                    connection.scalar(
+                        text("SELECT version_num FROM alembic_version")
+                    ),
+                    "0011",
+                )
+                connection.execute(
+                    text(
+                        "UPDATE placement_profiles SET status = 'DRAFT' "
+                        "WHERE id = :placement_id"
+                    ),
+                    {"placement_id": placement_ids[0]},
+                )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            with engine.connect() as connection:
+                rows = connection.execute(
+                    text(
+                        "SELECT id, status FROM placement_profiles "
+                        "WHERE id IN :placement_ids ORDER BY id"
+                    ).bindparams(bindparam("placement_ids", expanding=True)),
+                    {"placement_ids": placement_ids},
+                ).all()
+            self.assertEqual(
+                [(placement_id, "DRAFT") for placement_id in placement_ids],
+                rows,
+            )
+            engine.dispose()
+            self.assert_benchmark_head(url)
 
     def test_true_0009_upgrade_and_empty_round_trip_preserve_stage_registry(self):
         with tempfile.TemporaryDirectory() as temporary:

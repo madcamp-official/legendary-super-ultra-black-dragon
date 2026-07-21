@@ -1,3 +1,11 @@
+dure (0.3.28) UNRELEASED; urgency=medium
+
+  * 자동 배치 프로필에 GPU UUID 결합 qualification 증적과 승격 게이트를 추가합니다.
+  * 정책·작업 부하·rank 결합을 동결하고 운영자 명시 활성화를 요구합니다.
+  * Alembic 0012로 qualification 실행·증적·GPU 결합을 안전하게 영속화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 21:30:00 +0900
+
 dure (0.3.27) UNRELEASED; urgency=medium
 
   * 네 Qwen2.5 AWQ 모델의 TP=1 자동 배치 프로필 생성기를 추가합니다.

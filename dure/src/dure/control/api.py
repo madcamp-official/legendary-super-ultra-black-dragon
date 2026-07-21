@@ -44,6 +44,8 @@ from .models import (
     Node,
     NodeProfileRecord,
     PlacementProfileRecord,
+    ProfileQualificationEvidence,
+    ProfileQualificationRun,
     RuntimeRelease,
     Task,
     TaskType,
@@ -109,6 +111,16 @@ from .recommendation import (
     accept_deployment_recommendation,
     recommend_deployment,
     show_deployment_recommendation,
+)
+from .qualification import (
+    QUALIFICATION_STEPS,
+    ProfileQualificationError,
+    activate_validated_profile,
+    cancel_profile_qualification,
+    prepare_profile_qualification,
+    qualification_evidence_dict,
+    qualification_run_dict,
+    register_profile_qualification_evidence,
 )
 from .preparation import (
     ArtifactPreparationError,
@@ -367,6 +379,96 @@ class PlacementProfileGenerate(StrictBody):
     apply: StrictBool = False
 
 
+class ProfileQualificationPrepare(StrictBody):
+    request_id: str
+    placement_id: str
+    node_ids: list[str] = Field(min_length=1, max_length=64)
+    apply: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_identities(self):
+        if len(self.node_ids) != len(set(self.node_ids)):
+            raise ValueError("node_ids must not contain duplicates")
+        for value in (self.request_id, self.placement_id, *self.node_ids):
+            try:
+                if str(uuid.UUID(value)) != value:
+                    raise ValueError
+            except (AttributeError, ValueError) as exc:
+                raise ValueError(
+                    "qualification identities must be canonical UUIDs"
+                ) from exc
+        return self
+
+
+class ProfileQualificationStep(StrictBody):
+    step_id: Literal[
+        "STATIC_COMPATIBILITY",
+        "CAPACITY_ESTIMATE",
+        "ARTIFACT_READY",
+        "NETWORK_NCCL",
+        "MODEL_LOAD",
+        "SHORT_INFERENCE",
+        "CONTEXT_CONCURRENCY",
+        "RESTART_STABILITY",
+    ]
+    status: Literal["PASSED", "FAILED"]
+    failure_code: Literal[
+        "STATIC_COMPATIBILITY_FAILED",
+        "CAPACITY_ESTIMATE_FAILED",
+        "ARTIFACT_NOT_READY",
+        "NETWORK_NCCL_FAILED",
+        "MODEL_LOAD_FAILED",
+        "SHORT_INFERENCE_FAILED",
+        "CONTEXT_CONCURRENCY_FAILED",
+        "RESTART_STABILITY_FAILED",
+    ] | None = None
+
+    @model_validator(mode="after")
+    def validate_failure(self):
+        if self.status == "PASSED" and self.failure_code is not None:
+            raise ValueError("passing step cannot have failure_code")
+        if self.status == "FAILED" and self.failure_code is None:
+            raise ValueError("failed step requires failure_code")
+        return self
+
+
+class ProfileQualificationMetrics(StrictBody):
+    model_load_seconds: float = Field(gt=0, allow_inf_nan=False)
+    request_count: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    restart_count: int = Field(ge=0, le=MAX_BENCHMARK_INTEGER)
+    max_model_len: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    concurrency: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    input_tokens: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    output_tokens: int = Field(gt=0, le=MAX_BENCHMARK_INTEGER)
+    warmup_requests: int = Field(ge=0, le=MAX_BENCHMARK_INTEGER)
+    ttft_p95_ms: float = Field(gt=0, allow_inf_nan=False)
+    tpot_p95_ms: float = Field(gt=0, allow_inf_nan=False)
+    e2e_p95_ms: float = Field(gt=0, allow_inf_nan=False)
+    throughput_tps: float = Field(gt=0, allow_inf_nan=False)
+    success_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
+    vram_headroom_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    network_bandwidth_mbps: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+    network_rtt_ms: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    packet_loss_pct: float | None = Field(
+        default=None, ge=0, le=100, allow_inf_nan=False
+    )
+    nccl_all_reduce_ok: StrictBool | None = None
+
+
+class ProfileQualificationEvidenceCreate(StrictBody):
+    steps: list[ProfileQualificationStep] = Field(
+        min_length=len(QUALIFICATION_STEPS),
+        max_length=len(QUALIFICATION_STEPS),
+    )
+    metrics: ProfileQualificationMetrics
+    executor_image: str = Field(min_length=1, max_length=512)
+    dure_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+
+
 class DeploymentRecommendationCreate(StrictBody):
     node_ids: list[str] = Field(default_factory=list, max_length=256)
     all_online: bool = False
@@ -573,6 +675,14 @@ def _promotion_error_detail(exc: BenchmarkPromotionError) -> dict:
     }
 
 
+def _qualification_error_detail(exc: ProfileQualificationError) -> dict:
+    return {
+        "code": exc.code,
+        "message": str(exc),
+        "details": exc.details,
+    }
+
+
 def _benchmark_run_error_detail(exc: BenchmarkRunError) -> dict:
     return {
         "code": exc.code,
@@ -717,6 +827,9 @@ def _placement_dict(record: PlacementProfileRecord) -> dict:
             "origin",
             "status",
             "spec_digest",
+            "qualification_evidence_id",
+            "qualified_at",
+            "activated_at",
             "requires_network_evidence",
             "requires_nccl",
             "min_bandwidth_mbps",
@@ -1415,6 +1528,146 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"generation": result}
+
+    @app.post(
+        "/v1/admin/profile-qualifications/prepare",
+        dependencies=[Depends(admin_auth)],
+    )
+    def profile_qualification_prepare(
+        body: ProfileQualificationPrepare,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            run, created = prepare_profile_qualification(
+                session, **body.model_dump()
+            )
+        except ProfileQualificationError as exc:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if exc.code
+                in {
+                    "QUALIFICATION_PROFILE_NOT_FOUND",
+                    "QUALIFICATION_NODE_NOT_FOUND",
+                }
+                else status.HTTP_409_CONFLICT
+            )
+            raise HTTPException(
+                status_code, _qualification_error_detail(exc)
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"qualification": run, "created": created}
+
+    @app.get(
+        "/v1/admin/profile-qualifications/{run_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def profile_qualification_detail(
+        run_id: str, session: Session = Depends(get_session)
+    ):
+        run = session.get(ProfileQualificationRun, run_id)
+        if run is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                {
+                    "code": "QUALIFICATION_RUN_NOT_FOUND",
+                    "message": "qualification run does not exist",
+                    "details": {},
+                },
+            )
+        evidence = (
+            session.get(ProfileQualificationEvidence, run.evidence_id)
+            if run.evidence_id
+            else None
+        )
+        return {
+            "qualification": qualification_run_dict(run),
+            "evidence": (
+                qualification_evidence_dict(evidence)
+                if evidence is not None
+                else None
+            ),
+        }
+
+    @app.post(
+        "/v1/admin/profile-qualifications/{run_id}/evidence",
+        dependencies=[Depends(admin_auth)],
+    )
+    def profile_qualification_evidence_create(
+        run_id: str,
+        body: ProfileQualificationEvidenceCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            evidence, run, created = register_profile_qualification_evidence(
+                session,
+                run_id=run_id,
+                **body.model_dump(),
+            )
+        except ProfileQualificationError as exc:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if exc.code == "QUALIFICATION_RUN_NOT_FOUND"
+                else status.HTTP_409_CONFLICT
+            )
+            raise HTTPException(
+                status_code, _qualification_error_detail(exc)
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+            ) from exc
+        return {
+            "qualification": qualification_run_dict(run),
+            "evidence": qualification_evidence_dict(evidence),
+            "created": created,
+        }
+
+    @app.post(
+        "/v1/admin/profile-qualifications/{run_id}/cancel",
+        dependencies=[Depends(admin_auth)],
+    )
+    def profile_qualification_cancel(
+        run_id: str, session: Session = Depends(get_session)
+    ):
+        try:
+            run, changed = cancel_profile_qualification(session, run_id)
+        except ProfileQualificationError as exc:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if exc.code == "QUALIFICATION_RUN_NOT_FOUND"
+                else status.HTTP_409_CONFLICT
+            )
+            raise HTTPException(
+                status_code, _qualification_error_detail(exc)
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"qualification": qualification_run_dict(run), "changed": changed}
+
+    @app.post(
+        "/v1/admin/placement-profiles/{placement_id}/activate",
+        dependencies=[Depends(admin_auth)],
+    )
+    def placement_profile_activate(
+        placement_id: str, session: Session = Depends(get_session)
+    ):
+        try:
+            placement, changed = activate_validated_profile(
+                session, placement_id
+            )
+        except ProfileQualificationError as exc:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if exc.code == "QUALIFICATION_PROFILE_NOT_FOUND"
+                else status.HTTP_409_CONFLICT
+            )
+            raise HTTPException(
+                status_code, _qualification_error_detail(exc)
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"placement": _placement_dict(placement), "changed": changed}
 
     @app.post(
         "/v1/admin/model-releases/{release_id}/placements",

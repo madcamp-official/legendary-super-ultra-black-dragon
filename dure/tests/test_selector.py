@@ -267,6 +267,43 @@ class SelectorTests(unittest.TestCase):
             "2026-07-21T00:00:00Z",
         )
 
+    def test_qualification_evidence_requires_its_exact_single_node(self):
+        base = STATIC_CATALOG.entry("qwen2.5-7b-awq")
+        entry = replace(
+            base,
+            placement=replace(
+                base.placement,
+                requires_qualification_evidence=True,
+            ),
+            network_evidence=(network_evidence("evidence-b", "node-b"),),
+        )
+
+        result = recommend_model(
+            [inventory(profile("node-a")), inventory(profile("node-b"))],
+            catalog=ModelCatalog("test", "test", (entry,)),
+            allow_unverified_network=True,
+        )
+
+        candidate = result.evaluations[0]
+        self.assertTrue(candidate.feasible)
+        self.assertEqual(candidate.node_ids, ("node-b",))
+        self.assertEqual(candidate.network_evidence_id, "evidence-b")
+
+        missing = recommend_model(
+            [inventory(profile("node-a")), inventory(profile("node-b"))],
+            catalog=ModelCatalog(
+                "test",
+                "test",
+                (replace(entry, network_evidence=()),),
+            ),
+            allow_unverified_network=True,
+        ).evaluations[0]
+        self.assertFalse(missing.feasible)
+        self.assertIn(
+            "QUALIFICATION_EVIDENCE",
+            {item.code for item in missing.rejections},
+        )
+
     def test_exact_network_evidence_groups_are_not_combined(self):
         first = network_evidence("evidence-a", "node-a", "node-b", "node-c")
         second = network_evidence("evidence-b", "node-b", "node-c", "node-d")

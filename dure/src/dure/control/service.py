@@ -68,6 +68,7 @@ from .models import (
     TaskType,
     utcnow,
 )
+from .qualification import active_profile_qualification_nodes
 from .rollout import (
     DeploymentRolloutConflictError,
     PHASE_TASK_TYPES,
@@ -2076,6 +2077,18 @@ def apply_benchmark_run(
                 "task_type": active_task.type,
             },
         )
+    active_qualification = active_profile_qualification_nodes(
+        session, [locked_node.id]
+    ).get(locked_node.id)
+    if active_qualification is not None:
+        raise BenchmarkRunError(
+            "benchmark coordinator node belongs to an active profile qualification",
+            code="BENCHMARK_NODE_BUSY",
+            details={
+                "node_id": locked_node.id,
+                "qualification_run_id": active_qualification,
+            },
+        )
     for operation in session.scalars(
         select(DeploymentOperation).where(
             DeploymentOperation.active_lineage_id.is_not(None)
@@ -2690,6 +2703,21 @@ def _ensure_deployment_node_scope_available(
             details={
                 "task_id": active_task.id,
                 "node_id": active_task.node_id,
+            },
+        )
+    active_qualifications = active_profile_qualification_nodes(
+        session, requested
+    )
+    if active_qualifications:
+        overlap = sorted(active_qualifications)
+        raise DeploymentRolloutConflictError(
+            "assigned nodes belong to active profile qualification runs",
+            code="DEPLOYMENT_NODE_QUALIFICATION_ACTIVE",
+            details={
+                "node_ids": overlap,
+                "qualification_run_ids": sorted(
+                    {active_qualifications[node_id] for node_id in overlap}
+                ),
             },
         )
 

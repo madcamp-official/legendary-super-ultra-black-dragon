@@ -141,7 +141,11 @@ def _best_gpu(node: InventoryNode, minimum_mib: int) -> GPUProfile | None:
         for gpu in node.profile.gpus
         if gpu.healthy and gpu.memory_mib >= minimum_mib
     ]
-    return max(eligible, key=lambda gpu: (gpu.memory_mib, -gpu.index), default=None)
+    return min(
+        eligible,
+        key=lambda gpu: (-gpu.memory_mib, gpu.uuid, gpu.index),
+        default=None,
+    )
 
 
 def _has_cached_model(node: InventoryNode, entry: CatalogEntry) -> bool:
@@ -288,6 +292,7 @@ def _evaluate(
     insufficient_disk: list[str] = []
     missing_runtime: list[str] = []
     missing_network: list[str] = []
+    missing_qualification: list[str] = []
     stage_disk_failures: tuple[str, ...] = ()
     rank_node_ids: tuple[str, ...] = ()
     full_required_bytes = (
@@ -360,7 +365,21 @@ def _evaluate(
         )
     )
     selected_evidence = None
-    if not placement.requires_network_evidence or allow_unverified_network:
+    if placement.requires_qualification_evidence:
+        if entry.network_evidence:
+            (
+                selected_evidence,
+                selected,
+                rank_node_ids,
+                stage_disk_failures,
+            ) = _select_exact_network_evidence(entry, available)
+            network_eligible = available if selected_evidence is not None else []
+        else:
+            selected = ()
+            network_eligible = []
+        if selected_evidence is None:
+            missing_qualification.extend(item[0].node_id for item in available)
+    elif not placement.requires_network_evidence or allow_unverified_network:
         network_eligible = available
         selected = tuple(
             item[0].node_id for item in network_eligible[: placement.node_count]
@@ -485,6 +504,15 @@ def _evaluate(
     if missing_network:
         rejections.append(
             Rejection("NETWORK_EVIDENCE", f"네트워크/NCCL 증적이 없는 노드: {', '.join(missing_network)}", tuple(missing_network))
+        )
+    if missing_qualification:
+        rejections.append(
+            Rejection(
+                "QUALIFICATION_EVIDENCE",
+                "exact qualification node/GPU 결합 증적이 없는 노드: "
+                f"{', '.join(missing_qualification)}",
+                tuple(missing_qualification),
+            )
         )
     feasible = (
         len(selected) == placement.node_count and not stage_disk_failures

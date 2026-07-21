@@ -166,6 +166,17 @@ probe는 최대 256개의 marker metadata만 보고합니다. `scan_complete=tru
 
 추천이 `FULL_SNAPSHOT`을 선택하면 각 노드에 같은 전체 모델을 두고, `STAGE`를 선택하면 각 노드에 서버가 그 UUID와 PP rank에 고정한 서로 다른 정규 매니페스트만 준비합니다. 컨테이너에는 계산된 host path만 `/models/model:ro`로 연결합니다. task가 host path·loader 인자를 제공할 수 없고 시작 직전 캐시 전체를 다시 해시합니다. 다만 이것은 게시자·builder 서명이나 악성 root·Docker daemon 방어를 대신하지 않습니다.
 
+## 자동 배치 프로필 qualification의 신뢰 경계
+
+자동 프로필 qualification은 `DRAFT → QUALIFYING → VALIDATED → 운영자 ACTIVE` 전이와 증적 형식을 중앙에서 강제하는 계약입니다. 준비 시 policy·suite·작업 부하, 모델·런타임 식별자와 8단계 순서를 동결하고 각 rank를 서버 발급 노드 UUID와 GPU index·UUID에 정규화해 결합합니다. task, 활성 배포 operation, 다른 qualification 예약 또는 관측 작업 부하가 있는 노드는 대상에서 제외합니다. 증적 등록과 활성화 시 현재 인벤토리·binding·레지스트리를 다시 계산하며, 중앙 단일·다중 노드 AUTO 추천은 exact 결합의 24시간 이내 통과 증적만 사용합니다.
+
+- 준비 preview, `apply=true` run 생성, 증적 등록과 활성화는 Agent task, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지를 만들지 않습니다.
+- 증적은 정적 호환성, 용량, 아티팩트, 네트워크·NCCL, 모델 load, 짧은 추론, 컨텍스트·동시성, 재시작 안정성의 8단계와 폐쇄형 수치·실패 코드만 받습니다. 임의 명령·환경 변수·마운트·비밀·로그를 표현할 수 없습니다.
+- executor 이미지는 OCI digest로 고정하고 Dure 커밋 표식을 기록하지만, 이 값은 결과의 암호학적 서명이나 원본 로그 provenance가 아닙니다.
+- 현재 서버는 신뢰된 외부 executor가 관리자 API로 제출한 결과를 신뢰 경계 안에서 검증합니다. 다중 노드 Agent 자동 executor, 분산 barrier와 결과 서명은 구현되지 않았습니다.
+
+따라서 관리자 token, executor, 원본 결과 저장소를 같은 신뢰된 운영 경계에서 관리해야 합니다. 이 경계의 전체 계약은 [자동 배치 프로필 qualification](profile-qualification.md)을 참고합니다.
+
 ## 모델 레지스트리, 승격 게이트와 추천 수락의 경계
 
 모델 레지스트리의 영속 스키마, 관리자 인증 API, 고정 리비전·다이제스트 검증, 구조화된 벤치마크 증적, `ACTIVE` 승격 게이트, 정확한 다중 노드 증적을 소비하는 정책 기반 추천 스냅샷과 명시적 수락은 구현되었습니다. 추천은 호스트 변경 권한이 아닙니다. 저장된 인벤토리와 `ACTIVE` 모델 릴리스만 평가하고, 승인·온라인·프로필 신선도·GPU 아키텍처를 통과한 노드만 선택합니다. 수락도 적용 권한이 아니며 적용 전 배포 세대 한 건만 만듭니다.
