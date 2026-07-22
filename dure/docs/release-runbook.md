@@ -99,7 +99,7 @@ record에는 binary version뿐 아니라 선택 package의 SHA-256과 provenance
    실행 시각, 비밀값을 제외한 structured result를 남긴다.
 4. 실제 `PASSED` evidence가 필요한 지원 claim만 `ACCEPTED`로 표시한다. evidence가 없는 package는
    `PUBLISHED`이지만 해당 GPU profile에 수용 완료라고 홍보하지 않는다.
-5. README, 지원 매트릭스, changelog가 실제 지원 범위와 현재 APT mirror authority에 맞는지 검토한다.
+5. README, 지원 매트릭스, [변경 이력](../CHANGELOG.md)이 실제 지원 범위와 현재 APT mirror authority에 맞는지 검토한다.
 
 ## 실패·재시도·철회
 

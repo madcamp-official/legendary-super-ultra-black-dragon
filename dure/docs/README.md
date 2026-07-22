@@ -7,11 +7,14 @@
 - [루트 README](../README.md): 설치, 로컬 CLI, 중앙 관리의 빠른 시작
 - [아키텍처](architecture.md): 로컬 CLI·에이전트·중앙 제어면의 경계와 작업 프로토콜
 - [운영 절차](operations.md): GPU host bootstrap, 서버 운영, 노드 승인, Fleet 준비·적용, 세대별 검증·롤백과 장애 복구
+- [설정 참조서](configuration-reference.md): 환경 변수, 설정 파일, systemd 및 수용 검증 opt-in의 범위·우선순위·권한
+- [CLI 명령 참조](cli-reference.md): 로컬·관리자 명령의 권한, 호스트 변경 여부, preview/apply 조건
 - [Agent 설정과 credential 회전 운영 절차](agent-operations.md): `/etc/dure` 설정 경계, HTTPS/TLS 우선순위, 안전한 회전·재등록
 - [단일 GPU 자동 활성화](activation.md): 불변 릴리스 등록, 자동 준비·벤치마크·승격·추천·배포·검증
 - [릴리스 수용 검증](release-validation.md): v0.4.14 activation 순서 회귀와 실제 3×24GiB `PP=3` GPU 검증 절차
 - [릴리스 증적 기록](release-evidence/README.md): runbook과 실제 GPU 수용 결과를 분리해 보관하는 형식
 - [릴리스 실행 체크리스트](release-runbook.md): 승인자·중단 기준·재시도·APT 게시 뒤 확인을 연결하는 release record 절차
+- [사용자용 변경 이력](../CHANGELOG.md): 기능 변화, 호환성 영향, 업그레이드 요구 사항과 알려진 제한
 - [보안 모델](security.md): 현재 통제와 공개 전 보안 강화 과제
 - [개인정보·프롬프트 처리 정책](data-privacy.md): 현재 데이터 등급, node 운영자의 가시성, logging·incident 대응 경계
 - [네트워크·방화벽 운영 절차](networking.md): Controller·Agent·Ray/vLLM·NCCL 통신 경계, 포트와 사설망 검증
