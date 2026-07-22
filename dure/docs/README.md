@@ -17,7 +17,7 @@
 - [Agent 설정과 credential 회전 운영 절차](agent-operations.md): `/etc/dure` 설정 경계, HTTPS/TLS 우선순위, 안전한 회전·재등록
 - [단일 GPU 자동 활성화](activation.md): 불변 릴리스 등록, 자동 준비·벤치마크·승격·추천·배포·검증
 - [릴리스 수용 검증](release-validation.md): v0.4.14 activation 순서 회귀와 실제 3×24GiB `PP=3` GPU 검증 절차
-- [Dure 0.4.23 작동 시연 보고서](demo-report.md): 실제 로컬 GPU 조사·계획·dry-run과 자동 테스트 결과, 미실행 수용 검사의 경계
+- [Dure 관리자 운영 검증 보고서](admin-operational-validation-2026-07-22.md): 실제 중앙 node·task·deployment·72B qualification 증적과 아직 미완료인 Fleet-native 배포의 경계
 - [릴리스 증적 기록](release-evidence/README.md): runbook과 실제 GPU 수용 결과를 분리해 보관하는 형식
 - [릴리스 실행 체크리스트](release-runbook.md): 승인자·중단 기준·재시도·APT 게시 뒤 확인을 연결하는 release record 절차
 - [사용자용 변경 이력](../CHANGELOG.md): 기능 변화, 호환성 영향, 업그레이드 요구 사항과 알려진 제한
