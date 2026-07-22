@@ -23,7 +23,7 @@
 
 ## 자동 배치 프로필 qualification 계약
 
-자동 생성 프로필은 모델 릴리스 벤치마크와 별도의 `DRAFT → QUALIFYING → VALIDATED → 운영자 ACTIVE` 수명 주기를 가집니다. 준비 시 정책 `profile-qualification-v1`, suite `dure-profile-qualification-v1`, 모델·런타임 식별자, 프로필 spec, TP/PP, 컨텍스트·동시성, 입출력 토큰·예열·최소 요청 수와 단계 순서를 불변 run 및 `workload_digest`로 동결합니다. 각 rank는 중앙 노드 UUID와 GPU index·UUID에 정규화해 결합하며, task·활성 배포 operation·관측 작업 부하가 있는 노드는 시험 대상으로 사용할 수 없습니다.
+자동 생성 프로필은 모델 릴리스 벤치마크와 별도의 `DRAFT → QUALIFYING → VALIDATED → 운영자 ACTIVE` 수명 주기를 가집니다. 준비 시 정책 `profile-qualification-v2`, suite `dure-profile-qualification-v2`, 모델·런타임 식별자, 프로필 spec, TP/PP, 컨텍스트·동시성, 최대 32 출력 토큰·예열·최소 2회 측정과 단계 순서를 불변 run 및 `workload_digest`로 동결합니다. 각 rank는 중앙 노드 UUID와 GPU index·UUID에 정규화해 결합하며, task·활성 배포 operation·관측 작업 부하가 있는 노드는 시험 대상으로 사용할 수 없습니다. 전체 인벤토리 지문은 감사용으로 보존하지만, qualification 중 exact 캐시 준비로 변하는 디스크·설치 모델 필드는 동일한 GPU·불변 실행 identity의 증적을 무효화하지 않습니다.
 
 신뢰된 외부 executor는 다음 8단계를 정확한 순서와 폐쇄형 수치·실패 코드로 모두 제출합니다.
 

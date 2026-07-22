@@ -1,3 +1,12 @@
+dure (0.4.22) UNRELEASED; urgency=medium
+
+  * Bound qualification evidence to stable node, rank, GPU, model, runtime,
+    and workload identity while allowing safe dynamic inventory changes.
+  * Shorten the frozen qualification workload and calibrate the validated
+    72B PP=3 profile for 3x24 GiB nodes and the measured private network.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 06:38:00 +0000
+
 dure (0.4.21) UNRELEASED; urgency=medium
 
   * 문서 지원 매트릭스, 용어집, 릴리스 권한·증적 기록 체계를 추가합니다.

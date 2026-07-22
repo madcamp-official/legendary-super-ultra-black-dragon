@@ -23,11 +23,17 @@ class AutoPlacementProfileGeneratorTests(unittest.TestCase):
         )
         self.assertEqual(
             [spec.min_disk_free_mib for spec in generated["qwen2.5-72b-awq"]],
-            [51200, 51200, 20480],
+            [51200, 51200, 8192],
         )
+        pp3 = generated["qwen2.5-72b-awq"][2]
+        self.assertEqual(pp3.min_bandwidth_mbps, 2000)
+        self.assertEqual(pp3.max_ttft_p95_ms, 30000.0)
+        self.assertEqual(pp3.max_tpot_p95_ms, 250.0)
+        self.assertEqual(pp3.max_e2e_p95_ms, 45000.0)
+        self.assertEqual(pp3.min_throughput_tps, 1.0)
         self.assertTrue(
             all(
-                spec.profile_id.endswith("-v2")
+                spec.profile_id.endswith("-v3")
                 for specs in generated.values()
                 for spec in specs
             )

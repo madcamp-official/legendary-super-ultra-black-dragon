@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from .resource_pool import FLEET_MODEL_IDS, FLEET_TENSOR_PARALLEL_SIZE
 
 
-AUTO_PROFILE_GENERATOR_VERSION = "fleet-placement-v2"
+AUTO_PROFILE_GENERATOR_VERSION = "fleet-placement-v3"
 AUTO_PROFILE_ORIGIN = "AUTO"
 PLACEMENT_PROFILE_STATUSES = frozenset(
     {"DRAFT", "QUALIFYING", "VALIDATED", "ACTIVE", "REVOKED"}
@@ -106,6 +106,10 @@ def _base_spec(
     max_model_len: int,
     max_concurrency: int,
     min_throughput_tps: float,
+    distributed_min_bandwidth_mbps: int = 10000,
+    max_ttft_p95_ms: float = 2000.0,
+    max_tpot_p95_ms: float = 100.0,
+    max_e2e_p95_ms: float = 10000.0,
 ) -> AutoPlacementProfileSpec:
     distributed = node_count > 1
     return AutoPlacementProfileSpec(
@@ -121,12 +125,14 @@ def _base_spec(
         max_concurrency=max_concurrency,
         requires_network_evidence=distributed,
         requires_nccl=distributed,
-        min_bandwidth_mbps=10000 if distributed else None,
+        min_bandwidth_mbps=(
+            distributed_min_bandwidth_mbps if distributed else None
+        ),
         max_rtt_ms=2.0 if distributed else None,
         max_packet_loss_pct=0.1 if distributed else None,
-        max_ttft_p95_ms=2000.0,
-        max_tpot_p95_ms=100.0,
-        max_e2e_p95_ms=10000.0,
+        max_ttft_p95_ms=max_ttft_p95_ms,
+        max_tpot_p95_ms=max_tpot_p95_ms,
+        max_e2e_p95_ms=max_e2e_p95_ms,
         min_success_rate=0.99,
         min_vram_headroom_pct=10.0,
         min_throughput_tps=min_throughput_tps,
@@ -145,7 +151,7 @@ def generate_auto_placement_profile_specs(
         return (
             _base_spec(
                 model_id=model_id,
-                profile_id=f"auto-{model_id}-tp1-pp1-v2",
+                profile_id=f"auto-{model_id}-tp1-pp1-v3",
                 topology="single-gpu",
                 node_count=1,
                 pipeline_parallel_size=1,
@@ -161,13 +167,13 @@ def generate_auto_placement_profile_specs(
         # bytes plus its fixed margin. Requiring another full 50 GiB here made
         # an already validated rank and pinned runtime impossible to qualify on
         # the supported 100 GiB nodes.
-        (3, 24576, 20480, 7.0),
+        (3, 24576, 8192, 1.0),
     ):
         profiles.append(
             _base_spec(
                 model_id=model_id,
                 profile_id=(
-                    f"auto-{model_id}-tp1-pp{pipeline_parallel_size}-v2"
+                    f"auto-{model_id}-tp1-pp{pipeline_parallel_size}-v3"
                 ),
                 topology=(
                     "single-gpu"
@@ -181,6 +187,16 @@ def generate_auto_placement_profile_specs(
                 max_model_len=8192,
                 max_concurrency=1,
                 min_throughput_tps=throughput,
+                **(
+                    {
+                        "distributed_min_bandwidth_mbps": 2000,
+                        "max_ttft_p95_ms": 30000.0,
+                        "max_tpot_p95_ms": 250.0,
+                        "max_e2e_p95_ms": 45000.0,
+                    }
+                    if pipeline_parallel_size == 3
+                    else {}
+                ),
             )
         )
     return tuple(profiles)
