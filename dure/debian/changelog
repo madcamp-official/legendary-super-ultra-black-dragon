@@ -11,6 +11,7 @@ dure (0.4.18) UNRELEASED; urgency=medium
     memory measurement.
   * Revalidate staged single-GPU activation ordering before final verify.
   * Document reproducible single-GPU and multi-node release acceptance gates.
+  * Align roadmap, Alembic-head guidance, and pre-tag release metadata rules.
 
  -- Dure Maintainers <maintainers@example.com>  Tue, 22 Jul 2026 12:30:00 +0900
 

@@ -53,7 +53,13 @@ workflow를 merge하고 첫 성공 run이 생긴 뒤 `main` ruleset에서 안정
 
 schema 변경마다 `src/dure/control/migrations/versions/` 아래에 새 Alembic revision을 만듭니다. 출시된 revision은 수정하지 않으며 새 database와 기존 database 모두에서 `dure-server --migrate`를 검증합니다.
 
-현재 단일 Alembic 계보는 `0006 → 0007 → 0008 → 0009 → 0010`입니다. `0006`은 배포 operation·노드별 시도·`verified_at`, `0007`은 불변 아티팩트 매니페스트·청크 레지스트리, `0008`은 중앙 모델·이미지 준비 계획과 시도, `0009`는 `STAGE` variant와 신뢰 빌더 증적, `0010`은 준비 시도의 nullable `download_progress`, 노드 아티팩트 캐시 상태와 append-only 이벤트를 추가합니다. 마이그레이션 테스트는 새 DB와 직전 head 업그레이드, single head, ORM metadata 일치를 모두 검증해야 합니다.
+현재 단일 Alembic 계보는 `0006 → 0007 → 0008 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015`입니다. `0006`은 배포 operation·노드별 시도·`verified_at`, `0007`은 불변 아티팩트 매니페스트·청크 레지스트리, `0008`은 중앙 모델·이미지 준비 계획과 시도, `0009`는 `STAGE` variant와 신뢰 빌더 증적, `0010`은 준비 시도의 nullable `download_progress`, 노드 아티팩트 캐시 상태와 append-only 이벤트를 추가합니다. `0011`은 placement profile lifecycle과 폐쇄형 실행 설정, `0012`는 exact GPU-bound qualification evidence, `0013`은 불변 Fleet recommendation, `0014`는 수락된 Fleet의 원자적 node/GPU reservation, `0015`는 Fleet별 deployment runtime 상태를 영속합니다. 마이그레이션 테스트는 새 DB와 직전 head 업그레이드, single head, ORM metadata 일치를 모두 검증해야 합니다.
+
+v0.4.18의 3×24GiB harness는 root-owned local 설정과 structured stdout만 사용하며 validation run이나
+GPU memory를 중앙 DB에 기록하지 않습니다. 따라서 이 변경에는 빈 `0016` revision을 만들지 않습니다.
+향후 controller가 acceptance evidence를 release gate로 저장하려면 새 `0016`에서 append-only evidence
+schema를 추가하고, closed field·새 DB·`0015`에서의 upgrade·파괴적 downgrade 거부를 함께 테스트합니다.
+raw log, credential, command, Docker argument, mount, host path는 그 evidence에 저장하지 않습니다.
 
 `artifact_cache_events`의 추가 전용 계약은 서비스 관례에만 의존하지 않습니다. `Base.metadata.create_all`과 `0010` upgrade 모두 SQLite·PostgreSQL에 `UPDATE`·`DELETE` 거부 트리거를 설치해야 합니다. SQLite는 숨은 `rowid` 교체 우회를 없앤 `WITHOUT ROWID`와 충돌 `INSERT OR REPLACE` 거부 트리거까지 실제 raw SQL·ORM 변경으로 시험합니다. PostgreSQL은 `TRUNCATE` 문장 트리거도 생성하지만 단위 검증 범위는 생성 DDL과 downgrade 정리의 mock/compile 검사이며 실제 PostgreSQL 실행이나 부하 시험이 아닙니다. 이 장치는 권한 있는 DDL까지 막는 WORM이 아니므로 이를 수용 증적으로 과장하지 않습니다.
 
@@ -66,7 +72,7 @@ dure-server --database-url sqlite:////tmp/dure-migration-check.db --migrate
 python3 -m pip wheel . --no-deps --no-build-isolation -w /tmp/dure-wheel-check
 ```
 
-릴리스 전에는 `pyproject.toml`, `setup.py`, `src/dure/__init__.py`, `debian/changelog`의 버전을 일치시킵니다. `scripts/build-deb.sh`로 로컬 build를 확인하고 Debian version과 정확히 같은 `v<version>` tag를 push해야 서명된 APT workflow가 실행됩니다.
+릴리스 전에는 `pyproject.toml`, `setup.py`, `src/dure/__init__.py`, `debian/changelog`의 버전을 일치시킵니다. `scripts/check_version_sync.py`, `scripts/build-deb.sh`, wheel build와 migration smoke를 확인하고 Debian version과 정확히 같은 `v<version>` tag를 push해야 서명된 APT workflow가 실행됩니다. `version/<semver>` branch, draft PR, `UNRELEASED` changelog 항목과 version synchronization은 release publish 권한이 아니며, tag·GitHub Release·APT publish는 사용자의 명시적 요청 전에는 수행하지 않습니다.
 
 ## 모델 선택 기능 개발 규칙
 

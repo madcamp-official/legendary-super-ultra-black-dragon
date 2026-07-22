@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
-기준일: 2026-07-21
-현재 누적 개발 브랜치: `version/0.3.21` (명시적 로컬 Docker·NVIDIA Toolkit bootstrap, 공식 병합 전 Draft)
+기준일: 2026-07-22
+현재 릴리스 메타데이터: `0.4.18` (`UNRELEASED`; source·wheel·Debian package version 동기화 완료)
 
 ## 방향과 원칙
 
@@ -16,7 +16,9 @@ Dure의 다음 목표는 기능 수를 빠르게 늘리는 것이 아니라, 현
 
 ## 현재 구현 진행 상태
 
-v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR로 나누어 진행합니다. 각 기능은 `main`에 병합되기 전까지 공식 릴리스가 아닙니다.
+v0.3 계열의 모델 선택·제어면 기반은 아래 버전 브랜치에서 구현되었습니다. `main` 병합만으로
+APT package나 Git tag가 발행되지는 않으며, 공식 package release는 사용자의 명시적 요청으로
+Debian version과 같은 `v<version>` tag를 만들고 배포 workflow가 성공한 뒤에만 성립합니다.
 
 - `version/0.3.6`: 결정론적 정적 모델 선택기
 - `version/0.3.7`: 중앙 모델 레지스트리와 배치 프로필 영속화
@@ -34,16 +36,40 @@ v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR
 - `version/0.3.19`: exact `VALIDATED` variant의 rank별 준비·복합 cache identity·원자적 활성화, stage-local `sharded_state` 로더와 실제 GPU 수용 harness
 - `version/0.3.20`: exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`의 결정론적 선택, 불변 세대 결합, probe 기반 중앙 캐시 투영, 준비·배포·롤백 소비 게이트와 명시적 `QUARANTINED` 수명 주기
 - `version/0.3.21`: 기존 driver를 변경하지 않는 로컬 Docker Engine·NVIDIA Container Toolkit preview/apply, 충돌·재시작·설정 복구 안전 경계
+- `version/0.4.13`: `PP=1`/`TP=1` 단일 GPU는 Ray 없이 고정 vLLM API container를 직접 실행
+- `version/0.4.14`: activation이 staged `APPLY` operation 완료 뒤에만 final `VERIFY`를 만들도록 보완
+- `version/0.4.15`: 24GiB GPU에서 72B PP rank를 만들기 위한 stage exporter memory contract 보완
+- `version/0.4.16`: nested Dure layout의 Git hook·PR/push CI와 package smoke 검증 정비
+- `version/0.4.18`: v0.4.14 operation ordering 회귀 테스트, 폐쇄형 3×24GiB `PP=3` GPU memory profile,
+  실제 수용 검사 runbook 추가
 
-현재 누적 `version/0.3.21` 범위는 기존 추천·수락·준비·배포 경계와 legacy 계획 JSON 호환성을 유지하면서, `VLLM_RAY_PP_V1`의 exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`을 결정론적으로 평가합니다. 같은 품질·모델이면 실행 가능한 `STAGE`를 artifact-set digest 순으로 먼저 평가하지만, 각 후보는 자체 디스크·rank 조건을 통과해야 하고 수락 뒤 전달 방식을 바꾸지 않습니다. 런타임은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, 노드별 정상 GPU 한 장과 선택 세대가 고정한 exact 캐시를 요구합니다. 서버 UUID를 identity로 사용하고 head를 rank 0으로 고정하며 worker는 고유 RFC1918 IPv4 문자열 순으로 결합합니다. GCS 6379, worker 20000-21000, loopback API 8000과 backend·rank·component·stage identity 컨테이너 레이블도 고정합니다. 0.3.21은 이 실행 계층 앞에 중앙과 분리된 로컬 bootstrap을 추가하며, GPU driver가 이미 정상인 Ubuntu 노드에서만 Docker와 NVIDIA Toolkit을 명시적으로 준비합니다.
+현재 코드베이스는 기존 추천·수락·준비·배포 경계와 legacy 계획 JSON 호환성을 유지하면서, `VLLM_RAY_PP_V1`의 exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`을 결정론적으로 평가합니다. 같은 품질·모델이면 실행 가능한 `STAGE`를 artifact-set digest 순으로 먼저 평가하지만, 각 후보는 자체 디스크·rank 조건을 통과해야 하고 수락 뒤 전달 방식을 바꾸지 않습니다. 런타임은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, 노드별 정상 GPU 한 장과 선택 세대가 고정한 exact 캐시를 요구합니다. 서버 UUID를 identity로 사용하고 head를 rank 0으로 고정하며 worker는 고유 RFC1918 IPv4 문자열 순으로 결합합니다. GCS 6379, worker 20000-21000, loopback API 8000과 backend·rank·component·stage identity 컨테이너 레이블도 고정합니다. v0.3.21은 이 실행 계층 앞에 중앙과 분리된 로컬 bootstrap을 추가하며, GPU driver가 이미 정상인 Ubuntu 노드에서만 Docker와 NVIDIA Toolkit을 명시적으로 준비합니다.
 
 `pipeline-rank-contract`는 vLLM 버전, Ray 노드·GPU, Dure UUID custom resource와 API 시작 뒤 worker actor topology를 확인하고 고정된 vLLM 0.9.0 소스 정렬 규칙에서 binding을 도출합니다. Ray가 vLLM 내부 rank를 공개 필드로 직접 보고한 증거는 아닙니다. 실제 2·3노드 harness는 기본적으로 `NOT_RUN`·77이며 명시적 opt-in과 고정 설정·GPU·모델·runtime 전제가 모두 있어야 분산 load와 최소 추론을 시작합니다. harness는 UUID resource를 대조하지만 설정의 이미지 digest는 선언값이므로 신뢰된 wrapper의 별도 이미지 대조가 필요합니다. 이 Draft 범위는 실제 GPU 수용 검사 결과가 첨부되기 전 장기 안정성이나 이기종 driver 호환성을 증명하지 않습니다.
 
 아티팩트 매니페스트는 중앙 DB에 정규 파일·청크 관계를 저장하고, 노드 라이브러리는 노드 로컬 신뢰 origin에서 해당 청크를 받아 `FULL_SNAPSHOT` 또는 rank별 `STAGE` 캐시로 materialize합니다. 중단 다운로드와 조립을 재개하고, CAS·파일·전체 트리·marker·복합 식별자를 다시 검사한 뒤 marker-last와 no-replace rename으로 활성화합니다. 중앙 준비 API·CLI와 `PREPARE_MODEL`·`PREPARE_IMAGE` Agent 작업은 preview와 명시적 적용을 분리하며, 실패 노드의 현재 단계만 재시도합니다. 현재 준비 성공과 중앙 `READY`는 같은 트랜잭션에서 기록되고 늦은 과거 완료는 펜싱됩니다. 별도 오프라인 빌더는 source 매니페스트와 전체 파일 SHA-256을 export 직전에 다시 검증하고 `stages/<pp-rank>`로 격리한 vLLM-native sharded state를 만듭니다. 추천·수락·GPU 추가만으로 자동 준비를 시작하지 않습니다.
 
-노드별 중앙 캐시는 `READY`·`STALE`·`MISSING`·`CORRUPT`·`QUARANTINED` 현재 상태와 추가 전용 이벤트를 사용합니다. 완전한 probe만 알려진 캐시를 강등하고, 불완전·legacy probe와 정상 관찰은 `READY`를 만들지 않습니다. 일반 적용·시작·재시작·검증과 롤백 대상 시작은 exact `READY`와 최신 이미지 준비 증적을 요구하며, 롤백은 `STOP_SOURCE` 뒤에도 이를 다시 검사합니다. 수동 격리는 활성 작업·operation·현재 세대·검증된 직접 롤백 선행 세대의 참조가 없을 때만 정확한 디렉터리를 보존 영역으로 원자적 이동합니다. 자동 퇴출·삭제와 노드 간 P2P 전송은 없습니다. Dure는 NVIDIA host driver를 자동 설치·교체하지 않습니다. 이 누적 브랜치는 공식 `main`에 병합되기 전까지 Draft 개발 상태입니다.
+노드별 중앙 캐시는 `READY`·`STALE`·`MISSING`·`CORRUPT`·`QUARANTINED` 현재 상태와 추가 전용 이벤트를 사용합니다. 완전한 probe만 알려진 캐시를 강등하고, 불완전·legacy probe와 정상 관찰은 `READY`를 만들지 않습니다. 일반 적용·시작·재시작·검증과 롤백 대상 시작은 exact `READY`와 최신 이미지 준비 증적을 요구하며, 롤백은 `STOP_SOURCE` 뒤에도 이를 다시 검사합니다. 수동 격리는 활성 작업·operation·현재 세대·검증된 직접 롤백 선행 세대의 참조가 없을 때만 정확한 디렉터리를 보존 영역으로 원자적 이동합니다. 자동 퇴출·삭제와 노드 간 P2P 전송은 없습니다. Dure는 NVIDIA host driver를 자동 설치·교체하지 않습니다. 구현·단위 테스트 통과와 실제 GPU 수용 증적은 별개의 상태이며, release tag와 package publish 전에는 후자를 완료 기준으로 주장하지 않습니다.
 
 롤백은 전체 노드와 동일한 실제 실행 토폴로지·승인·온라인·다이제스트 이미지 조건을 강제하고, `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET`과 선택적 `START_API → VERIFY_API`를 모든 노드 성공 게이트로 진행합니다. 엄격한 backend에서 모델·revision·layer 범위·매니페스트·variant 및 `FULL_SNAPSHOT`/`STAGE` identity는 세대별 exact 게이트를 통과하면 달라도 되며, legacy layer 범위 비교는 유지합니다. 실패 노드 재시도는 새 시도 번호로 펜싱합니다. 같은 GPU에서 컨테이너를 다시 만드는 방식이므로 중단 가능성이 있고 블루·그린 전환이 아닙니다. 네트워크·NCCL 자동 시험과 24시간 복구 검증은 여전히 후속 범위입니다.
+
+## 현재 릴리스 수용 상태
+
+- **v0.4.14 staged activation ordering:** `QUEUED → RUNNING → SUCCEEDED` operation 동안 final
+  `VERIFY`가 생성되지 않는 단위 회귀 테스트가 있습니다. 실제 단일 GPU activation의 success와
+  failure run은 별도 격리 노드에서 수행하고 operation·task 순서와 `verified_at`을 보관해야 합니다.
+- **v0.4.18 3×24GiB profile:** `minimum_gpu_memory_mib=24000`은 정확히 세 binding에서만 허용되며,
+  harness가 각 Ray node의 실제 CUDA memory를 측정합니다. 이 구현만으로 실제 72B 분산 load가
+  통과한 것은 아닙니다. `PASSED`, 전체 node `verify --api`, wrapper의 image-digest 대조 기록이
+  있어야 수용 증적입니다.
+- **schema:** 현재 Alembic head는 `0015_fleet_runtime`입니다. v0.4.18은 harness 결과를 중앙 DB에
+  저장하지 않아 새 revision을 만들지 않습니다. 향후 validation run·GPU memory·wrapper attestation을
+  중앙 증적으로 영속한다면 `0016`에서 새 append-only evidence schema를 추가하고 기존 DB upgrade와
+  downgrade 거부 경로를 별도로 검증해야 합니다.
+- **release metadata:** `0.4.18`은 `UNRELEASED`입니다. `pyproject.toml`, `setup.py`, runtime version,
+  Debian changelog와 package test는 동기화되어 있지만, 사용자의 명시적 요청 전에는 tag, GitHub
+  Release, APT publish를 수행하지 않습니다. 상세 절차는 [릴리스 수용 검증](release-validation.md)을
+  따릅니다.
 
 ## 단계별 계획
 
