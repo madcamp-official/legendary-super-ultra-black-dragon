@@ -83,10 +83,16 @@ python3 -m pip install -e '.[server]'
 
 ## APT 설치
 
-서명된 저장소가 게시된 뒤에는 다음 한 번의 등록으로 설치할 수 있습니다.
+공식 저장소의 서명된 릴리스가 게시된 뒤에는 다음 경로에서 APT 저장소를 등록합니다. 이 주소와
+archive key는 `madcamp-official/legendary-super-ultra-black-dragon`의 protected release workflow가
+함께 관리합니다. 개인 fork나 이전 배포 미러는 공식 release authority가 아닙니다.
 
 ```bash
-curl -fsSL https://chek737.github.io/dure/install.sh | sudo sh
+curl -fSLo /tmp/dure-install.sh \
+  https://madcamp-official.github.io/legendary-super-ultra-black-dragon/install.sh
+sed -n '1,240p' /tmp/dure-install.sh
+sudo sh /tmp/dure-install.sh
+rm -f /tmp/dure-install.sh
 ```
 
 APT 서명 키 fingerprint는 다음과 같습니다.
@@ -94,6 +100,9 @@ APT 서명 키 fingerprint는 다음과 같습니다.
 ```text
 E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01
 ```
+
+installer를 실행하기 전 검토할 수 없거나 release provenance까지 확인해야 하면
+[APT 배포 문서](docs/apt-distribution.md)의 수동 등록·검증 절차를 사용합니다.
 
 이후 Dure만 설치하거나 업그레이드할 때는 다음처럼 범위를 제한합니다.
 

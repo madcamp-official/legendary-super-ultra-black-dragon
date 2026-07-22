@@ -4,33 +4,51 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
+# Release construction is intentionally read-only.  Only the deployment job
+# receives production credentials after the protected github-pages environment
+# approves the release tag.
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
 concurrency:
-  group: "dure-apt-pages"
+  group: "dure-apt-release-${{ github.ref_name }}"
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
+  build-and-attest:
+    name: Build and attest release package
     runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      package_name: ${{ steps.package.outputs.name }}
+      package_sha256: ${{ steps.package.outputs.sha256 }}
+      source_commit: ${{ steps.source.outputs.commit }}
+      source_ref: ${{ steps.source.outputs.ref }}
     defaults:
       run:
+        shell: bash
         working-directory: dure
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Check out source
+      - name: Check out immutable release tag
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+      - name: Resolve tagged source commit
+        id: source
+        working-directory: ${{ github.workspace }}
+        run: |
+          source_commit=$(git rev-parse "${GITHUB_REF}^{commit}")
+          test "$source_commit" = "$(git rev-parse HEAD)"
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "ref=$GITHUB_REF" >> "$GITHUB_OUTPUT"
 
       - name: Install packaging tools
         run: |
@@ -42,59 +60,187 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -e '.[test]'
+          python3 -m compileall -q src tests
           python3 -m unittest discover -v
 
-      - name: Verify synchronized versions
-        run: python3 scripts/check_version_sync.py
-
-      - name: Verify release version
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Verify synchronized release version
         run: |
+          python3 scripts/check_version_sync.py
           package_version=$(dpkg-parsechangelog -S Version)
           test "${GITHUB_REF_NAME}" = "v${package_version}"
 
       - name: Build and test Debian package
         id: package
         env:
-          DURE_BUILD_COMMIT: ${{ github.sha }}
+          DURE_BUILD_COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           package_path=$(scripts/build-deb.sh)
+          test "$(dpkg-deb -f "$package_path" Version)" = "$(dpkg-parsechangelog -S Version)"
           echo "path=$package_path" >> "$GITHUB_OUTPUT"
-
-      - name: Install Debian node package
-        run: |
+          echo "name=$(basename "$package_path")" >> "$GITHUB_OUTPUT"
+          sha256sum "$package_path" | awk '{print "sha256="$1}' >> "$GITHUB_OUTPUT"
           python3 -m pip uninstall -y dure
-          sudo apt-get install -y "${{ steps.package.outputs.path }}"
-          test "$(cat /usr/share/dure/build-commit)" = "$GITHUB_SHA"
+          sudo apt-get install -y "$package_path"
+          test "$(cat /usr/share/dure/build-commit)" = "$DURE_BUILD_COMMIT"
           /usr/bin/python3 -c 'import dure; assert dure.__file__.startswith("/usr/lib/python3/dist-packages/dure/"); import dure.bootstrap, dure.host_setup'
           /usr/bin/dure --version
           /usr/bin/dure bootstrap --help >/dev/null
           /usr/bin/dure doctor --json >/dev/null
           grep -Fx 'ConditionPathExists=/etc/dure/agent.json' \
             /lib/systemd/system/dure-agent.service
+          scripts/test-apt-repo.sh "$package_path"
 
-      - name: Test signed APT repository
-        run: scripts/test-apt-repo.sh "${{ steps.package.outputs.path }}"
+      - name: Attest Debian package provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.package.outputs.path }}
 
-      - name: Import APT signing key
+      - name: Transfer only the attested package to publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: dure-release-package
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign and publish official release
+    needs: build-and-attest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    # Configure this environment to allow only v* tags, require a release
+    # approver, and hold APT_GPG_PRIVATE_KEY plus DURE_APT_GPG_FINGERPRINT.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+      attestations: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: dure
+
+    steps:
+      - name: Check out immutable release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download attested release package
+        uses: actions/download-artifact@v4
+        with:
+          name: dure-release-package
+          path: dure/release-package
+
+      - name: Verify transferred package identity and GitHub attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PACKAGE_NAME: ${{ needs.build-and-attest.outputs.package_name }}
+          EXPECTED_PACKAGE_SHA256: ${{ needs.build-and-attest.outputs.package_sha256 }}
+          SOURCE_COMMIT: ${{ needs.build-and-attest.outputs.source_commit }}
+          SOURCE_REF: ${{ needs.build-and-attest.outputs.source_ref }}
+        run: |
+          package_path=$(find release-package -maxdepth 1 -type f -name 'dure_*.deb' -print -quit)
+          test -n "$package_path"
+          test "$(basename "$package_path")" = "$EXPECTED_PACKAGE_NAME"
+          test "$(sha256sum "$package_path" | awk '{print $1}')" = "$EXPECTED_PACKAGE_SHA256"
+          gh attestation verify "$package_path" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-apt.yml" \
+            --source-digest "$SOURCE_COMMIT" \
+            --source-ref "$SOURCE_REF" \
+            --deny-self-hosted-runners
+          echo "DURE_RELEASE_PACKAGE=$package_path" >> "$GITHUB_ENV"
+
+      - name: Import exactly the approved APT signing key
         env:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          DURE_APT_GPG_FINGERPRINT: ${{ vars.DURE_APT_GPG_FINGERPRINT }}
         run: |
           test -n "$APT_GPG_PRIVATE_KEY"
+          test -n "$DURE_APT_GPG_FINGERPRINT"
           printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
-          key_id=$(gpg --batch --with-colons --list-secret-keys | \
-            awk -F: '$1 == "sec" && !found { print $5; found=1 }')
-          test -n "$key_id"
+          mapfile -t key_ids < <(gpg --batch --with-colons --list-secret-keys \
+            | awk -F: '$1 == "sec" { print $5 }')
+          test "${#key_ids[@]}" -eq 1
+          key_id=${key_ids[0]}
+          fingerprint=$(gpg --batch --with-colons --fingerprint "$key_id" \
+            | awk -F: '$1 == "fpr" && !found { print $10; found=1 }')
+          expected_fingerprint=$(printf '%s' "$DURE_APT_GPG_FINGERPRINT" \
+            | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+          test "$fingerprint" = "$expected_fingerprint"
           echo "DURE_APT_GPG_KEY_ID=$key_id" >> "$GITHUB_ENV"
+          echo "DURE_APT_GPG_FINGERPRINT=$fingerprint" >> "$GITHUB_ENV"
 
-      - name: Build signed APT repository
+      - name: Build signed APT repository and release provenance
+        env:
+          SOURCE_COMMIT: ${{ needs.build-and-attest.outputs.source_commit }}
+          DURE_APT_REPOSITORY_URL: ${{ vars.DURE_APT_REPOSITORY_URL }}
         run: |
           mkdir public
           scripts/build-apt-repo.sh \
-            "${{ steps.package.outputs.path }}" public stable main "$DURE_APT_GPG_KEY_ID"
-          repository_name=${GITHUB_REPOSITORY#*/}
-          repository_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${repository_name}"
+            "$DURE_RELEASE_PACKAGE" public stable main "$DURE_APT_GPG_KEY_ID"
+          repository_url="${DURE_APT_REPOSITORY_URL:-https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}}"
+          case "$repository_url" in
+            https://*) ;;
+            *) echo "DURE_APT_REPOSITORY_URL must use https" >&2; exit 1 ;;
+          esac
           scripts/render-installer.sh "$repository_url" public/install.sh
+          provenance=public/release-provenance.json
+          python3 scripts/release_provenance.py create \
+            --package "$DURE_RELEASE_PACKAGE" \
+            --version "$(dpkg-parsechangelog -S Version)" \
+            --tag "$GITHUB_REF_NAME" \
+            --source-repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --signing-key-fingerprint "$DURE_APT_GPG_FINGERPRINT" \
+            --output "$provenance"
+          python3 scripts/release_provenance.py verify \
+            --manifest "$provenance" \
+            --package "$DURE_RELEASE_PACKAGE" \
+            --version "$(dpkg-parsechangelog -S Version)" \
+            --tag "$GITHUB_REF_NAME" \
+            --source-repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --signing-key-fingerprint "$DURE_APT_GPG_FINGERPRINT"
+          gpg --batch --yes --armor --local-user "$DURE_APT_GPG_KEY_ID" \
+            --output "$provenance.asc" --detach-sign "$provenance"
+          gpgv --keyring public/dure-archive-keyring.gpg "$provenance.asc" "$provenance"
+
+      - name: Create or verify matching official draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=(
+            "$DURE_RELEASE_PACKAGE"
+            public/release-provenance.json
+            public/release-provenance.json.asc
+            public/dure-archive-keyring.gpg
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true"
+            mkdir draft-assets
+            for asset in "${assets[@]}"; do
+              name=$(basename "$asset")
+              gh release download "$GITHUB_REF_NAME" --pattern "$name" --dir draft-assets
+              cmp "$asset" "draft-assets/$name"
+            done
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "Dure $GITHUB_REF_NAME"
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4
@@ -105,18 +251,9 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
-      - name: Publish GitHub release asset
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish the verified official release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" \
-              "${{ steps.package.outputs.path }}" \
-              --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              "${{ steps.package.outputs.path }}" \
-              --generate-notes \
-              --title "Dure $GITHUB_REF_NAME"
-          fi
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --title "Dure $GITHUB_REF_NAME"

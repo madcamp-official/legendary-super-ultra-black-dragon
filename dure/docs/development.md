@@ -49,6 +49,20 @@ git hook run pre-push -- origin "$(git remote get-url origin)"
 
 workflow를 merge하고 첫 성공 run이 생긴 뒤 `main` ruleset에서 안정적인 `Required CI` check를 필수로 설정합니다. Pull request, 최신 base 반영 또는 merge queue, review conversation 해결, force-push와 branch 삭제 금지도 함께 요구합니다. required workflow에 `paths-ignore`를 추가하지 않아 check가 skip·pending 상태로 남지 않게 합니다.
 
+## APT release 권한과 provenance
+
+`.github/workflows/publish-apt.yml`은 `v*` tag에서만 시작합니다. `build-and-attest`는 read-only
+권한으로 version sync, test, Debian build·APT smoke test를 수행하고 `.deb`의 GitHub artifact
+attestation을 만듭니다. 뒤의 `publish` job만 `github-pages` protected environment를 사용합니다.
+이 job은 전달받은 package digest와 attestation의 repository·workflow·source commit을 확인한 뒤에만
+APT archive signing key를 읽고 Pages와 GitHub Release를 publish합니다.
+
+`github-pages` environment에는 tag pattern `v*`, required reviewer, self-review 방지, bypass 금지,
+environment-scoped `APT_GPG_PRIVATE_KEY` 및 `DURE_APT_GPG_FINGERPRINT`가 필요합니다. 기존처럼
+environment가 `main`만 허용하면 tag workflow는 signing step 전에 실패합니다. key fingerprint가
+import한 private key와 다르거나, tag가 Debian version과 다르면 workflow는 fail-closed로 중단합니다.
+자세한 release·미러 검증 계약은 [APT 배포](apt-distribution.md)를 참고합니다.
+
 ## 스키마와 릴리스 변경
 
 schema 변경마다 `src/dure/control/migrations/versions/` 아래에 새 Alembic revision을 만듭니다. 출시된 revision은 수정하지 않으며 새 database와 기존 database 모두에서 `dure-server --migrate`를 검증합니다.

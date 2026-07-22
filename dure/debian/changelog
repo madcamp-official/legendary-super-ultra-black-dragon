@@ -1,3 +1,11 @@
+dure (0.4.17) UNRELEASED; urgency=medium
+
+  * Separate read-only package attestation from protected APT signing and publish.
+  * Bind official release packages to signed source, workflow and archive-key provenance.
+  * Define the official origin and verified static-mirror operating contract.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 14:00:00 +0000
+
 dure (0.4.16) UNRELEASED; urgency=medium
 
   * Repair tracked Git hooks for the nested Dure project layout.
