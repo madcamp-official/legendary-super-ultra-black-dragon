@@ -13,7 +13,9 @@
 - [릴리스 증적 기록](release-evidence/README.md): runbook과 실제 GPU 수용 결과를 분리해 보관하는 형식
 - [릴리스 실행 체크리스트](release-runbook.md): 승인자·중단 기준·재시도·APT 게시 뒤 확인을 연결하는 release record 절차
 - [보안 모델](security.md): 현재 통제와 공개 전 보안 강화 과제
+- [개인정보·프롬프트 처리 정책](data-privacy.md): 현재 데이터 등급, node 운영자의 가시성, logging·incident 대응 경계
 - [네트워크·방화벽 운영 절차](networking.md): Controller·Agent·Ray/vLLM·NCCL 통신 경계, 포트와 사설망 검증
+- [외부 추론 API 경계](external-inference-boundary.md): 현재 공개 gateway 미지원 범위와 별도 gateway의 필수 조건
 - [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md): backup, restore drill, migration 실패, credential 회전 절차
 - [데이터 보존·격리·삭제 정책](data-retention.md): DB·audit·evidence·journal·model cache의 보존 기준과 수동 삭제 승인
 - [관측·장애 대응 운영 절차](observability.md): systemd·heartbeat·task·DB 신호, 외부 알림 기준과 redaction
@@ -25,6 +27,7 @@
 
 - [모델 선택 정책](model-selection.md): GPU 인벤토리 기반 결정론적 선택기, 모델 레지스트리·승격 게이트, 결정론적 추천 스냅샷, 배포 세대 상태와 명시적 롤백 — 부분 구현
 - [벤치마크 및 모델 자격 검증](benchmarking.md): 구조화된 증적, 단일 노드 폐쇄형 실행과 후보 모델의 품질·성능·안정성 승격 기준 — 부분 구현
+- [SLO·벤치마크 정책 운영 절차](slo-benchmark-policy.md): SLO 기준선, evidence 재검증, `ACTIVE` 승격 승인 절차
 - [자동 배치 프로필 qualification](profile-qualification.md): `DRAFT → QUALIFYING → VALIDATED → ACTIVE`, 8단계 폐쇄형 증적과 exact rank·노드·GPU 결합을 강제하는 중앙 계약
 - [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md): 여러 exact 증적을 비중첩 배포로 조합하고 불변 추천·원자적 수락·명시적 준비·적용·검증으로 연결하는 계약과 이기종·대규모 합성 수용 매트릭스
 - [모델 아티팩트 매니페스트와 배포 계약](artifact-distribution.md): 불변 파일·청크 레지스트리, 결정론적 `STAGE`·`FULL_SNAPSHOT` 선택, 중앙 캐시 수명 주기, 명시적 준비·격리와 배포·롤백 소비 게이트
@@ -55,9 +58,11 @@
 - 모델은 이름만이 아니라 리비전, 양자화, 런타임 이미지 다이제스트, 라이선스를 함께 관리합니다.
 - 모델 반입의 출처·라이선스·보안·철회 검토는 [모델 반입·승인 정책](model-onboarding-policy.md)을 따르며, 레지스트리 등록이 그 검토를 자동화하지 않습니다.
 - 프롬프트, 자격 증명, 토큰, 실제 비밀값을 예시나 벤치마크 결과에 기록하지 않습니다.
+- 현재 허용 데이터 등급, host 운영자의 가시성, prompt 노출 대응은 [개인정보·프롬프트 처리 정책](data-privacy.md)을 따릅니다. 공개 inference endpoint는 현재 제공 범위가 아니며 [외부 추론 API 경계](external-inference-boundary.md)의 별도 gateway 조건을 충족하기 전에는 만들지 않습니다.
 - 모델 릴리스와 배치 프로필의 실제 상태는 중앙 레지스트리가 진실의 원천이며, 이 문서는 정책과 절차를 설명합니다.
 - 배포 세대의 `verified_at`은 전체 배정 노드가 검증에 성공하고 backend별 최소 Agent 버전을 충족할 때만 롤백 증거로 사용합니다. legacy는 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상, `STAGE`는 0.3.19 이상과 엄격한 rank·API 검증이 필요합니다.
 - 추천 세대의 apply와 rollback은 배포·노드·매니페스트·exact cache identity·현재 준비 시도·OCI 다이제스트에 결합된 `READY` 증적을 요구하며, rollback은 네트워크 준비를 수행하지 않습니다.
+- 모델·profile의 SLO 기준선과 evidence 재검증·승격은 [SLO·벤치마크 정책 운영 절차](slo-benchmark-policy.md)를 따르며, `NOT_RUN`은 통과 증적이 아닙니다.
 - Fleet 추천·조회·수락은 호스트 변경 권한이 아닙니다. 전용 `fleet prepare`와 `fleet apply`만 Agent 작업을 만들며, 배포별 실패 뒤에도 자동 롤백·중지·예약 해제는 수행하지 않습니다.
 - Fleet의 이기종·대규모 기본 수용 매트릭스는 합성 인벤토리와 SQLite를 사용합니다. 알고리즘 불변식을 검증할 뿐 실제 GPU·NCCL·vLLM 또는 PostgreSQL 부하 증적을 대신하지 않습니다.
 - stage variant의 `VALIDATED`는 실제 GPU export/load 검증 상태이지 노드 설치나 배포 완료 상태가 아닙니다. 추천이 exact digest와 rank 결합을 선택한 뒤에도 별도 준비 적용과 모든 rank의 배포 검증을 완료해야 합니다.
