@@ -7,6 +7,11 @@
 - [루트 README](../README.md): 설치, 로컬 CLI, 중앙 관리의 빠른 시작
 - [아키텍처](architecture.md): 로컬 CLI·에이전트·중앙 제어면의 경계와 작업 프로토콜
 - [운영 절차](operations.md): GPU host bootstrap, 서버 운영, 노드 승인, Fleet 준비·적용, 세대별 검증·롤백과 장애 복구
+- [Controller 운영](controller-operations.md): Controller·PostgreSQL·관리자 credential, node 등록·승인과 중단 기준
+- [배포·Fleet 운영](deployment-operations.md): qualification, recommendation, 준비·적용·검증과 명시적 rollback
+- [아티팩트·캐시 운영](artifact-cache-operations.md): manifest, `FULL_SNAPSHOT`, `STAGE`, cache 상태와 격리
+- [레거시 업그레이드와 복구](legacy-upgrades.md): 과거 Agent·deployment 경로의 backup, migration, 최소 호환 경계
+- [통합 운영 참조](operations-reference.md): 이전 통합 문서의 상세 명령·failure code·역사적 절차 보존본
 - [설정 참조서](configuration-reference.md): 환경 변수, 설정 파일, systemd 및 수용 검증 opt-in의 범위·우선순위·권한
 - [CLI 명령 참조](cli-reference.md): 로컬·관리자 명령의 권한, 호스트 변경 여부, preview/apply 조건
 - [Agent 설정과 credential 회전 운영 절차](agent-operations.md): `/etc/dure` 설정 경계, HTTPS/TLS 우선순위, 안전한 회전·재등록
