@@ -1,3 +1,10 @@
+dure (0.4.21) UNRELEASED; urgency=medium
+
+  * 문서 지원 매트릭스, 용어집, 릴리스 권한·증적 기록 체계를 추가합니다.
+  * 내부 Markdown 링크와 이미지 링크를 검사하는 문서 검증을 CI에 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 14:30:00 +0000
+
 dure (0.4.20) UNRELEASED; urgency=medium
 
   * Version automatic Fleet placement profiles as v2.

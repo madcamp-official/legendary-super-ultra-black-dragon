@@ -49,6 +49,23 @@ git hook run pre-push -- origin "$(git remote get-url origin)"
 
 workflow를 merge하고 첫 성공 run이 생긴 뒤 `main` ruleset에서 안정적인 `Required CI` check를 필수로 설정합니다. Pull request, 최신 base 반영 또는 merge queue, review conversation 해결, force-push와 branch 삭제 금지도 함께 요구합니다. required workflow에 `paths-ignore`를 추가하지 않아 check가 skip·pending 상태로 남지 않게 합니다.
 
+## 문서 검증과 증적 관리
+
+문서 변경 전후에는 Dure 디렉터리에서 다음 검사를 실행합니다.
+
+```bash
+python3 scripts/check_docs.py
+```
+
+이 검사는 `README.md`와 `docs/` 아래 Markdown의 상대 링크·이미지 링크를 검사합니다. 외부 URL의
+가용성이나 문서 내용의 사실성은 검사하지 않으므로, 지원 범위·CLI/API·보안 경계가 바뀌면 관련
+운영 문서를 사람이 함께 검토해야 합니다.
+
+실제 GPU·네트워크·NCCL 수용 결과는 절차 문서에 성공으로 덮어쓰지 않습니다. `docs/release-evidence/`
+아래에 version별 기록을 만들고 `PASSED`, `FAILED`, `NOT_RUN`을 명시합니다. credential, token,
+private URL, raw prompt, Docker command, host path와 원본 로그는 기록하지 않습니다. 모델·OS·GPU·TP/PP
+지원 수치는 [지원 매트릭스](support-matrix.md)를 기준으로 갱신합니다.
+
 ## 스키마와 릴리스 변경
 
 schema 변경마다 `src/dure/control/migrations/versions/` 아래에 새 Alembic revision을 만듭니다. 출시된 revision은 수정하지 않으며 새 database와 기존 database 모두에서 `dure-server --migrate`를 검증합니다.
@@ -72,7 +89,7 @@ dure-server --database-url sqlite:////tmp/dure-migration-check.db --migrate
 python3 -m pip wheel . --no-deps --no-build-isolation -w /tmp/dure-wheel-check
 ```
 
-릴리스 전에는 `pyproject.toml`, `setup.py`, `src/dure/__init__.py`, `debian/changelog`의 버전을 일치시킵니다. `scripts/check_version_sync.py`, `scripts/build-deb.sh`, wheel build와 migration smoke를 확인하고 Debian version과 정확히 같은 `v<version>` tag를 push해야 서명된 APT workflow가 실행됩니다. `version/<semver>` branch, draft PR, `UNRELEASED` changelog 항목과 version synchronization은 release publish 권한이 아니며, tag·GitHub Release·APT publish는 사용자의 명시적 요청 전에는 수행하지 않습니다.
+릴리스 전에는 `pyproject.toml`, `setup.py`, `src/dure/__init__.py`, `debian/changelog`의 버전을 일치시킵니다. `scripts/check_version_sync.py`, `scripts/build-deb.sh`, wheel build와 migration smoke를 확인하고 Debian version과 정확히 같은 `v<version>` tag를 push해야 서명된 APT workflow가 실행됩니다. `version/<semver>` branch, draft PR, `UNRELEASED` changelog 항목과 version synchronization은 release publish 권한이 아니며, tag·GitHub Release·APT publish는 사용자의 명시적 요청 전에는 수행하지 않습니다. 현재 package mirror와 canonical source의 authority 차이는 [릴리스 권한과 출처 관리](release-governance.md)를 따릅니다.
 
 ## 모델 선택 기능 개발 규칙
 

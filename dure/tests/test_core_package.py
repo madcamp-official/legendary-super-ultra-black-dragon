@@ -30,7 +30,7 @@ class CorePackageTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "0.4.20")
+        self.assertEqual(result.stdout.strip(), "0.4.21")
 
     def test_agent_service_waits_for_joined_node_config(self):
         unit = (REPOSITORY_ROOT / "packaging" / "dure-agent.service").read_text(

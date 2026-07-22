@@ -17,6 +17,11 @@ Dure는 서명된 Debian 패키지 저장소로 배포합니다. 현재 정적 h
 보호된 tag, Release 또는 artifact attestation이 별도로 도입되기 전에는 이를 공식 승인의 증거로
 표시해서는 안 됩니다.
 
+저장소에 공식 publish workflow 정의가 존재하더라도, 그 사실만으로 해당 tag가 실제로 package를
+게시했거나 현재 설치 주소의 authority가 공식 조직으로 이전됐다는 뜻은 아닙니다. tag·Release asset·
+APT `InRelease`·서명 key의 연결을 release마다 확인해야 합니다. 현재 상태와 공식 authority 전환
+조건은 [릴리스 권한과 출처 관리](release-governance.md)에 정리합니다.
+
 ## 사용자 설치
 
 편의 installer는 network response를 shell로 바로 연결하지 않습니다. 내려받은 내용을 검토한 뒤

@@ -1,6 +1,8 @@
 # 단일 GPU activation 및 3×24GiB 다중 노드 릴리스 검증
 
-이 문서는 일반 단위 테스트가 대신할 수 없는 두 운영 검증을 재현 가능하게 남깁니다.
+이 문서는 일반 단위 테스트가 대신할 수 없는 두 운영 검증의 **절차(runbook)** 를 재현 가능하게
+남깁니다. 실제 실행 결과는 이 문서에 덮어쓰지 않고 [릴리스 증적 기록](release-evidence/README.md)에
+version별로 남깁니다.
 
 - v0.4.14에서 보완한 단일 GPU activation의 staged operation 완료 대기 회귀
 - `VLLM_RAY_PP_V1`에서 24GiB 이상 GPU 세 장으로 실행하는 `TP=1`, `PP=3` 수용 검사
@@ -24,7 +26,7 @@
 `NOT_RUN`과 종료 코드 `77`은 전제 조건 미충족입니다. 성공 증적이 아니며 `PASSED`로 바꾸거나
 다른 실행의 성공을 재사용해서는 안 됩니다.
 
-## v0.4.14 단일 GPU activation 회귀
+## v0.4.14에서 도입한 단일 GPU activation 순서 회귀
 
 v0.4.14는 `APPLY_DEPLOYMENT` task의 성공만으로 최종 VERIFY를 보내지 않도록 변경했습니다.
 activation은 최신 `APPLY` operation이 terminal `SUCCEEDED`가 될 때까지 기다리고, `FAILED` 또는
@@ -155,3 +157,7 @@ API는 rank 0 head에서만 검사해도 `verify --api`의 node 목록에는 세
 
 실패를 해결한 뒤에는 과거 성공 결과를 재사용하지 않습니다. 새 validation run과 현재 준비 증적으로
 처음부터 확인하며, Dure는 driver를 자동 변경하거나 실패 노드를 자동 재배정·자동 롤백하지 않습니다.
+
+실제 결과 기록에는 최소한 source commit, package version, OCI image digest, model manifest digest,
+선택 GPU UUID, 실행 시각, `PASSED`·`FAILED`·`NOT_RUN` 상태와 비밀값을 제외한 구조화된 결과를
+남깁니다. 템플릿은 [release-evidence/template.md](release-evidence/template.md)를 사용합니다.

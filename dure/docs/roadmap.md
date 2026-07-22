@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
 기준일: 2026-07-22
-현재 릴리스 메타데이터: `0.4.18` (`UNRELEASED`; source·wheel·Debian package version 동기화 완료)
+현재 릴리스 메타데이터: `0.4.21` (`UNRELEASED`; source·wheel·Debian package version 동기화 완료)
 
 ## 방향과 원칙
 
@@ -42,6 +42,7 @@ Debian version과 같은 `v<version>` tag를 만들고 배포 workflow가 성공
 - `version/0.4.16`: nested Dure layout의 Git hook·PR/push CI와 package smoke 검증 정비
 - `version/0.4.18`: v0.4.14 operation ordering 회귀 테스트, 폐쇄형 3×24GiB `PP=3` GPU memory profile,
   실제 수용 검사 runbook 추가
+- `version/0.4.21`: 지원 매트릭스·용어집·릴리스 권한/증적 문서와 내부 Markdown 링크 검증 추가
 
 현재 코드베이스는 기존 추천·수락·준비·배포 경계와 legacy 계획 JSON 호환성을 유지하면서, `VLLM_RAY_PP_V1`의 exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`을 결정론적으로 평가합니다. 같은 품질·모델이면 실행 가능한 `STAGE`를 artifact-set digest 순으로 먼저 평가하지만, 각 후보는 자체 디스크·rank 조건을 통과해야 하고 수락 뒤 전달 방식을 바꾸지 않습니다. 런타임은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, 노드별 정상 GPU 한 장과 선택 세대가 고정한 exact 캐시를 요구합니다. 서버 UUID를 identity로 사용하고 head를 rank 0으로 고정하며 worker는 고유 RFC1918 IPv4 문자열 순으로 결합합니다. GCS 6379, worker 20000-21000, loopback API 8000과 backend·rank·component·stage identity 컨테이너 레이블도 고정합니다. v0.3.21은 이 실행 계층 앞에 중앙과 분리된 로컬 bootstrap을 추가하며, GPU driver가 이미 정상인 Ubuntu 노드에서만 Docker와 NVIDIA Toolkit을 명시적으로 준비합니다.
 

@@ -8,7 +8,8 @@
 - [아키텍처](architecture.md): 로컬 CLI·에이전트·중앙 제어면의 경계와 작업 프로토콜
 - [운영 절차](operations.md): GPU host bootstrap, 서버 운영, 노드 승인, Fleet 준비·적용, 세대별 검증·롤백과 장애 복구
 - [단일 GPU 자동 활성화](activation.md): 불변 릴리스 등록, 자동 준비·벤치마크·승격·추천·배포·검증
-- [릴리스 수용 검증](release-validation.md): v0.4.14 staged activation 회귀와 실제 3×24GiB `PP=3` GPU 검증 절차
+- [릴리스 수용 검증](release-validation.md): v0.4.14 activation 순서 회귀와 실제 3×24GiB `PP=3` GPU 검증 절차
+- [릴리스 증적 기록](release-evidence/README.md): runbook과 실제 GPU 수용 결과를 분리해 보관하는 형식
 - [보안 모델](security.md): 현재 통제와 공개 전 보안 강화 과제
 - [vLLM 다중 노드 rank 결합 결정 기록](adr-vllm-multinode-rank-binding.md): `VLLM_RAY_PP_V1`의 고정 소스 계약과 검증 한계
 
@@ -20,18 +21,25 @@
 - [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md): 여러 exact 증적을 비중첩 배포로 조합하고 불변 추천·원자적 수락·명시적 준비·적용·검증으로 연결하는 계약과 이기종·대규모 합성 수용 매트릭스
 - [모델 아티팩트 매니페스트와 배포 계약](artifact-distribution.md): 불변 파일·청크 레지스트리, 결정론적 `STAGE`·`FULL_SNAPSHOT` 선택, 중앙 캐시 수명 주기, 명시적 준비·격리와 배포·롤백 소비 게이트
 - [vLLM 단계 아티팩트 생성·검증·배포](stage-artifacts.md): 제한된 vLLM 0.9.0 stage builder, variant·rank 매니페스트, 추천에 고정된 rank별 준비와 `sharded_state` 소비
+- [지원 매트릭스](support-matrix.md): OS·APT package·모델·GPU·TP/PP·runtime의 현재 지원 범위
+- [용어집](glossary.md): 모델 배포와 운영에서 쓰는 핵심 용어
 - [제품 제안서](dure-proposal.md): 장기 제품 비전과 MVP 가설
 
 ## 개발과 배포
 
 - [개발·릴리스 절차](development.md): 단위 테스트, 마이그레이션, Git 훅, 릴리스 규칙과 실제 GPU·PostgreSQL 검증의 분리
 - [APT 배포](apt-distribution.md): Debian 패키지와 서명된 APT 저장소 운영
-- [개발 로드맵](roadmap.md): v0.3.6 이후 모델 선택·자격 검증·세대 롤백과 단계별 목표
+- [릴리스 권한과 출처 관리](release-governance.md): source, tag, 서명 키, package, APT mirror의 신뢰 경계
+- [개발 로드맵](roadmap.md): 현재 구현 상태와 공개 운영 전 단계별 목표
 
 ## 문서 관리 원칙
 
 - 실행 가능한 CLI/API만 현재형으로 기술합니다.
 - 계획 중인 기능은 상태와 전제 조건을 표시합니다.
+- 절차(runbook)와 실제 실행 결과(evidence)를 같은 문서에서 혼합하지 않습니다. version별 실제 GPU·네트워크 수용 결과는 `release-evidence/`에 `PASSED`·`FAILED`·`NOT_RUN`으로 기록합니다.
+- source checkout, Git tag, GitHub Release, APT package는 서로 다른 상태입니다. source-to-package provenance가 없는 경우에는 공식 승인 package라고 표현하지 않습니다.
+- 모델·OS·runtime 지원 범위는 [지원 매트릭스](support-matrix.md)를 기준으로 하며, 기능 문서에 같은 수치를 반복할 때는 이 문서와 함께 갱신합니다.
+- 새 문서·이미지·링크는 `python3 scripts/check_docs.py`를 통과해야 합니다. 이미지에는 alt text와 갱신 가능한 원본 형식을 함께 보관합니다.
 - 모델은 이름만이 아니라 리비전, 양자화, 런타임 이미지 다이제스트, 라이선스를 함께 관리합니다.
 - 프롬프트, 자격 증명, 토큰, 실제 비밀값을 예시나 벤치마크 결과에 기록하지 않습니다.
 - 모델 릴리스와 배치 프로필의 실제 상태는 중앙 레지스트리가 진실의 원천이며, 이 문서는 정책과 절차를 설명합니다.
