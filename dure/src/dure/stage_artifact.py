@@ -41,6 +41,8 @@ CONTROL_LOADER_FORMAT = "VLLM_SHARDED_STATE_V1"
 SUPPORTED_TENSOR_PARALLEL_SIZE = 1
 DEFAULT_MAX_PART_BYTES = 5 * 1024**3
 DEFAULT_CHUNK_BYTES = 8 * 1024**2
+STAGE_EXPORT_MAX_MODEL_LEN = 128
+STAGE_EXPORT_GPU_MEMORY_UTILIZATION = 0.95
 MAX_PIPELINE_STAGES = 64
 MAX_SOURCE_ENTRIES = 200_000
 MAX_JSON_BYTES = 4 * 1024**2
@@ -1466,6 +1468,14 @@ class VLLM090NativeStageExporter:
             "load_format": "auto",
             "enable_lora": False,
             "enforce_eager": True,
+            # Export never serves requests, but vLLM still initializes a KV
+            # cache and profiles activations before collective_rpc is usable.
+            # Keep that transient allocation bounded so uneven 72B PP ranks
+            # fit on supported 24 GiB workers without changing model weights.
+            "max_model_len": STAGE_EXPORT_MAX_MODEL_LEN,
+            "gpu_memory_utilization": (
+                STAGE_EXPORT_GPU_MEMORY_UTILIZATION
+            ),
         }
         if contract.pipeline_parallel_size > 1:
             options["distributed_executor_backend"] = "ray"
