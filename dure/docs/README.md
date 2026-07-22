@@ -44,7 +44,8 @@
 - [지원 매트릭스](support-matrix.md): OS·APT package·모델·GPU·TP/PP·runtime의 현재 지원 범위
 - [버전 호환성과 롤링 업그레이드](compatibility-upgrades.md): Controller·Agent·migration·backend의 최소 조건과 안전한 rollout·복구 순서
 - [용어집](glossary.md): 모델 배포와 운영에서 쓰는 핵심 용어
-- [제품 제안서](dure-proposal.md): 장기 제품 비전과 MVP 가설
+- [제품 제안서](dure-proposal.md): 현재 지원 범위와 장기 비전의 경계
+- [Community LLM Mesh 장기 비전](vision/community-llm-mesh.md): 공유 GPU 추론 API의 장기 MVP 가설과 공개 운영 목표
 
 ## 개발과 배포
 

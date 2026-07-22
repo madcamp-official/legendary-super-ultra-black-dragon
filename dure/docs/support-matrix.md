@@ -16,23 +16,25 @@
 
 ## 허용 모델과 기준 배치
 
-현재 Fleet allowlist는 다음 네 Qwen2.5 Instruct AWQ 모델뿐입니다. 표의 디스크 값은 최소 여유
-공간이며 실제 `STAGE` 소비는 rank별 manifest와 cache identity의 exact gate를 추가로 통과해야 합니다.
+현재 Fleet allowlist는 다음 네 Qwen2.5 Instruct AWQ 모델뿐입니다. 표의 `최초 준비 최소 여유 디스크`는
+모델 또는 rank 캐시를 새로 준비할 때 필요한 보수적 기준입니다. `캐시 준비 후 운영 여유`는 이미 exact
+identity가 `READY`인 노드에서 추가로 확보해야 하는 최소 여유이며, 실제 `STAGE` 소비는 rank별 manifest와
+cache identity의 exact gate를 추가로 통과해야 합니다.
 
-| 모델 ID | 기준 구성 | 최소 GPU VRAM | 최소 여유 디스크 | checkpoint |
-| --- | --- | ---: | ---: | ---: |
-| `qwen2.5-7b-awq` | 1 node, `TP=1`, `PP=1` | 8 GiB | 6 GiB | 4.8 GiB |
-| `qwen2.5-14b-awq` | 1 node, `TP=1`, `PP=1` | 12 GiB | 12 GiB | 9.5 GiB |
-| `qwen2.5-32b-awq` | 1 node, `TP=1`, `PP=1` | 24 GiB | 25 GiB | 19.5 GiB |
-| `qwen2.5-72b-awq` | 3 nodes, node당 1 GPU, `TP=1`, `PP=3` | node당 24 GiB | node당 50 GiB | 38.74 GiB |
+| 모델 ID | 기준 구성 | 최소 GPU VRAM | 최초 준비 최소 여유 디스크 | 캐시 준비 후 운영 여유 | checkpoint |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `qwen2.5-7b-awq` | 1 node, `TP=1`, `PP=1` | 8 GiB | 6 GiB | 6 GiB | 4.8 GiB |
+| `qwen2.5-14b-awq` | 1 node, `TP=1`, `PP=1` | 12 GiB | 12 GiB | 12 GiB | 9.5 GiB |
+| `qwen2.5-32b-awq` | 1 node, `TP=1`, `PP=1` | 24 GiB | 25 GiB | 25 GiB | 19.5 GiB |
+| `qwen2.5-72b-awq` | 3 nodes, node당 1 GPU, `TP=1`, `PP=3` | node당 24 GiB | node당 50 GiB | node당 8 GiB | 38.74 GiB |
 
 자동 placement profile 생성기는 72B에 대해 다음 **qualification 초안**도 만들 수 있습니다.
 
-| 72B 초안 | node당 최소 VRAM | node당 profile 최소 디스크 | 상태 |
-| --- | ---: | ---: | --- |
-| `TP=1`, `PP=1` | 48 GiB | 50 GiB | `DRAFT`, 실제 evidence 전 배포 불가 |
-| `TP=1`, `PP=2` | 24 GiB | 50 GiB | `DRAFT`, exact 2-node evidence 전 배포 불가 |
-| `TP=1`, `PP=3` | 24 GiB | 8 GiB | `DRAFT`, rank별 stage bytes·cache gate와 exact 3-node evidence 전 배포 불가 |
+| 72B 초안 | node당 최소 VRAM | 최초 준비 최소 여유 디스크 | 캐시 준비 후 운영 여유 | 상태 |
+| --- | ---: | ---: | ---: | --- |
+| `TP=1`, `PP=1` | 48 GiB | 50 GiB | 50 GiB | `DRAFT`, 실제 evidence 전 배포 불가 |
+| `TP=1`, `PP=2` | 24 GiB | 50 GiB | 50 GiB | `DRAFT`, exact 2-node evidence 전 배포 불가 |
+| `TP=1`, `PP=3` | 24 GiB | rank별 exact gate | 8 GiB | `DRAFT`, rank별 stage bytes·cache gate와 exact 3-node evidence 전 배포 불가 |
 
 `PP=3` 초안의 8 GiB는 rank 캐시가 준비된 뒤의 운영 최소치입니다. 최초 준비는 rank별
 `2 × manifest bytes + 64 MiB` exact gate를 별도로 적용하므로 이 값만 확보했다고 새 캐시를
