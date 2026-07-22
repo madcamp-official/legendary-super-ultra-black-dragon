@@ -460,6 +460,12 @@ dure admin fleet status <fleet-id>
 - 모델은 `Qwen2ForCausalLM` AWQ이며 `TP=1`, loader는 `sharded_state`입니다.
 - remote code, `auto_map`, LoRA·adapter, MoE, 멀티모달 파일이나 임의 Python 모델 코드를 포함하지 않습니다.
 
+exporter는 요청을 처리하지 않지만 vLLM 초기화 자체가 KV cache와 activation profile을
+생성합니다. 고정 exporter는 이 일시 메모리를 `max_model_len=128`,
+`gpu_memory_utilization=0.95`로 제한합니다. 이 값은 stage 생성 전용이며 생성된 artifact의
+모델 tensor나 실제 배포의 context 한도를 바꾸지 않습니다. 특히 72B의 불균등 PP rank가
+24 GiB GPU에서 불필요한 32K activation profile 때문에 export 전에 실패하지 않게 합니다.
+
 기본 순서는 다음과 같습니다.
 
 ```text
