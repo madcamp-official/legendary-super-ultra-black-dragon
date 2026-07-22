@@ -646,9 +646,20 @@ class ProfileQualificationTests(unittest.TestCase):
             )
             self.assertTrue(created)
             self.assertEqual(len(run["gpu_bindings"]), 3)
+            self.assertEqual(run["workload"]["output_tokens"], 32)
+            self.assertEqual(run["workload"]["minimum_request_count"], 2)
             self.assertTrue(
                 all(binding["gpu_uuid"].startswith("GPU-") for binding in run["gpu_bindings"])
             )
+            # Qualification may legitimately populate caches and consume disk.
+            # Keep the exact node/GPU binding frozen, but do not make dynamic
+            # capacity fields invalidate evidence produced by that same run.
+            dynamic = session.get(NodeProfileRecord, node_ids[0])
+            changed_profile = copy.deepcopy(dynamic.profile)
+            changed_profile["disk_free_mib"] -= 1
+            dynamic.profile = changed_profile
+            dynamic.updated_at = utcnow()
+            session.commit()
             evidence, stored_run, created = register_profile_qualification_evidence(
                 session,
                 run_id=request_id,

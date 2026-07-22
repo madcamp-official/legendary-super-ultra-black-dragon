@@ -729,12 +729,17 @@ curl -sS -X POST \
 
 적용은 누락된 전체 프로필을 한 트랜잭션으로 만들며 같은 요청을 반복해도 중복 생성하지 않습니다. 같은 profile ID에 다른 origin 또는 digest가 있으면 전체 요청을 거부하고 기존 행을 덮어쓰지 않습니다. 생성된 프로필은 `DRAFT`라서 추천에 사용되지 않습니다. 이 API는 benchmark, Agent task, 모델 다운로드, 이미지 pull, Docker 실행 또는 기존 배포 변경을 만들지 않습니다.
 
-`fleet-placement-v2`의 72B `PP=3` 프로필은 qualification 실행 공간으로 노드당
-20 GiB를 요구합니다. 실제 `STAGE` 추천과 준비는 이 값으로 저장 공간을 추측하지 않고
+`fleet-placement-v3`의 72B `PP=3` 프로필은 검증된 rank 캐시가 이미 준비된 뒤의 운영 여유로
+노드당 8 GiB를 요구합니다. 실제 `STAGE` 추천과 최초 준비는 이 값으로 저장 공간을 추측하지 않고
 각 rank의 exact manifest 크기에 대해 기존 `2 × rank bytes + 64 MiB` 게이트를 별도로
 적용합니다. 따라서 이미 내려받은 digest-pinned runtime과 검증 rank 때문에 100 GiB
-노드의 free 공간이 50 GiB 아래로 내려가도 qualification을 부당하게 막지 않으며,
+노드의 free 공간이 20 GiB 아래로 내려가도 qualification을 부당하게 막지 않으며,
 실제 rank를 안전하게 준비할 공간이 부족한 노드는 여전히 추천·준비에서 거부됩니다.
+
+이 프로필의 사설망 하한은 실제 대상 노드 쌍의 최저 측정값보다 낮은 2,000 Mbps이고,
+SLO는 TTFT 30초, TPOT 250ms, E2E 45초, 처리량 1 token/s입니다. qualification v2는 최대
+컨텍스트 입력과 최대 32 출력 토큰, 최소 2회 측정을 사용합니다. 이는 실제 load·최대 컨텍스트·
+재시작을 짧게 검증하는 수용 게이트이며 장기 처리량·복구 soak test가 아닙니다.
 
 ## 자동 배치 프로필 qualification
 
@@ -750,7 +755,7 @@ curl -sS -X POST \
 
 응답에서 정책·suite·작업 부하 digest, 8단계 순서와 rank별 중앙 노드 UUID·GPU index·GPU UUID binding을 검토합니다. 서버는 정상·승인·온라인 노드, Docker/NVIDIA runtime, VRAM·GPU 아키텍처·디스크·사설망을 검사합니다. `QUEUED`·`RUNNING` task, 활성 배포 operation, 다른 `QUALIFYING` 실행의 예약 또는 Agent가 보고한 작업 부하가 있는 노드는 `NODE_OCCUPIED`로 차단합니다. 적용하려면 같은 본문에서 `apply`만 `true`로 바꿉니다. 이때 중앙 run·binding·감사 기록과 프로필의 `QUALIFYING` 상태만 생기며 Agent task나 호스트 변경은 생기지 않습니다.
 
-현재 Dure는 다중 노드 qualification을 Agent에 자동 분배하지 않습니다. 신뢰된 외부 executor가 동결된 정책 `profile-qualification-v1`, suite `dure-profile-qualification-v1`, 작업 부하와 exact binding을 사용해 정적 호환성, 용량 추정, 아티팩트 준비, 네트워크·NCCL, 모델 load, 짧은 추론, 컨텍스트·동시성, 재시작 안정성의 8단계를 실행한 뒤 결과를 등록해야 합니다.
+현재 Dure는 다중 노드 qualification을 Agent에 자동 분배하지 않습니다. 신뢰된 외부 executor가 동결된 정책 `profile-qualification-v2`, suite `dure-profile-qualification-v2`, 작업 부하와 exact binding을 사용해 정적 호환성, 용량 추정, 아티팩트 준비, 네트워크·NCCL, 모델 load, 짧은 추론, 컨텍스트·동시성, 재시작 안정성의 8단계를 실행한 뒤 결과를 등록해야 합니다.
 
 최초 활성화 뒤 다른 exact 노드 집합을 검증할 때는 준비 본문에 `"purpose":"SUPPLEMENTARY"`를 명시합니다. 목적을 생략하면 `PRIMARY`이므로 활성 프로필에서 자동 추측하지 않고 거부합니다. 보조 실행의 통과·실패·취소는 기존 프로필 상태와 최초 증적 포인터를 바꾸지 않으며, 겹치지 않는 노드 집합의 보조 실행은 병행할 수 있습니다.
 
