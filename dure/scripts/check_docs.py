@@ -15,6 +15,13 @@ _LINK = re.compile(r"!?\[[^\]]*\]\((?P<target><[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 _EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "tel:", "data:")
 _HEADING = re.compile(r"^#{1,6}\s+(?P<title>.+?)\s*#*\s*$", re.MULTILINE)
 _DATED_DOCUMENT = re.compile(r"(?:기준일|작성일):\s*(?P<date>\d{4}-\d{2}-\d{2})")
+_PACKAGE_VERSION = re.compile(r'^version\s*=\s*"(?P<version>[^"\s]+)"\s*$', re.MULTILINE)
+
+
+def _dure_root(root: Path) -> Path:
+    """Return the Dure project directory for a repository or fixture root."""
+
+    return root / "dure" if (root / "dure").is_dir() else root
 
 
 def documentation_files(root: Path) -> list[Path]:
@@ -148,6 +155,70 @@ def check_document_freshness(
     return errors
 
 
+def check_release_documentation_contract(root: Path) -> list[str]:
+    """Require the current package version to have aligned release documentation."""
+
+    dure_root = _dure_root(root)
+    pyproject = dure_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return []
+    match = _PACKAGE_VERSION.search(pyproject.read_text(encoding="utf-8"))
+    if match is None:
+        return [f"{pyproject.relative_to(root)}: missing project version"]
+    version = match.group("version")
+    evidence = dure_root / "docs" / "release-evidence" / f"v{version}.md"
+    errors: list[str] = []
+    if not evidence.is_file():
+        errors.append(
+            f"{pyproject.relative_to(root)}: missing current release evidence v{version}.md"
+        )
+    else:
+        evidence_text = evidence.read_text(encoding="utf-8")
+        if f"# v{version} 수용 증적" not in evidence_text:
+            errors.append(
+                f"{evidence.relative_to(root)}: heading does not identify v{version}"
+            )
+        if not re.search(r"`(?:PASSED|FAILED|NOT_RUN)`", evidence_text):
+            errors.append(
+                f"{evidence.relative_to(root)}: missing closed evidence status"
+            )
+
+    expected = (
+        (dure_root / "CHANGELOG.md", f"## {version} — 소스 기준선"),
+        (dure_root / "docs" / "roadmap.md", f"현재 릴리스 메타데이터: `{version}`"),
+        (
+            dure_root / "docs" / "release-evidence" / "README.md",
+            f"현재 source metadata `{version}`",
+        ),
+    )
+    for document, required_text in expected:
+        if not document.is_file() or required_text not in document.read_text(encoding="utf-8"):
+            errors.append(
+                f"{document.relative_to(root)}: current release documentation must reference {version}"
+            )
+    return errors
+
+
+def check_bootstrap_cli_contract(root: Path) -> list[str]:
+    """Keep the Docker restart compatibility flag aligned with the CLI source."""
+
+    dure_root = _dure_root(root)
+    source = dure_root / "src" / "dure" / "cli.py"
+    document = dure_root / "docs" / "cli-reference.md"
+    if not source.is_file() or not document.is_file():
+        return []
+    source_text = source.read_text(encoding="utf-8")
+    document_text = document.read_text(encoding="utf-8")
+    cli_contract = "Compatibility flag; --apply already includes the required Docker restart"
+    documentation_contract = "`--allow-docker-restart`는 이전 자동화와의 호환 플래그"
+    if cli_contract in source_text and documentation_contract not in document_text:
+        return [
+            f"{document.relative_to(root)}: bootstrap Docker restart documentation "
+            "does not match the CLI compatibility flag"
+        ]
+    return []
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -177,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         + check_document_freshness(
             root, today=args.today, max_age_days=args.max_document_age_days
         )
+        + check_release_documentation_contract(root)
+        + check_bootstrap_cli_contract(root)
     )
     if errors:
         print("\n".join(errors), file=sys.stderr)

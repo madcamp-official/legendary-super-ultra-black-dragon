@@ -18,7 +18,7 @@
 
 | 명령 | 주된 목적 | 기본 실행 | 실제 변경 조건·주의 |
 | --- | --- | --- | --- |
-| `dure bootstrap` | OS, NVIDIA 드라이버, Docker, NVIDIA Container Toolkit, Agent 준비 상태 진단 | 변경 없는 계획·차단 사유 출력 | `sudo dure bootstrap --apply`만 제한된 설치·설정을 수행합니다. Docker 재시작이 필요한데 컨테이너가 있으면 `--allow-docker-restart` 없이는 중단합니다. 드라이버·커널·CUDA 호스트 패키지는 변경하지 않습니다. |
+| `dure bootstrap` | OS, NVIDIA 드라이버, Docker, NVIDIA Container Toolkit, Agent 준비 상태 진단 | 변경 없는 계획·차단 사유 출력 | `sudo dure bootstrap --apply`만 제한된 설치·설정을 수행합니다. Docker 재시작이 필요한 경우의 승인은 `--apply`에 포함됩니다. `--allow-docker-restart`는 이전 자동화와의 호환 플래그이며 추가 권한을 주지 않습니다. 드라이버·커널·CUDA 호스트 패키지는 변경하지 않습니다. |
 | `dure doctor` | GPU·런타임·네트워크의 읽기 전용 진단 | 읽기 전용 | `--json`, `--output`은 출력 형식·저장 위치만 지정합니다. |
 | `dure plan` | 로컬 인벤토리와 배치 프로필에서 결정론적 계획 작성 | 계획 파일 생성 | `--output`은 필수입니다. Docker·모델·서비스를 변경하지 않습니다. `--image` 기본값은 편의값일 뿐 중앙 배포에는 digest-pinned 이미지 계약이 적용됩니다. |
 | `dure init` | 계획을 검토하고 로컬 준비·배포 절차 수행 | `--apply` 없이는 preview | `--apply`가 실제 상태 변경 관문입니다. 모델 다운로드는 `--accept-model-download`, image pull은 `--pull`, digest 없는 이미지는 `--allow-unpinned-image`, 기존 Dure 컨테이너 교체는 `--replace`, 서빙은 `--serve`를 각각 명시해야 합니다. |

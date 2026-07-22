@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
 기준일: 2026-07-22
-현재 릴리스 메타데이터: `0.4.21` (`UNRELEASED`; source·wheel·Debian package version 동기화 완료)
+현재 릴리스 메타데이터: `0.4.22` (`UNRELEASED`; source·wheel·Debian package version 동기화 완료)
 
 ## 방향과 원칙
 
@@ -44,6 +44,7 @@ Debian version과 같은 `v<version>` tag를 만들고 배포 workflow가 성공
 - `version/0.4.18`: v0.4.14 operation ordering 회귀 테스트, 폐쇄형 3×24GiB `PP=3` GPU memory profile,
   실제 수용 검사 runbook 추가
 - `version/0.4.21`: 지원 매트릭스·용어집·릴리스 권한/증적, 네트워크·방화벽, PostgreSQL 재해 복구, Agent 설정·credential 회전, 관측·장애 대응, 관리자·Agent API 계약 문서와 내부 Markdown 링크 검증 추가
+- `version/0.4.22`: qualification evidence를 node·rank·GPU·모델·runtime·workload identity에 결합하고, 3×24GiB 72B `PP=3` profile의 workload·SLO·사설망 기준을 보정
 
 현재 코드베이스는 기존 추천·수락·준비·배포 경계와 legacy 계획 JSON 호환성을 유지하면서, `VLLM_RAY_PP_V1`의 exact `VALIDATED` `STAGE`와 독립 `FULL_SNAPSHOT`을 결정론적으로 평가합니다. 같은 품질·모델이면 실행 가능한 `STAGE`를 artifact-set digest 순으로 먼저 평가하지만, 각 후보는 자체 디스크·rank 조건을 통과해야 하고 수락 뒤 전달 방식을 바꾸지 않습니다. 런타임은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, 노드별 정상 GPU 한 장과 선택 세대가 고정한 exact 캐시를 요구합니다. 서버 UUID를 identity로 사용하고 head를 rank 0으로 고정하며 worker는 고유 RFC1918 IPv4 문자열 순으로 결합합니다. GCS 6379, worker 20000-21000, loopback API 8000과 backend·rank·component·stage identity 컨테이너 레이블도 고정합니다. v0.3.21은 이 실행 계층 앞에 중앙과 분리된 로컬 bootstrap을 추가하며, GPU driver가 이미 정상인 Ubuntu 노드에서만 Docker와 NVIDIA Toolkit을 명시적으로 준비합니다.
 
@@ -55,10 +56,10 @@ Debian version과 같은 `v<version>` tag를 만들고 배포 workflow가 성공
 
 롤백은 전체 노드와 동일한 실제 실행 토폴로지·승인·온라인·다이제스트 이미지 조건을 강제하고, `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET`과 선택적 `START_API → VERIFY_API`를 모든 노드 성공 게이트로 진행합니다. 엄격한 backend에서 모델·revision·layer 범위·매니페스트·variant 및 `FULL_SNAPSHOT`/`STAGE` identity는 세대별 exact 게이트를 통과하면 달라도 되며, legacy layer 범위 비교는 유지합니다. 실패 노드 재시도는 새 시도 번호로 펜싱합니다. 같은 GPU에서 컨테이너를 다시 만드는 방식이므로 중단 가능성이 있고 블루·그린 전환이 아닙니다. 네트워크·NCCL 자동 시험과 24시간 복구 검증은 여전히 후속 범위입니다.
 
-## 현재 릴리스·수용 상태: 0.4.21 소스 기준선
+## 현재 릴리스·수용 상태: 0.4.22 소스 기준선
 
-현재 기준선은 `0.4.21`이며 package, Git tag, APT publish, 실제 GPU 수용은 아직 별개의 상태다.
-실제 실행 결과의 진실의 원천은 [v0.4.21 수용 증적](release-evidence/v0.4.21.md)이다. 현재 증적은
+현재 기준선은 `0.4.22`이며 package, Git tag, APT publish, 실제 GPU 수용은 아직 별개의 상태다.
+실제 실행 결과의 진실의 원천은 [v0.4.22 수용 증적](release-evidence/v0.4.22.md)이다. 현재 증적은
 `NOT_RUN`이며, 실제 GPU·Docker·Ray·vLLM·NCCL 실행 없이 `PASSED`로 바꾸지 않는다.
 
 - **역사적 v0.4.14 activation ordering 기준:** `QUEUED → RUNNING → SUCCEEDED` operation 동안 final
@@ -72,7 +73,7 @@ Debian version과 같은 `v<version>` tag를 만들고 배포 workflow가 성공
   저장하지 않아 새 revision을 만들지 않습니다. 향후 validation run·GPU memory·wrapper attestation을
   중앙 증적으로 영속한다면 `0016`에서 새 append-only evidence schema를 추가하고 기존 DB upgrade와
   downgrade 거부 경로를 별도로 검증해야 합니다.
-- **release metadata:** `0.4.21`은 `UNRELEASED`입니다. `pyproject.toml`, `setup.py`, runtime version,
+- **release metadata:** `0.4.22`는 `UNRELEASED`입니다. `pyproject.toml`, `setup.py`, runtime version,
   Debian changelog와 package test는 동기화되어 있지만, 사용자의 명시적 요청 전에는 tag, GitHub
   Release, APT publish를 수행하지 않습니다. 상세 절차는 [릴리스 수용 검증](release-validation.md)을
   따릅니다.
