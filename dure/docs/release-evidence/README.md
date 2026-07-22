@@ -17,6 +17,7 @@
 
 새 기록은 [template.md](template.md)를 복사해 만듭니다.
 
-현재 source metadata `0.4.21`에 대해 실제 GPU/NCCL 수용 검사가 아직 실행되지 않았음을 기록한 기준 파일은
-[v0.4.21.md](v0.4.21.md)입니다. 이 `NOT_RUN` 기록은 실패가 아닌 미실행 상태이지만, release·배포·stage
-승격의 성공 증거로 사용할 수 없습니다.
+현재 source metadata `0.4.22`에 대해 실제 GPU/NCCL 수용 검사가 아직 실행되지 않았음을 기록한 기준 파일은
+[v0.4.22.md](v0.4.22.md)입니다. 이 `NOT_RUN` 기록은 실패가 아닌 미실행 상태이지만, release·배포·stage
+승격의 성공 증거로 사용할 수 없습니다. [v0.4.21.md](v0.4.21.md)는 이전 source 기준선의 역사적 기록이며,
+현재 package 또는 새 배포의 증거가 아닙니다.

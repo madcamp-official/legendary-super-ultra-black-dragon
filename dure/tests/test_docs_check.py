@@ -94,3 +94,50 @@ class DocumentationLinkCheckTests(unittest.TestCase):
 
         self.assertEqual(len(errors), 1)
         self.assertIn("older than 90 days", errors[0])
+
+    def test_requires_current_package_evidence_and_release_references(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dure = root / "dure"
+            (dure / "docs" / "release-evidence").mkdir(parents=True)
+            (dure / "pyproject.toml").write_text(
+                '[project]\nversion = "1.2.3"\n', encoding="utf-8"
+            )
+            (dure / "CHANGELOG.md").write_text(
+                "## 1.2.3 — 소스 기준선\n", encoding="utf-8"
+            )
+            (dure / "docs" / "roadmap.md").write_text(
+                "현재 릴리스 메타데이터: `1.2.3`\n", encoding="utf-8"
+            )
+            (dure / "docs" / "release-evidence" / "README.md").write_text(
+                "현재 source metadata `1.2.3`\n", encoding="utf-8"
+            )
+            (dure / "docs" / "release-evidence" / "v1.2.3.md").write_text(
+                "# v1.2.3 수용 증적\n\n`NOT_RUN`\n", encoding="utf-8"
+            )
+
+            errors = DOCS_CHECK.check_release_documentation_contract(root)
+
+        self.assertEqual(errors, [])
+
+    def test_reports_release_or_bootstrap_documentation_contract_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dure = root / "dure"
+            (dure / "docs").mkdir(parents=True)
+            (dure / "pyproject.toml").write_text(
+                '[project]\nversion = "1.2.3"\n', encoding="utf-8"
+            )
+            (dure / "src" / "dure").mkdir(parents=True)
+            (dure / "src" / "dure" / "cli.py").write_text(
+                "Compatibility flag; --apply already includes the required Docker restart\n",
+                encoding="utf-8",
+            )
+            (dure / "docs" / "cli-reference.md").write_text("old docs\n", encoding="utf-8")
+
+            release_errors = DOCS_CHECK.check_release_documentation_contract(root)
+            cli_errors = DOCS_CHECK.check_bootstrap_cli_contract(root)
+
+        self.assertTrue(any("missing current release evidence" in error for error in release_errors))
+        self.assertEqual(len(cli_errors), 1)
+        self.assertIn("does not match", cli_errors[0])
