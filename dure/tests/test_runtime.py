@@ -5,9 +5,11 @@ from unittest.mock import patch
 from dure.command import CommandResult
 from dure.pipeline_runtime import (
     RAY_COMPONENT,
+    RAY_SESSION_CONTAINER_PATH,
     stage_cache_identity,
     stage_identity_labels,
     strict_model_mount_path,
+    strict_ray_session_path,
     strict_runtime_contract_digest,
     strict_vllm_api_command,
 )
@@ -468,10 +470,15 @@ class RuntimeTests(unittest.TestCase):
                 "--head",
                 "--node-ip-address=192.168.0.10",
                 "--port=6379",
+                "--temp-dir=/tmp/ray",
                 '--resources={"dure_node_11111111111141118111111111111111":1}',
                 "--min-worker-port=20000",
                 "--max-worker-port=21000",
             ),
+        )
+        self.assertIn(
+            f"type=bind,src={strict_ray_session_path(plan)},dst=/tmp/ray",
+            head_run,
         )
 
     def test_strict_api_is_head_only_and_uses_fixed_v0_non_spmd_mode(self):
@@ -518,12 +525,70 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(run[run.index("--host") + 1], "127.0.0.1")
         self.assertEqual(run[run.index("--port") + 1], "8000")
+        session_mount = (
+            f"type=bind,src={strict_ray_session_path(plan)},"
+            f"dst={RAY_SESSION_CONTAINER_PATH}"
+        )
+        self.assertIn(session_mount, run)
+        self.assertIn(
+            (
+                "install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0700",
+                "--",
+                str(strict_ray_session_path(plan)),
+            ),
+            runner.calls,
+        )
 
         worker_result = ContainerRuntime(FakeRunner()).start_api(
             plan, plan.assignments[1], replace=False
         )
         self.assertTrue(worker_result.ok)
         self.assertFalse(worker_result.blocking)
+
+    def test_strict_api_refuses_to_start_without_safe_ray_session_directory(self):
+        plan, _, _ = strict_pipeline_fixture()
+        assignment = plan.assignments[0]
+        name = f"dure-api-{plan.deployment_id}"
+        inspect = (
+            "docker",
+            "inspect",
+            "--format",
+            DEPLOYMENT_IDENTITY_FORMAT,
+            name,
+        )
+        install = (
+            "install",
+            "-d",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0700",
+            "--",
+            str(strict_ray_session_path(plan)),
+        )
+        runner = FakeRunner(
+            responses={
+                inspect: CommandResult(inspect, 1, stderr="not found"),
+                install: CommandResult(install, 1, stderr="permission denied"),
+            }
+        )
+
+        result = ContainerRuntime(runner).start_api(
+            plan, assignment, replace=False
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("permission denied", result.detail)
+        self.assertFalse(any(call[:3] == ("docker", "run", "-d") for call in runner.calls))
 
     def test_stage_worker_mounts_only_its_derived_cache_with_exact_labels(self):
         plan, _, worker = strict_stage_pipeline_fixture()

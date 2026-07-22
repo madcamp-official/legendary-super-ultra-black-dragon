@@ -23,7 +23,7 @@ from dure.model_cache import (
     MODEL_CACHE_KIND_STAGE,
 )
 from dure.resource_pool import FLEET_MODEL_IDS, build_gpu_pool_snapshot
-from dure.selector import InventoryNode, recommend_model
+from dure.selector import InventoryNode, has_exact_stage_cache, recommend_model
 
 from .models import (
     Deployment,
@@ -47,7 +47,7 @@ from .recommendation import (
 )
 
 
-FLEET_CANDIDATE_POLICY_VERSION = "fleet-candidate-v2"
+FLEET_CANDIDATE_POLICY_VERSION = "fleet-candidate-v3"
 FLEET_SCHEDULER_VERSION = "fleet-set-packing-v1"
 
 
@@ -189,7 +189,10 @@ def _fleet_occupancy(
         for node in session.scalars(
             select(Node).where(Node.id.in_(requested)).order_by(Node.id)
         )
-        if node.observed_deployment_id
+        # PLANNED is the durable stopped/unstarted state. It owns no live host
+        # resource, and Fleet reservations still prevent a later conflicting
+        # START from being queued after acceptance.
+        if node.observed_deployment_id and node.observed_phase != "PLANNED"
     }
     for node_id, deployment_id in observed.items():
         reasons.setdefault(
@@ -211,6 +214,31 @@ def _cache_hit(
     if node.profile is None:
         return False
     cache_kind = context["model_cache_kind"]
+    if cache_kind == MODEL_CACHE_KIND_STAGE:
+        stage_ranks = context.get("stage_ranks")
+        stage_artifact = context.get("stage_artifact")
+        if not isinstance(stage_ranks, list) or not isinstance(
+            stage_artifact, dict
+        ):
+            return False
+        stage = next(
+            (
+                item
+                for item in stage_ranks
+                if isinstance(item, dict) and item.get("rank") == rank
+            ),
+            None,
+        )
+        if stage is None:
+            return False
+        return has_exact_stage_cache(
+            node.profile,
+            artifact_set_digest=stage_artifact["artifact_set_digest"],
+            source_manifest_digest=stage_artifact["source_manifest_digest"],
+            manifest_digest=stage["manifest_digest"],
+            pipeline_rank=stage["pipeline_rank"],
+            tensor_rank=stage["tensor_rank"],
+        )
     for marker in node.profile.installed_models:
         if not marker.complete or marker.cache_kind != cache_kind:
             continue
@@ -224,16 +252,6 @@ def _cache_hit(
                 != context["artifact_manifest_digest"]
             ):
                 continue
-            return True
-        if cache_kind == MODEL_CACHE_KIND_STAGE and (
-            marker.artifact_set_digest
-            == context["stage_artifact"]["artifact_set_digest"]
-            and marker.source_manifest_digest
-            == context["artifact_manifest_digest"]
-            and marker.runtime_image == context["runtime_image"]
-            and marker.pipeline_rank == rank
-            and marker.tensor_rank == 0
-        ):
             return True
     return False
 

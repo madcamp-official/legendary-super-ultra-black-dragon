@@ -11,7 +11,11 @@ from sqlalchemy import func, select
 
 from dure.control.benchmark import promote_model_release
 from dure.control.db import Base, make_engine, make_session_factory
-from dure.control.fleet import FleetEvaluationError, evaluate_fleet_schedule
+from dure.control.fleet import (
+    FleetEvaluationError,
+    _fleet_occupancy,
+    evaluate_fleet_schedule,
+)
 from dure.control.fleet_acceptance import (
     FleetAcceptanceError,
     accept_fleet_recommendation,
@@ -54,6 +58,8 @@ from dure.control.service import (
     prepare_benchmark_run,
     transition_model_release,
 )
+from dure.models import NodeProfile
+from dure.selector import InventoryNode
 
 from .helpers import profile
 
@@ -201,6 +207,38 @@ class ProfileQualificationTests(unittest.TestCase):
         )
         self.assertTrue(created)
         return evidence
+
+    def test_planned_observation_does_not_occupy_fleet_but_ready_does(self):
+        with self.factory() as session:
+            node_id = self._nodes(session, 1)[0]
+            node = session.get(Node, node_id)
+            node.observed_deployment_id = str(uuid.uuid4())
+            node.observed_phase = "PLANNED"
+            session.commit()
+            record = session.get(NodeProfileRecord, node_id)
+            inventory = [
+                InventoryNode(
+                    node_id=node_id,
+                    profile=NodeProfile.from_dict(record.profile),
+                    approved=True,
+                    online=True,
+                    profile_fresh=True,
+                    network_verified=False,
+                )
+            ]
+
+            self.assertEqual(_fleet_occupancy(session, inventory), {})
+
+            node.observed_phase = "READY"
+            session.commit()
+            self.assertEqual(
+                _fleet_occupancy(session, inventory),
+                {
+                    node_id: (
+                        "OBSERVED_DEPLOYMENT:" + node.observed_deployment_id
+                    )
+                },
+            )
 
     def test_fleet_scheduler_combines_disjoint_exact_evidence_sets(self):
         with self.factory() as session:

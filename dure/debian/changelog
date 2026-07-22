@@ -1,3 +1,12 @@
+dure (0.4.23) UNRELEASED; urgency=medium
+
+  * Reuse exact probed STAGE caches without requiring download headroom and
+    keep stopped PLANNED deployments out of Fleet occupancy.
+  * Share a generation-scoped Ray session directory between strict Ray head
+    and vLLM API containers.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 08:30:00 +0000
+
 dure (0.4.22) UNRELEASED; urgency=medium
 
   * Bound qualification evidence to stable node, rank, GPU, model, runtime,

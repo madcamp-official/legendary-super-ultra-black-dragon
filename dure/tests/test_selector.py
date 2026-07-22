@@ -8,7 +8,7 @@ from dure.catalog import (
     StageArtifactDelivery,
     StageRankDelivery,
 )
-from dure.models import GPUProfile, InstalledModelProfile
+from dure.models import ArtifactCacheObservation, GPUProfile, InstalledModelProfile
 from dure.selector import InventoryNode, recommend_model
 
 from .helpers import profile
@@ -108,6 +108,69 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(staged.rank_node_ids, ("node-a", "node-c", "node-b"))
         self.assertFalse(full.feasible)
         self.assertIn("DISK_SPACE", {item.code for item in full.rejections})
+
+    def test_exact_present_stage_cache_does_not_require_download_headroom(self):
+        stage = stage_delivery("a", rank_size_bytes=40 * 1024 * 1024 * 1024)
+        nodes = []
+        rank_nodes = ("node-a", "node-c", "node-b")
+        for rank, node_id in enumerate(rank_nodes):
+            value = profile(node_id)
+            value.disk_free_mib = 1
+            rank_stage = stage.ranks[rank]
+            value.artifact_cache_scan_complete = True
+            value.artifact_cache_observations = [
+                ArtifactCacheObservation(
+                    cache_kind="STAGE",
+                    cache_identity_digest="sha256:" + str(rank + 7) * 64,
+                    condition="PRESENT",
+                    manifest_digest=rank_stage.manifest_digest,
+                    verification_version=1,
+                    artifact_set_digest=stage.artifact_set_digest,
+                    source_manifest_digest=stage.source_manifest_digest,
+                    pipeline_rank=rank_stage.pipeline_rank,
+                    tensor_rank=rank_stage.tensor_rank,
+                )
+            ]
+            nodes.append(inventory(value))
+
+        result = recommend_model(nodes, catalog=self._delivery_catalog(stage=stage))
+
+        staged = result.evaluations[0]
+        self.assertTrue(staged.feasible)
+        self.assertNotIn(
+            "STAGE_DISK_SPACE", {item.code for item in staged.rejections}
+        )
+
+    def test_wrong_stage_observation_does_not_bypass_disk_gate(self):
+        stage = stage_delivery("a", rank_size_bytes=40 * 1024 * 1024 * 1024)
+        nodes = []
+        rank_nodes = ("node-a", "node-c", "node-b")
+        for rank, node_id in enumerate(rank_nodes):
+            value = profile(node_id)
+            value.disk_free_mib = 1
+            rank_stage = stage.ranks[rank]
+            value.artifact_cache_scan_complete = True
+            value.artifact_cache_observations = [
+                ArtifactCacheObservation(
+                    cache_kind="STAGE",
+                    cache_identity_digest="sha256:" + str(rank + 7) * 64,
+                    condition="PRESENT",
+                    manifest_digest="sha256:" + "9" * 64,
+                    verification_version=1,
+                    artifact_set_digest=stage.artifact_set_digest,
+                    source_manifest_digest=stage.source_manifest_digest,
+                    pipeline_rank=rank_stage.pipeline_rank,
+                    tensor_rank=rank_stage.tensor_rank,
+                )
+            ]
+            nodes.append(inventory(value))
+
+        result = recommend_model(nodes, catalog=self._delivery_catalog(stage=stage))
+
+        self.assertIn(
+            "STAGE_DISK_SPACE",
+            {item.code for item in result.evaluations[0].rejections},
+        )
 
     def test_full_snapshot_is_an_independent_fallback_when_stage_disk_fails(self):
         nodes = []

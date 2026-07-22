@@ -38,6 +38,7 @@ RAY_MIN_WORKER_PORT = 20000
 RAY_MAX_WORKER_PORT = 21000
 VLLM_API_HOST = "127.0.0.1"
 VLLM_API_PORT = 8000
+RAY_SESSION_CONTAINER_PATH = "/tmp/ray"
 RAY_COMPONENT = "ray-node"
 VLLM_API_COMPONENT = "vllm-api"
 STRICT_IDENTITY_COMPONENTS = frozenset({RAY_COMPONENT, VLLM_API_COMPONENT})
@@ -51,6 +52,7 @@ STAGE_CACHE_CHECK = "stage-cache"
 
 _TRUSTED_MODEL_ROOT = Path("/var/lib/dure/models")
 _TRUSTED_STAGE_ROOT = _TRUSTED_MODEL_ROOT / "stages"
+_TRUSTED_RUNTIME_ROOT = Path("/var/lib/dure/runtime")
 _NETWORK_INTERFACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}")
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _MODEL_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -491,6 +493,7 @@ def strict_ray_command(
                 "--head",
                 f"--node-ip-address={assignment.runtime_address}",
                 f"--port={RAY_GCS_PORT}",
+                f"--temp-dir={RAY_SESSION_CONTAINER_PATH}",
             )
         )
     else:
@@ -508,6 +511,20 @@ def strict_ray_command(
         )
     )
     return tuple(command)
+
+
+def strict_ray_session_path(plan: DeploymentPlan) -> Path:
+    """Return the deterministic host directory shared by head Ray and API."""
+
+    deployment_id = _canonical_uuid(plan.deployment_id, "deployment_id")
+    if type(plan.generation) is not int or plan.generation < 1:
+        raise PipelineRuntimeContractError("generation must be a positive integer")
+    return (
+        _TRUSTED_RUNTIME_ROOT
+        / deployment_id
+        / f"generation-{plan.generation}"
+        / "ray"
+    )
 
 
 def strict_vllm_api_command(plan: DeploymentPlan) -> tuple[str, ...]:
@@ -566,8 +583,23 @@ def strict_runtime_contract_digest(
         raise PipelineRuntimeContractError(
             "strict runtime component is not valid for this assignment"
         )
+    mounts = [
+        {
+            "source": str(strict_model_mount_path(plan, assignment)),
+            "target": "/models/model",
+            "readonly": True,
+        }
+    ]
+    if assignment.role == "ray-head":
+        mounts.append(
+            {
+                "source": str(strict_ray_session_path(plan)),
+                "target": RAY_SESSION_CONTAINER_PATH,
+                "readonly": False,
+            }
+        )
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "identity": {
             "deployment_id": plan.deployment_id,
             "generation": plan.generation,
@@ -583,11 +615,7 @@ def strict_runtime_contract_digest(
             "network": "host",
             "shm_size": shm_size,
             "gpu_device": assignment.gpu_uuid or assignment.gpu_index,
-            "mount": {
-                "source": str(strict_model_mount_path(plan, assignment)),
-                "target": "/models/model",
-                "readonly": True,
-            },
+            "mounts": mounts,
             "entrypoint": entrypoint,
             "environment": dict(environment),
             "command": list(command),

@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 
 from .catalog import CatalogEntry, ModelCatalog, NetworkEvidenceBinding, STATIC_CATALOG
+from .model_cache import MODEL_CACHE_KIND_STAGE
 from .models import GPUProfile, NodeProfile
 
 
@@ -160,6 +161,36 @@ def _has_cached_model(node: InventoryNode, entry: CatalogEntry) -> bool:
     )
 
 
+def has_exact_stage_cache(
+    profile: NodeProfile | None,
+    *,
+    artifact_set_digest: str,
+    source_manifest_digest: str,
+    manifest_digest: str,
+    pipeline_rank: int,
+    tensor_rank: int,
+) -> bool:
+    """Return whether a complete probe observed the exact immutable stage."""
+
+    if (
+        profile is None
+        or profile.artifact_cache_scan_complete is not True
+        or profile.artifact_cache_observations is None
+    ):
+        return False
+    return any(
+        observation.cache_kind == MODEL_CACHE_KIND_STAGE
+        and observation.condition == "PRESENT"
+        and observation.verification_version == 1
+        and observation.artifact_set_digest == artifact_set_digest
+        and observation.source_manifest_digest == source_manifest_digest
+        and observation.manifest_digest == manifest_digest
+        and observation.pipeline_rank == pipeline_rank
+        and observation.tensor_rank == tensor_rank
+        for observation in profile.artifact_cache_observations
+    )
+
+
 def _gpu_architecture(compute_capability: str | None) -> str | None:
     if compute_capability is None:
         return None
@@ -237,10 +268,21 @@ def _select_exact_network_evidence(
                 if stage is None:
                     failed.append(node_id)
                     continue
+                profile = available_by_id[node_id].profile
+                if has_exact_stage_cache(
+                    profile,
+                    artifact_set_digest=entry.stage_artifact.artifact_set_digest,
+                    source_manifest_digest=(
+                        entry.stage_artifact.source_manifest_digest
+                    ),
+                    manifest_digest=stage.manifest_digest,
+                    pipeline_rank=stage.pipeline_rank,
+                    tensor_rank=stage.tensor_rank,
+                ):
+                    continue
                 required_bytes = (
                     stage.total_size_bytes * 2 + _STAGE_CACHE_RESERVE_BYTES
                 )
-                profile = available_by_id[node_id].profile
                 if (
                     profile is None
                     or profile.disk_free_mib * _MIB < required_bytes

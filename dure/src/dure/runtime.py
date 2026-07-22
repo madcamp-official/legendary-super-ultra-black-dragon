@@ -12,6 +12,7 @@ from .pipeline_runtime import (
     RAY_COMPONENT,
     RAY_MAX_WORKER_PORT,
     RAY_MIN_WORKER_PORT,
+    RAY_SESSION_CONTAINER_PATH,
     STRICT_IDENTITY_COMPONENTS,
     STRICT_CACHE_KIND_LABEL,
     STRICT_RUNTIME_CONTRACT_LABEL,
@@ -26,6 +27,7 @@ from .pipeline_runtime import (
     stage_identity_labels,
     strict_model_mount_path,
     strict_ray_command,
+    strict_ray_session_path,
     strict_runtime_contract_digest,
     strict_vllm_api_command,
     strict_vllm_environment,
@@ -213,6 +215,33 @@ class ContainerRuntime:
             "container-image",
             result.ok,
             f"Pulled {image}" if result.ok else result.stderr or result.stdout,
+        )
+
+    def _ensure_strict_ray_session(self, plan: DeploymentPlan) -> CheckResult:
+        path = strict_ray_session_path(plan)
+        result = self.runner.run(
+            [
+                "install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0700",
+                "--",
+                str(path),
+            ],
+            timeout=15,
+        )
+        return CheckResult(
+            "ray-session-directory",
+            result.ok,
+            (
+                f"Prepared strict Ray session directory: {path}"
+                if result.ok
+                else result.stderr or result.stdout
+            ),
         )
 
     def inspect_container(self, name: str) -> CommandResult:
@@ -681,6 +710,20 @@ class ContainerRuntime:
             assert existing_check is not None
             return existing_check
 
+        ray_session_mount: list[str] = []
+        if strict and assignment.role == "ray-head":
+            session_check = self._ensure_strict_ray_session(plan)
+            if not session_check.ok:
+                return CheckResult(
+                    "ray-container", False, session_check.detail
+                )
+            ray_session_mount = [
+                "--mount",
+                "type=bind,src="
+                f"{strict_ray_session_path(plan)},"
+                f"dst={RAY_SESSION_CONTAINER_PATH}",
+            ]
+
         local_ip = (
             assignment.runtime_address
             if strict
@@ -766,6 +809,7 @@ class ContainerRuntime:
             "type=bind,src="
             f"{strict_model_mount_path(plan, assignment) if strict else plan.model_path},"
             "dst=/models/model,readonly",
+            *ray_session_mount,
             *environment_args,
             plan.image,
             *ray_command,
@@ -836,6 +880,20 @@ class ContainerRuntime:
         if not proceed:
             assert existing_check is not None
             return existing_check
+
+        ray_session_mount: list[str] = []
+        if strict:
+            session_check = self._ensure_strict_ray_session(plan)
+            if not session_check.ok:
+                return CheckResult(
+                    "vllm-api-start", False, session_check.detail
+                )
+            ray_session_mount = [
+                "--mount",
+                "type=bind,src="
+                f"{strict_ray_session_path(plan)},"
+                f"dst={RAY_SESSION_CONTAINER_PATH}",
+            ]
 
         if strict:
             environment_args = [
@@ -923,6 +981,7 @@ class ContainerRuntime:
             "type=bind,src="
             f"{strict_model_mount_path(plan, assignment) if strict else plan.model_path},"
             "dst=/models/model,readonly",
+            *ray_session_mount,
             *environment_args,
             "--label",
             f"dure.deployment={plan.deployment_id}",

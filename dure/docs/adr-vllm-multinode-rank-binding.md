@@ -38,6 +38,13 @@ Dure의 새 폐쇄형 다중 노드 backend를 `VLLM_RAY_PP_V1`로 정합니다.
 | driver | 계획의 pipeline rank 0 node |
 | 네트워크 | 서로 다른 사설 IPv4 주소를 가진 신뢰 LAN 또는 사설 overlay |
 
+Ray head는 세대별 root 소유 디렉터리를 컨테이너의 `/tmp/ray`에 연결하고
+`ray start --temp-dir=/tmp/ray`로 session metadata 위치를 고정합니다. 별도 vLLM API
+컨테이너도 head와 같은 디렉터리를 `/tmp/ray`에 연결합니다. 따라서 GCS 주소만 공유한
+별도 컨테이너가 head의 `node_ip_address.json`을 찾지 못하는 상태를 허용하지 않으며,
+이 mount도 strict runtime contract digest에 포함됩니다. worker의 로컬 Ray 임시
+디렉터리는 API 연결 계약에 사용하지 않습니다.
+
 `VLLM_RAY_PP_V1`이라는 이름은 “Ray를 사용한다”는 사실만 나타내지 않습니다.
 버전, V0/V1, TP·PP, node 수, driver, node UUID·주소·rank 순서, 이미지와 모델
 identity를 함께 고정한 계약입니다. 이 중 하나라도 다르면 같은 backend로 인정하지
