@@ -27,6 +27,7 @@ from dure.stage_artifact import (
     StageExportContract,
     TensorSpec,
     TrustedStageBuilder,
+    VLLM090NativeStageExporter,
     WorkerStageExport,
     _vllm_worker_export,
     verify_stage_artifact_set,
@@ -208,6 +209,93 @@ class SyntheticNativeExporter:
 
 
 class StageBuilderTests(unittest.TestCase):
+    def test_native_exporter_bounds_transient_vllm_cache_for_large_pp_ranks(self):
+        observed: dict[str, object] = {}
+
+        class Executor:
+            def collective_rpc(self, callback, kwargs):
+                observed["callback"] = callback
+                observed["kwargs"] = kwargs
+                return [
+                    {
+                        "rank": rank,
+                        "tensors": [
+                            {
+                                "name": f"model.layers.{rank}.weight",
+                                "dtype": "F16",
+                                "shape": [1],
+                            }
+                        ],
+                    }
+                    for rank in range(3)
+                ]
+
+        class LLM:
+            def __init__(self, **options):
+                observed["options"] = options
+                self.llm_engine = types.SimpleNamespace(
+                    model_executor=Executor()
+                )
+
+        vllm = types.ModuleType("vllm")
+        vllm.LLM = LLM
+        environment = {
+            "DURE_STAGE_RUNTIME_IMAGE": RUNTIME_IMAGE,
+            "DURE_STAGE_EXPORTER_BUILD_DIGEST": EXPORTER_DIGEST,
+            "VLLM_USE_V1": "0",
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch.dict(sys.modules, {"vllm": vllm}),
+            mock.patch.object(
+                stage_artifact_module.importlib.metadata,
+                "version",
+                return_value="0.9.0",
+            ),
+        ):
+            exports = VLLM090NativeStageExporter().export(
+                Path("/models/source"),
+                Path("/build-output/workspace"),
+                _contract(STATIC_SOURCE_DIGEST, pp=3),
+            )
+
+        options = observed["options"]
+        self.assertEqual(options["max_model_len"], 128)
+        self.assertEqual(options["gpu_memory_utilization"], 0.95)
+        self.assertEqual(options["pipeline_parallel_size"], 3)
+        self.assertEqual(options["distributed_executor_backend"], "ray")
+        self.assertIs(observed["callback"], _vllm_worker_export)
+        self.assertEqual([item.rank for item in exports], [0, 1, 2])
+
+    def test_native_exporter_fails_closed_when_bounded_engine_rejects_init(self):
+        def reject_engine(**_options):
+            raise RuntimeError("injected vLLM initialization failure")
+
+        vllm = types.ModuleType("vllm")
+        vllm.LLM = reject_engine
+        environment = {
+            "DURE_STAGE_RUNTIME_IMAGE": RUNTIME_IMAGE,
+            "DURE_STAGE_EXPORTER_BUILD_DIGEST": EXPORTER_DIGEST,
+            "VLLM_USE_V1": "0",
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch.dict(sys.modules, {"vllm": vllm}),
+            mock.patch.object(
+                stage_artifact_module.importlib.metadata,
+                "version",
+                return_value="0.9.0",
+            ),
+            self.assertRaises(StageArtifactError) as caught,
+        ):
+            VLLM090NativeStageExporter().export(
+                Path("/models/source"),
+                Path("/build-output/workspace"),
+                _contract(STATIC_SOURCE_DIGEST, pp=3),
+            )
+
+        self.assertEqual(caught.exception.code, "STAGE_EXPORT_FAILED")
+
     def test_gpu_acceptance_requires_explicit_export_and_load_opt_in(self):
         script = (
             Path(__file__).resolve().parents[1]

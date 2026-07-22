@@ -1,9 +1,16 @@
-dure (0.4.15) UNRELEASED; urgency=medium
+dure (0.4.16) UNRELEASED; urgency=medium
 
   * Repair tracked Git hooks for the nested Dure project layout.
   * Add read-only pull request and branch push validation workflows.
 
- -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 12:00:00 +0000
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 13:00:00 +0000
+
+dure (0.4.15) UNRELEASED; urgency=medium
+
+  * Stage exporter의 일시 vLLM context와 GPU 메모리 사용을 제한해 24 GiB GPU의 72B PP rank를 지원합니다.
+  * 고정 exporter memory contract의 성공·실패 경로를 테스트하고 운영 문서를 보강합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 01:30:00 +0000
 
 dure (0.4.14) UNRELEASED; urgency=medium
 
