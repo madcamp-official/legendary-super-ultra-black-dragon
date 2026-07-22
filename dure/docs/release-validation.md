@@ -32,7 +32,7 @@ v0.4.14는 `APPLY_DEPLOYMENT` task의 성공만으로 최종 VERIFY를 보내지
 activation은 최신 `APPLY` operation이 terminal `SUCCEEDED`가 될 때까지 기다리고, `FAILED` 또는
 `PARTIAL_FAILED`면 최종 VERIFY를 만들지 않아야 합니다.
 
-### 사전 조건
+### 단일 GPU 사전 조건
 
 - 재검증 대상 package와 server·Agent build commit을 고정합니다. activation spec의
   `benchmark.dure_commit`은 대상 package의 `/usr/share/dure/build-commit`과 같아야 합니다.
@@ -83,7 +83,7 @@ PROBE → immutable registry registration → PREPARE/BENCHMARK → ACTIVE
 이 검사는 Qwen2.5-72B AWQ 같은 72B pipeline 기준선을 위한 별도 운영 경로입니다. `TP=1`,
 `PP=3`, 노드별 GPU 한 장, vLLM 0.9.0 V0 Ray 계약만 허용합니다.
 
-### 사전 조건
+### 다중 노드 사전 조건
 
 - 승인·온라인 상태의 서로 다른 세 노드와, 각 노드에서 계획이 선택한 정상 GPU 한 장
 - GPU마다 실제 total memory 24000MiB 이상
