@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import datetime as dt
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,3 +63,34 @@ class DocumentationLinkCheckTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("GOVERNANCE.md:1", errors[0])
         self.assertIn("missing.md", errors[0])
+
+    def test_reports_missing_anchor_and_duplicate_heading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "docs").mkdir()
+            (root / "README.md").write_text(
+                "[missing](docs/guide.md#nope)\n", encoding="utf-8"
+            )
+            (root / "docs" / "guide.md").write_text(
+                "# Same\n\n## Same\n", encoding="utf-8"
+            )
+
+            errors = DOCS_CHECK.check_relative_links(root) + DOCS_CHECK.check_duplicate_headings(root)
+
+        self.assertEqual(len(errors), 2)
+        self.assertIn("missing anchor nope", errors[0])
+        self.assertIn("duplicate heading anchor same", errors[1])
+
+    def test_reports_stale_explicit_document_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "README.md").write_text(
+                "# Guide\n\n기준일: 2026-01-01\n", encoding="utf-8"
+            )
+
+            errors = DOCS_CHECK.check_document_freshness(
+                root, today=dt.date(2026, 7, 22), max_age_days=90
+            )
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("older than 90 days", errors[0])
