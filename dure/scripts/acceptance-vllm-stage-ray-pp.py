@@ -9,6 +9,7 @@ Docker 인자, mount 또는 host path는 입력으로 받지 않는다.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.metadata
 import ipaddress
@@ -999,6 +1000,7 @@ class RealVllmStageRayBackend:
 
     def __init__(self) -> None:
         self._runtime_ray = None
+        self._runtime_async_engine = None
         self._runtime_executor = None
 
     def preflight(self, contract: AcceptanceContract) -> None:
@@ -1035,6 +1037,11 @@ class RealVllmStageRayBackend:
         try:
             return self._run(contract)
         finally:
+            if self._runtime_async_engine is not None:
+                try:
+                    self._runtime_async_engine.shutdown_background_loop()
+                except Exception:
+                    pass
             if self._runtime_executor is not None:
                 try:
                     self._runtime_executor.shutdown()
@@ -1081,9 +1088,16 @@ class RealVllmStageRayBackend:
         node_rehashes = _rehash_all_nodes(ray, contract, runtime_nodes)
 
         try:
-            from vllm import LLM, SamplingParams
+            from vllm import (
+                AsyncEngineArgs,
+                AsyncLLMEngine,
+                SamplingParams,
+            )
 
-            llm = LLM(**_vllm_load_kwargs(contract))
+            llm = AsyncLLMEngine.from_engine_args(
+                AsyncEngineArgs(**_vllm_load_kwargs(contract))
+            )
+            self._runtime_async_engine = llm
         except Exception as exc:
             raise AcceptanceFailure(
                 "VLLM_STAGE_DISTRIBUTED_LOAD_FAILED",
@@ -1091,7 +1105,7 @@ class RealVllmStageRayBackend:
             ) from exc
 
         try:
-            executor = llm.llm_engine.model_executor
+            executor = llm.engine.model_executor
             self._runtime_executor = executor
             if (
                 executor.__class__.__name__ != "RayDistributedExecutor"
@@ -1137,18 +1151,20 @@ class RealVllmStageRayBackend:
             ) from exc
 
         try:
-            outputs = llm.generate(
-                ["대한민국의 수도는"],
-                SamplingParams(
-                    temperature=0.0,
-                    min_tokens=1,
-                    max_tokens=4,
-                ),
-                use_tqdm=False,
+            output = asyncio.run(
+                _generate_minimal_output(
+                    llm,
+                    SamplingParams(
+                        temperature=0.0,
+                        min_tokens=1,
+                        max_tokens=4,
+                    ),
+                    request_id=contract.validation_run_id,
+                )
             )
-            if not outputs or not outputs[0].outputs:
+            if output is None or not output.outputs:
                 raise RuntimeError("empty generation")
-            token_count = len(outputs[0].outputs[0].token_ids)
+            token_count = len(output.outputs[0].token_ids)
             if token_count < 1 or token_count > 4:
                 raise RuntimeError("invalid token count")
         except Exception as exc:
@@ -1160,6 +1176,22 @@ class RealVllmStageRayBackend:
             token_count,
             node_rehashes,
         )
+
+
+async def _generate_minimal_output(
+    engine,
+    sampling_params,
+    *,
+    request_id: str,
+):
+    final_output = None
+    async for output in engine.generate(
+        "대한민국의 수도는",
+        sampling_params,
+        request_id=request_id,
+    ):
+        final_output = output
+    return final_output
 
 
 def _load_contract(path: Path = CONFIG_PATH) -> AcceptanceContract:

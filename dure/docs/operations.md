@@ -489,7 +489,7 @@ variant 등록 시 source manifest, runtime digest, vLLM, exporter build digest,
 
 synthetic fixture 검사는 빠진 rank, 잘못된 파일, tensor 누락과 digest 변조를 찾는 개발 게이트일 뿐 승격 증적이 아닙니다. 실제 GPU 검증의 전제 조건이 없으면 결과를 `NOT_RUN`으로 기록하며 성공으로 바꾸거나 생략하지 않습니다. 정확한 variant에 결합된 최신 `GPU_EXPORT_LOAD/PASSED`만 `DRAFT → VALIDATED`를 허용합니다. 새 validation run 증적은 `DRAFT`에서만 추가할 수 있습니다. 이미 등록한 동일 run의 정확한 네트워크 재전송은 `VALIDATED`나 `REVOKED` 뒤에도 기존 결과를 반환하지만, 두 상태에서 새 run을 추가하는 요청은 거부합니다. 검증 뒤 신뢰 문제가 발견되면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 전환하고 수정된 계약은 새 `DRAFT` variant에서 검증합니다. `REVOKED`는 되돌리지 않습니다.
 
-번들 `scripts/acceptance-vllm-stage-builder.py`는 `PP=1` export·native load·최소 추론을 검증합니다. `scripts/acceptance-vllm-stage-ray-pp.py`는 신뢰된 `PP=2/3` 노드에서 이미 준비한 rank별 캐시를 실제 Ray/vLLM `sharded_state`로 load하고 최소 추론을 확인합니다. 두 harness 모두 opt-in·GPU·고정 runtime 등 전제 조건이 없으면 `NOT_RUN`과 종료 코드 77이며 성공으로 취급하지 않습니다. 기존 `FULL_SNAPSHOT` 수용 결과를 stage 증적으로 바꾸어 기록해서도 안 됩니다.
+번들 `scripts/acceptance-vllm-stage-builder.py`는 `PP=1` export·native load·최소 추론을 검증합니다. `scripts/acceptance-vllm-stage-ray-pp.py`는 신뢰된 `PP=2/3` 노드에서 이미 준비한 rank별 캐시를 실제 Ray/vLLM `sharded_state`로 load하고 vLLM 0.9.0 V0 `AsyncLLMEngine`으로 최소 추론을 확인합니다. vLLM 0.9.0은 동기 `LLM`에서 pipeline parallel 생성을 거부하므로 수용 검사를 동기 경로로 대체해서는 안 됩니다. 두 harness 모두 opt-in·GPU·고정 runtime 등 전제 조건이 없으면 `NOT_RUN`과 종료 코드 77이며 성공으로 취급하지 않습니다. 기존 `FULL_SNAPSHOT` 수용 결과를 stage 증적으로 바꾸어 기록해서도 안 됩니다.
 
 현재 중앙 운영은 다음 관리자 인증 API를 사용합니다. 전용 `dure admin` 하위 명령은 아직 없습니다.
 

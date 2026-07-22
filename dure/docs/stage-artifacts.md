@@ -51,7 +51,7 @@ LoRA·adapter, MoE, 멀티모달 모델, 임의 아키텍처와 사용자 모델
 
 이 제한은 현재 저장된 모델 카탈로그 전체가 자동으로 stage 변환 가능하다는 뜻이 아님을 분명히 합니다. 레지스트리의 모델 이름이 비슷해도 정확한 아키텍처, 양자화, 원본 매니페스트와 고정 런타임 계약이 모두 일치해야 합니다.
 
-builder와 중앙 레지스트리는 PP 1~64의 구조를 표현하지만, 실제 배포 backend는 `PP=2/3`만 지원합니다. builder용 `scripts/acceptance-vllm-stage-builder.py`는 `PP=1` export·native load를 검증하고, 배포용 `scripts/acceptance-vllm-stage-ray-pp.py`는 신뢰된 2·3노드 환경에서 이미 준비한 서로 다른 rank 캐시를 실제 Ray/vLLM에 결합해 load·최소 추론을 확인합니다. 전제 조건이 없거나 opt-in하지 않은 `NOT_RUN(77)`은 성공 증적이 아닙니다.
+builder와 중앙 레지스트리는 PP 1~64의 구조를 표현하지만, 실제 배포 backend는 `PP=2/3`만 지원합니다. builder용 `scripts/acceptance-vllm-stage-builder.py`는 `PP=1` export·native load를 검증하고, 배포용 `scripts/acceptance-vllm-stage-ray-pp.py`는 신뢰된 2·3노드 환경에서 이미 준비한 서로 다른 rank 캐시를 실제 Ray/vLLM에 결합해 load한 뒤 vLLM 0.9.0 V0 `AsyncLLMEngine`으로 최소 추론을 확인합니다. vLLM 0.9.0의 동기 `LLM`은 pipeline parallel 생성을 명시적으로 거부하므로 이 검사를 동기 API로 바꾸면 안 됩니다. 전제 조건이 없거나 opt-in하지 않은 `NOT_RUN(77)`은 성공 증적이 아닙니다.
 
 ## 현재 다중 노드 실행과의 관계
 

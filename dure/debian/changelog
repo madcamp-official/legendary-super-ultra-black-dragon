@@ -1,3 +1,10 @@
+dure (0.4.16) UNRELEASED; urgency=medium
+
+  * PP=2/3 STAGE 수용 검사의 최소 추론을 vLLM 0.9.0 AsyncLLMEngine으로 실행합니다.
+  * 비동기 pipeline 생성과 실패 전파를 회귀 테스트로 고정합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 20:20:00 +0000
+
 dure (0.4.15) UNRELEASED; urgency=medium
 
   * Stage exporter의 일시 vLLM context와 GPU 메모리 사용을 제한해 24 GiB GPU의 72B PP rank를 지원합니다.

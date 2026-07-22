@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import importlib.util
@@ -9,9 +10,11 @@ import os
 import subprocess
 import sys
 import time
+import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from dure.stage_cache import (
     StageCacheIdentity,
@@ -643,6 +646,151 @@ class VllmStageRayPpAcceptanceTests(unittest.TestCase):
             )
             self.assertIs(options["trust_remote_code"], False)
             self.assertIs(options["enable_lora"], False)
+
+    def test_real_backend_uses_async_engine_for_pipeline_generation(self):
+        contract = acceptance.AcceptanceContract.parse(contract_document())
+        raw_nodes = []
+        actor_pairs = []
+        for index, binding in enumerate(contract.ordered_bindings):
+            ray_id = f"ray-{index}"
+            raw_nodes.append(
+                {
+                    "Alive": True,
+                    "NodeID": ray_id,
+                    "NodeManagerAddress": binding.runtime_address,
+                    "Resources": {
+                        "GPU": 1.0,
+                        "dure_node_"
+                        + binding.node_id.replace("-", ""): 1.0,
+                    },
+                }
+            )
+            actor_pairs.append((ray_id, [0]))
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self):
+                return self.value
+
+        class Worker:
+            def __init__(self, value):
+                self.get_node_and_gpu_ids = RemoteMethod(value)
+
+        executor_type = type("RayDistributedExecutor", (), {})
+        executor_type.__module__ = (
+            "vllm.executor.ray_distributed_executor"
+        )
+        executor = executor_type()
+        executor.parallel_config = types.SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+            world_size=2,
+        )
+        executor.driver_dummy_worker = Worker(actor_pairs[0])
+        executor.workers = [Worker(actor_pairs[1])]
+        executor.shutdown = mock.Mock()
+
+        class FakeAsyncEngineArgs:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeSamplingParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeAsyncLLMEngine:
+            instance = None
+            engine_args = None
+
+            def __init__(self):
+                self.engine = types.SimpleNamespace(
+                    model_executor=executor
+                )
+                self.generate_call = None
+                self.shutdown_calls = 0
+
+            @classmethod
+            def from_engine_args(cls, engine_args):
+                cls.engine_args = engine_args
+                cls.instance = cls()
+                return cls.instance
+
+            async def generate(
+                self, prompt, sampling_params, *, request_id
+            ):
+                self.generate_call = (
+                    prompt,
+                    sampling_params,
+                    request_id,
+                )
+                yield types.SimpleNamespace(
+                    outputs=[types.SimpleNamespace(token_ids=[1, 2])]
+                )
+
+            def shutdown_background_loop(self):
+                self.shutdown_calls += 1
+
+        fake_ray = types.ModuleType("ray")
+        fake_ray.init = mock.Mock()
+        fake_ray.nodes = lambda: raw_nodes
+        fake_ray.get = lambda references, timeout=None: references
+        fake_ray.shutdown = mock.Mock()
+        fake_vllm = types.ModuleType("vllm")
+        fake_vllm.AsyncEngineArgs = FakeAsyncEngineArgs
+        fake_vllm.AsyncLLMEngine = FakeAsyncLLMEngine
+        fake_vllm.SamplingParams = FakeSamplingParams
+
+        with mock.patch.dict(
+            sys.modules, {"ray": fake_ray, "vllm": fake_vllm}
+        ), mock.patch.object(
+            acceptance,
+            "_rehash_all_nodes",
+            return_value=acceptance._expected_node_rehashes(contract),
+        ):
+            backend = acceptance.RealVllmStageRayBackend()
+            result = backend.run(contract)
+
+        self.assertEqual(result.generated_token_count, 2)
+        self.assertEqual(result.ordered_addresses, ("10.0.0.2", "10.0.0.3"))
+        self.assertEqual(
+            FakeAsyncLLMEngine.engine_args.kwargs,
+            acceptance._vllm_load_kwargs(contract),
+        )
+        prompt, sampling_params, request_id = (
+            FakeAsyncLLMEngine.instance.generate_call
+        )
+        self.assertEqual(prompt, "대한민국의 수도는")
+        self.assertEqual(request_id, RUN_ID)
+        self.assertEqual(
+            sampling_params.kwargs,
+            {"temperature": 0.0, "min_tokens": 1, "max_tokens": 4},
+        )
+        self.assertEqual(
+            FakeAsyncLLMEngine.instance.shutdown_calls, 1
+        )
+        executor.shutdown.assert_called_once_with()
+        fake_ray.shutdown.assert_called_once_with()
+
+    def test_async_pipeline_generation_failure_is_closed(self):
+        class FailingEngine:
+            async def generate(self, prompt, sampling_params, *, request_id):
+                if False:
+                    yield None
+                raise RuntimeError("sensitive runtime failure")
+
+        with self.assertRaises(RuntimeError) as raised:
+            asyncio.run(
+                acceptance._generate_minimal_output(
+                    FailingEngine(),
+                    object(),
+                    request_id=RUN_ID,
+                )
+            )
+        self.assertEqual(
+            str(raised.exception), "sensitive runtime failure"
+        )
 
     def test_actor_rank_validation_rejects_missing_duplicate_and_swap(self):
         contract = acceptance.AcceptanceContract.parse(contract_document())
