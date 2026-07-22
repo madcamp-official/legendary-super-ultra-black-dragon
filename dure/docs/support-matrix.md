@@ -32,10 +32,12 @@
 | --- | ---: | ---: | --- |
 | `TP=1`, `PP=1` | 48 GiB | 50 GiB | `DRAFT`, 실제 evidence 전 배포 불가 |
 | `TP=1`, `PP=2` | 24 GiB | 50 GiB | `DRAFT`, exact 2-node evidence 전 배포 불가 |
-| `TP=1`, `PP=3` | 24 GiB | 20 GiB | `DRAFT`, rank별 stage bytes·cache gate와 exact 3-node evidence 전 배포 불가 |
+| `TP=1`, `PP=3` | 24 GiB | 8 GiB | `DRAFT`, rank별 stage bytes·cache gate와 exact 3-node evidence 전 배포 불가 |
 
-`PP=3` 초안의 20 GiB는 profile 생성기의 최소치입니다. 기준 3×24GiB 운영 구성의 50 GiB나
-rank별 실제 stage cache 요구량을 대체하지 않습니다.
+`PP=3` 초안의 8 GiB는 rank 캐시가 준비된 뒤의 운영 최소치입니다. 최초 준비는 rank별
+`2 × manifest bytes + 64 MiB` exact gate를 별도로 적용하므로 이 값만 확보했다고 새 캐시를
+다운로드할 수 있다는 뜻이 아닙니다. 현재 검증 프로필은 최소 2,000 Mbps 사설망과 실제
+3-node evidence도 요구합니다.
 
 ## 분산 runtime과 검증
 

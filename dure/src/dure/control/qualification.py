@@ -42,8 +42,8 @@ from .resource_reservation import (
 )
 
 
-QUALIFICATION_POLICY_VERSION = "profile-qualification-v1"
-QUALIFICATION_SUITE_ID = "dure-profile-qualification-v1"
+QUALIFICATION_POLICY_VERSION = "profile-qualification-v2"
+QUALIFICATION_SUITE_ID = "dure-profile-qualification-v2"
 QUALIFICATION_PURPOSES = frozenset({"PRIMARY", "SUPPLEMENTARY"})
 QUALIFICATION_PROFILE_MAX_AGE = timedelta(seconds=90)
 QUALIFICATION_STEPS = (
@@ -324,7 +324,7 @@ def _workload_contract(
     runtime: RuntimeRelease,
     qualification_purpose: str | None,
 ) -> dict[str, Any]:
-    output_tokens = min(256, max(1, placement.max_model_len // 16))
+    output_tokens = min(32, max(1, placement.max_model_len // 16))
     input_tokens = placement.max_model_len - output_tokens
     contract = {
         "policy_version": QUALIFICATION_POLICY_VERSION,
@@ -344,7 +344,7 @@ def _workload_contract(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "warmup_requests": max(1, min(8, placement.max_concurrency)),
-        "minimum_request_count": max(4, placement.max_concurrency),
+        "minimum_request_count": max(2, placement.max_concurrency),
         "steps": list(QUALIFICATION_STEPS),
     }
     if qualification_purpose is not None:
@@ -640,8 +640,7 @@ def validate_profile_qualification_evidence(
         reservation_fleet_id=reservation_fleet_id,
     )
     if (
-        context["inventory_fingerprint"] != run.inventory_fingerprint
-        or context["gpu_bindings"] != run.gpu_bindings
+        context["gpu_bindings"] != run.gpu_bindings
         or context["rank_node_ids"] != run.rank_node_ids
         or context["workload"] != run.workload
         or context["workload_digest"] != run.workload_digest
@@ -1068,8 +1067,7 @@ def register_profile_qualification_evidence(
         qualification_purpose=run.workload.get("qualification_purpose"),
     )
     if (
-        context["inventory_fingerprint"] != run.inventory_fingerprint
-        or context["gpu_bindings"] != run.gpu_bindings
+        context["gpu_bindings"] != run.gpu_bindings
         or context["rank_node_ids"] != run.rank_node_ids
         or context["workload"] != run.workload
         or context["workload_digest"] != run.workload_digest

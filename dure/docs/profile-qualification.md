@@ -90,8 +90,8 @@ run ID + rank + 중앙 node UUID + GPU index + GPU UUID
 현재 중앙 계약은 다음 값을 사용합니다.
 
 ```text
-policy_version = profile-qualification-v1
-suite_id       = dure-profile-qualification-v1
+policy_version = profile-qualification-v2
+suite_id       = dure-profile-qualification-v2
 ```
 
 run에는 다음 항목을 함께 동결합니다.
@@ -104,6 +104,10 @@ run에는 다음 항목을 함께 동결합니다.
 - 최대 컨텍스트, 동시성
 - 입력·출력 토큰, 예열 요청과 최소 측정 요청 수
 - 인벤토리 지문과 rank·노드·GPU 결합
+
+v2는 최대 컨텍스트 경계를 그대로 확인하면서 출력 토큰을 최대 32개, 최소 측정 요청을
+`max(2, concurrency)`로 제한합니다. 72B `PP=3`의 load·예열·측정·재시작까지 5분 안에 끝내기
+위한 계약이며, 요청 수를 늘린 장기 soak test를 대체하지 않습니다.
 
 작업 부하 전체를 정규 JSON으로 만든 SHA-256 `workload_digest`도 저장합니다. 증적의 컨텍스트·동시성·입출력 토큰·예열 횟수는 동결 값과 정확히 같아야 합니다. 정책·suite·단계·작업 부하 digest가 현재 계약 또는 run과 다르면 `QUALIFICATION_POLICY_STALE`로 거부합니다.
 
@@ -140,7 +144,7 @@ POST /v1/admin/profile-qualifications/<run-id>/evidence
 POST /v1/admin/placement-profiles/<placement-id>/activate
 ```
 
-서버는 연결된 run·증적, 정책·suite·작업 부하 digest, 정규화 binding, 현재 GPU UUID와 인벤토리 지문, 모델 revision·manifest와 런타임 이미지·vLLM 버전을 다시 검사합니다. 하나라도 달라졌으면 활성화를 거부합니다. 통과하면 프로필만 `ACTIVE`로 바꾸고 활성화 시각을 기록합니다.
+서버는 연결된 run·증적, 정책·suite·작업 부하 digest, 정규화 binding, 현재 GPU UUID·VRAM·compute capability, 모델 revision·manifest와 런타임 이미지·vLLM 버전을 다시 검사합니다. 현재 노드가 여전히 승인·온라인·비점유 상태이고 프로필의 최소 자원 조건도 만족해야 합니다. qualification 자체가 소비한 디스크나 새로 준비한 exact 캐시처럼 안전한 동적 인벤토리 변화는 허용하지만, GPU와 불변 실행 identity가 달라졌으면 활성화를 거부합니다. 통과하면 프로필만 `ACTIVE`로 바꾸고 활성화 시각을 기록합니다.
 
 조회와 취소 API는 다음과 같습니다.
 
@@ -158,7 +162,7 @@ POST /v1/admin/placement-profiles/<placement-id>/activate
 3. policy, suite, 단계와 workload digest가 현재 중앙 계약과 같습니다.
 4. 정렬된 노드 UUID 집합과 rank 노드 집합이 프로필의 전체 노드 수와 정확히 일치합니다.
 5. 정규화 binding과 run의 rank·node UUID·GPU index·GPU UUID 결합이 같습니다.
-6. 현재 인벤토리 지문과 선택 GPU 결합이 증적 시점과 같습니다.
+6. 현재 선택 GPU 결합이 증적 시점과 같고 노드는 여전히 승인·온라인·비점유이며 최소 자원 조건을 만족합니다. 전체 인벤토리 지문은 감사용으로 보존하지만 qualification이 만든 캐시·디스크 변화만으로 증적을 폐기하지 않습니다.
 7. 다중 노드이면 대역폭·RTT·패킷 손실·NCCL 수치가 현재 프로필 임계값을 통과합니다.
 8. 등록 시각이 미래가 아니고 24시간 이내입니다.
 
