@@ -4,6 +4,10 @@
 
 ## 현재 제공 범위
 
+모델·profile별 SLO 기준선의 승인, 변경, evidence 재검증과 승격 기록은
+[SLO·벤치마크 정책 운영 절차](slo-benchmark-policy.md)를 따른다. 이 문서는 구현된 schema와
+실행 경계를 설명하며, policy 문서가 실제 GPU evidence를 대신하지는 않는다.
+
 중앙 제어면은 관리자 인증을 거친 구조화된 증적만 저장합니다. 증적 등록 자체는 Agent 작업, 모델 다운로드, 이미지 내려받기, Docker 실행 또는 배포 변경을 만들지 않습니다.
 
 - 고정 suite `dure-serving-slo-v1`과 정책 `benchmark-gate-v3`만 받습니다.
