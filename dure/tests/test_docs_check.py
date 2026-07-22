@@ -41,3 +41,24 @@ class DocumentationLinkCheckTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("README.md:1", errors[0])
         self.assertIn("docs/missing.md", errors[0])
+
+    def test_checks_root_policy_and_nested_dure_documentation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "dure" / "docs").mkdir(parents=True)
+            (root / "README.md").write_text("# Root\n", encoding="utf-8")
+            (root / "GOVERNANCE.md").write_text(
+                "[missing](missing.md)\n", encoding="utf-8"
+            )
+            (root / "dure" / "README.md").write_text(
+                "[guide](docs/guide.md)\n", encoding="utf-8"
+            )
+            (root / "dure" / "docs" / "guide.md").write_text(
+                "# Guide\n", encoding="utf-8"
+            )
+
+            errors = DOCS_CHECK.check_relative_links(root)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("GOVERNANCE.md:1", errors[0])
+        self.assertIn("missing.md", errors[0])

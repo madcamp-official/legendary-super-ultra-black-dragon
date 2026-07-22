@@ -14,9 +14,10 @@ Dure의 다음 목표는 기능 수를 빠르게 늘리는 것이 아니라, 현
 4. 각 버전은 완료 기준을 모두 통과한 후 사용자의 명시적 요청으로만 `main`에 병합한다.
 5. 공개 참여는 보안 통과 기준과 신뢰된 알파 운영 데이터가 확보된 후에만 시작한다.
 
-## 현재 구현 진행 상태
+## 완료된 기반과 현재 소스 상태
 
-v0.3 계열의 모델 선택·제어면 기반은 아래 버전 브랜치에서 구현되었습니다. `main` 병합만으로
+아래 목록은 각 version branch에서 구현되어 현재 소스에 누적된 기반을 설명하는 **역사적 구현 기록**이다.
+`main` 병합만으로
 APT package나 Git tag가 발행되지는 않으며, 공식 package release는 사용자의 명시적 요청으로
 Debian version과 같은 `v<version>` tag를 만들고 배포 workflow가 성공한 뒤에만 성립합니다.
 
@@ -54,25 +55,29 @@ Debian version과 같은 `v<version>` tag를 만들고 배포 workflow가 성공
 
 롤백은 전체 노드와 동일한 실제 실행 토폴로지·승인·온라인·다이제스트 이미지 조건을 강제하고, `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET`과 선택적 `START_API → VERIFY_API`를 모든 노드 성공 게이트로 진행합니다. 엄격한 backend에서 모델·revision·layer 범위·매니페스트·variant 및 `FULL_SNAPSHOT`/`STAGE` identity는 세대별 exact 게이트를 통과하면 달라도 되며, legacy layer 범위 비교는 유지합니다. 실패 노드 재시도는 새 시도 번호로 펜싱합니다. 같은 GPU에서 컨테이너를 다시 만드는 방식이므로 중단 가능성이 있고 블루·그린 전환이 아닙니다. 네트워크·NCCL 자동 시험과 24시간 복구 검증은 여전히 후속 범위입니다.
 
-## 현재 릴리스 수용 상태
+## 현재 릴리스·수용 상태: 0.4.21 소스 기준선
 
-- **v0.4.14 staged activation ordering:** `QUEUED → RUNNING → SUCCEEDED` operation 동안 final
+현재 기준선은 `0.4.21`이며 package, Git tag, APT publish, 실제 GPU 수용은 아직 별개의 상태다.
+실제 실행 결과의 진실의 원천은 [v0.4.21 수용 증적](release-evidence/v0.4.21.md)이다. 현재 증적은
+`NOT_RUN`이며, 실제 GPU·Docker·Ray·vLLM·NCCL 실행 없이 `PASSED`로 바꾸지 않는다.
+
+- **역사적 v0.4.14 activation ordering 기준:** `QUEUED → RUNNING → SUCCEEDED` operation 동안 final
   `VERIFY`가 생성되지 않는 단위 회귀 테스트가 있습니다. 실제 단일 GPU activation의 success와
   failure run은 별도 격리 노드에서 수행하고 operation·task 순서와 `verified_at`을 보관해야 합니다.
-- **v0.4.18 3×24GiB profile:** `minimum_gpu_memory_mib=24000`은 정확히 세 binding에서만 허용되며,
+- **역사적 v0.4.18 3×24GiB 수용 절차:** `minimum_gpu_memory_mib=24000`은 정확히 세 binding에서만 허용되며,
   harness가 각 Ray node의 실제 CUDA memory를 측정합니다. 이 구현만으로 실제 72B 분산 load가
   통과한 것은 아닙니다. `PASSED`, 전체 node `verify --api`, wrapper의 image-digest 대조 기록이
   있어야 수용 증적입니다.
-- **schema:** 현재 Alembic head는 `0015_fleet_runtime`입니다. v0.4.18은 harness 결과를 중앙 DB에
+- **schema:** 현재 Alembic head는 `0015_fleet_runtime`입니다. 현재 harness 결과는 중앙 DB에
   저장하지 않아 새 revision을 만들지 않습니다. 향후 validation run·GPU memory·wrapper attestation을
   중앙 증적으로 영속한다면 `0016`에서 새 append-only evidence schema를 추가하고 기존 DB upgrade와
   downgrade 거부 경로를 별도로 검증해야 합니다.
-- **release metadata:** `0.4.18`은 `UNRELEASED`입니다. `pyproject.toml`, `setup.py`, runtime version,
+- **release metadata:** `0.4.21`은 `UNRELEASED`입니다. `pyproject.toml`, `setup.py`, runtime version,
   Debian changelog와 package test는 동기화되어 있지만, 사용자의 명시적 요청 전에는 tag, GitHub
   Release, APT publish를 수행하지 않습니다. 상세 절차는 [릴리스 수용 검증](release-validation.md)을
   따릅니다.
 
-## 단계별 계획
+## 향후 계획
 
 ### v0.3 — 신뢰된 중앙 제어면 안정화
 

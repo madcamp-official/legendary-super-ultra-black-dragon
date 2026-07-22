@@ -21,7 +21,7 @@
 현재 저장소의 `0.4.21` 소스 버전을 기준으로 문서 체계를 정비했습니다. 과거 버전의 사용자용 변경 내역은 신뢰할 수 있는 릴리스 메모가 없으므로 소급해서 추정·작성하지 않습니다.
 
 - 이 버전의 패키지 게시 여부와 설치 가능한 APT 경로는 별도로 확인해야 합니다.
-- GPU, Docker, Ray/vLLM, NCCL 검증의 통과 여부는 버전별 증적에서 `PASS`, `FAIL`, `NOT_RUN` 상태로 확인해야 합니다.
+- GPU, Docker, Ray/vLLM, NCCL 검증의 통과 여부는 버전별 증적에서 `PASSED`, `FAILED`, `NOT_RUN` 상태로 확인해야 합니다.
 - 업그레이드 전에 [호환성·롤링 업그레이드](docs/compatibility-upgrades.md), [릴리스 실행 체크리스트](docs/release-runbook.md), [복구 절차](docs/disaster-recovery.md)를 확인합니다.
 
 ## 이후 릴리스 작성 기준

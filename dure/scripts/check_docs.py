@@ -14,11 +14,22 @@ _EXTERNAL_PREFIXES = ("#", "http://", "https://", "mailto:", "tel:", "data:")
 
 
 def documentation_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    readme = root / "README.md"
-    if readme.is_file():
-        files.append(readme)
-    docs = root / "docs"
+    """Return Markdown documentation for a repository root or Dure-only fixture.
+
+    The repository keeps public policy documents at its root and the Dure project
+    under ``dure/``.  Small test fixtures may instead place their README and docs
+    directly under ``root``.
+    """
+
+    files = sorted(root.glob("*.md"))
+    dure_root = root / "dure"
+    if dure_root.is_dir():
+        for path in (dure_root / "README.md", dure_root / "CHANGELOG.md"):
+            if path.is_file():
+                files.append(path)
+        docs = dure_root / "docs"
+    else:
+        docs = root / "docs"
     if docs.is_dir():
         files.extend(sorted(docs.rglob("*.md")))
     return files
@@ -50,8 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(__file__).resolve().parents[1],
-        help="Dure project root containing README.md and docs/",
+        default=Path(__file__).resolve().parents[2],
+        help="repository root containing root policy documents and dure/docs/",
     )
     args = parser.parse_args(argv)
     root = args.root.resolve()

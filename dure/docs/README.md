@@ -57,7 +57,7 @@
 - release tag·package 게시·실제 GPU 수용 결과의 실행 순서는 [릴리스 실행 체크리스트](release-runbook.md)를 따르며, `PUBLISHED`와 `ACCEPTED`를 혼동하지 않습니다.
 - 네트워크 포트·방화벽·NCCL interface의 운영 기준은 [네트워크·방화벽 운영 절차](networking.md)를 단일 기준으로 사용합니다. Agent의 Controller 주소·TLS·credential 회전은 [Agent 설정과 credential 회전 운영 절차](agent-operations.md), PostgreSQL backup·restore와 credential 복구는 [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md), 상태 확인과 외부 alert는 [관측·장애 대응 운영 절차](observability.md)를 따릅니다.
 - 모델·OS·runtime 지원 범위는 [지원 매트릭스](support-matrix.md)를 기준으로 하며, 기능 문서에 같은 수치를 반복할 때는 이 문서와 함께 갱신합니다.
-- 새 문서·이미지·링크는 `python3 scripts/check_docs.py`를 통과해야 합니다. 이미지에는 alt text와 갱신 가능한 원본 형식을 함께 보관합니다.
+- 새 문서·이미지·링크는 `python3 scripts/check_docs.py`를 통과해야 합니다. 이 검사는 저장소 루트의 정책 문서와 `dure/` 문서를 함께 확인합니다. 이미지에는 alt text와 갱신 가능한 원본 형식을 함께 보관합니다.
 - 모델은 이름만이 아니라 리비전, 양자화, 런타임 이미지 다이제스트, 라이선스를 함께 관리합니다.
 - 모델 반입의 출처·라이선스·보안·철회 검토는 [모델 반입·승인 정책](model-onboarding-policy.md)을 따르며, 레지스트리 등록이 그 검토를 자동화하지 않습니다.
 - 프롬프트, 자격 증명, 토큰, 실제 비밀값을 예시나 벤치마크 결과에 기록하지 않습니다.
